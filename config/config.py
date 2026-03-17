@@ -39,3 +39,8 @@ CORRECTION_DEFAULTS = {
     "ground_albedo": 0.35,
     "line_azimuth_deg": 90.0,
 }
+
+MODEL_BUNDLE_FILES = {
+    "wind_speed": "wind_speed_bundle.joblib",
+    "ambient_temp": "ambient_temp_bundle.joblib",
+}

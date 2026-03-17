@@ -4,7 +4,6 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
-from scipy.interpolate import interp1d
 from datetime import datetime, timedelta, date
 from thermal_functions import ThermalCalculator, EnvironmentGenerator, LineAnalyzer
 import os
@@ -555,8 +554,8 @@ def convert_to_analysis_format(weather_data: dict, terrain_data: dict = None, nu
     # 绘图用真实时间戳 (datetime64[ns])
     # 将 datetime64 转换为 float (seconds) 进行插值，然后再转回 datetime
     ts_orig_float = ts_orig.astype('datetime64[s]').astype(float)
-    f_ts = interp1d(times_orig, ts_orig_float, kind='linear', fill_value='extrapolate')
-    ts_new_float = f_ts(times_new)
+    f_ts = np.interp(times_new, times_orig, ts_orig_float)
+    ts_new_float = f_ts
     datetimes_new = pd.to_datetime(ts_new_float, unit='s')
 
     temps_matrix = np.zeros((len(positions), num_times))
@@ -583,13 +582,9 @@ def convert_to_analysis_format(weather_data: dict, terrain_data: dict = None, nu
             times_to_use = times_orig
 
         try:
-            f_temp = interp1d(times_to_use, temp_data, kind='linear', fill_value='extrapolate')
-            f_wind = interp1d(times_to_use, wind_data, kind='linear', fill_value='extrapolate')
-            f_angle = interp1d(times_to_use, angle_data, kind='linear', fill_value='extrapolate')
-
-            temps_matrix[i, :] = np.clip(f_temp(times_new), -50, 70)
-            winds_matrix[i, :] = np.clip(f_wind(times_new), 0.1, 20)
-            angles_matrix[i, :] = f_angle(times_new) % 360
+            temps_matrix[i, :] = np.clip(np.interp(times_new, times_to_use, temp_data), -50, 70)
+            winds_matrix[i, :] = np.clip(np.interp(times_new, times_to_use, wind_data), 0.1, 20)
+            angles_matrix[i, :] = np.interp(times_new, times_to_use, angle_data) % 360
             elevations[i] = np.mean(elev_data)
         except Exception as e:
             temps_matrix[i, :] = np.mean(temp_data)
@@ -601,8 +596,7 @@ def convert_to_analysis_format(weather_data: dict, terrain_data: dict = None, nu
     # 太阳辐射插值
     try:
         if len(solar_orig) == len(times_orig):
-            f_solar = interp1d(times_orig, solar_orig, kind='linear', fill_value='extrapolate')
-            solar_array = np.clip(f_solar(times_new), 0, 1500)
+            solar_array = np.clip(np.interp(times_new, times_orig, solar_orig), 0, 1500)
         else:
             solar_array = np.zeros(num_times)
     except:
@@ -1243,8 +1237,9 @@ with tab_correction:
                 rolling_std = rating_series.rolling(window, center=True, min_periods=1).std().fillna(0).values
 
                 # 置信区间
-                from scipy.stats import norm
-                z_score = norm.ppf((1 + corr_cfg['ai_confidence'] / 100) / 2)
+                # 用查表法替代scipy.stats.norm.ppf
+                _z_table = {80: 1.282, 85: 1.440, 90: 1.645, 95: 1.960, 99: 2.576}
+                z_score = _z_table.get(int(corr_cfg['ai_confidence']), 1.960)
                 upper = rolling_mean + z_score * rolling_std
                 lower = rolling_mean - z_score * rolling_std
 

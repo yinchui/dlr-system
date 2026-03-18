@@ -635,45 +635,6 @@ def convert_to_analysis_format(weather_data: dict, terrain_data: dict = None, nu
 # ==============================================================================
 st.set_page_config(page_title="DLR调度分析系统", layout="wide")
 
-# 添加自定义CSS，将文件上传组件的英文改为中文
-st.markdown("""
-<style>
-    /* 隐藏原有的英文提示 */
-    [data-testid="stFileUploader"] section > div > span {
-        display: none;
-    }
-
-    /* 添加中文提示 */
-    [data-testid="stFileUploader"] section::before {
-        content: "拖放文件到此处";
-        display: block;
-        text-align: center;
-        color: rgba(250, 250, 250, 0.6);
-        font-size: 14px;
-        padding: 1rem;
-    }
-
-    /* 修改"Browse files"按钮文字 */
-    [data-testid="stFileUploader"] section button {
-        font-size: 0;
-    }
-    [data-testid="stFileUploader"] section button::after {
-        content: "浏览文件";
-        font-size: 14px;
-    }
-
-    /* 修改文件大小限制提示 */
-    [data-testid="stFileUploader"] small {
-        font-size: 0;
-    }
-    [data-testid="stFileUploader"] small::after {
-        content: "文件大小限制：200MB";
-        font-size: 12px;
-        color: rgba(250, 250, 250, 0.4);
-    }
-</style>
-""", unsafe_allow_html=True)
-
 if 'calculator' not in st.session_state:
     st.session_state.calculator = ThermalCalculator()
     st.session_state.env_generator = EnvironmentGenerator()

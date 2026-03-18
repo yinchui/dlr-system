@@ -689,12 +689,12 @@ with st.sidebar:
     with st.expander(" 参数微调", expanded=True):
         params = st.session_state.conductor_params
         st.markdown("**几何与热力**")
-        params['D0'] = st.number_input("导线外径（米）", value=params['D0'], format="%.4f")
-        params['line_azimuth'] = st.number_input("线路方位角（度）", value=params['line_azimuth'])
-        params['max_allow_temp'] = st.number_input("最大允许温度（摄氏度）", value=params['max_allow_temp'])
+        params['D0'] = st.number_input("导线外径 (m)", value=params['D0'], format="%.4f")
+        params['line_azimuth'] = st.number_input("线路方位角 (°)", value=params['line_azimuth'])
+        params['max_allow_temp'] = st.number_input("最大允许温度 (°C)", value=params['max_allow_temp'])
 
         st.markdown("**电气特性**")
-        params['R_low_25'] = st.number_input("电阻（25摄氏度）", value=params['R_low_25'], format="%.6f")
+        params['R_low_25'] = st.number_input("电阻 R(25°C)", value=params['R_low_25'], format="%.6f")
 
     st.markdown("**地形数据配置**")
 
@@ -702,7 +702,7 @@ with st.sidebar:
     tower_upload = st.file_uploader("上传杆塔坐标Excel", type=["xlsx"], key="tower_upload")
 
     # DEM文件 - 文件上传
-    dem_upload = st.file_uploader("上传DEM文件（TIF格式）", type=["tif", "tiff"], key="dem_upload")
+    dem_upload = st.file_uploader("上传DEM文件 (TIF)", type=["tif", "tiff"], key="dem_upload")
 
     if st.button("🔄 加载地形数据"):
         status = st.empty()
@@ -744,8 +744,8 @@ with st.sidebar:
     with st.expander("气象修正配置", expanded=False):
         enable_vertical_correction = st.checkbox("垂直修正（风速高度折算）", value=True)
         if enable_vertical_correction:
-            conductor_height = st.number_input("导线悬挂高度（米）", value=20.0, min_value=5.0, max_value=100.0)
-            anemometer_height = st.number_input("气象站测风高度（米）", value=10.0, min_value=1.0, max_value=50.0)
+            conductor_height = st.number_input("导线悬挂高度 (m)", value=20.0, min_value=5.0, max_value=100.0)
+            anemometer_height = st.number_input("气象站测风高度 (m)", value=10.0, min_value=1.0, max_value=50.0)
             roughness_alpha = st.number_input("地表粗糙度指数", value=0.15, min_value=0.05, max_value=0.5, format="%.2f",
                                               help="沙漠/戈壁: 0.10-0.15, 草地: 0.15-0.20, 城市: 0.25-0.40")
         else:
@@ -756,16 +756,16 @@ with st.sidebar:
         if enable_desert_correction:
             desert_albedo = st.number_input("地表反照率", value=0.35, min_value=0.1, max_value=0.6, format="%.2f",
                                             help="沙漠: 0.30-0.40, 戈壁: 0.25-0.35")
-            ground_temp_offset = st.number_input("地表增温偏移（摄氏度）", value=15.0, min_value=0.0, max_value=30.0)
+            ground_temp_offset = st.number_input("地表增温偏移 (°C)", value=15.0, min_value=0.0, max_value=30.0)
         else:
             desert_albedo, ground_temp_offset = 0.35, 15.0
 
         enable_wind_dir_correction = st.checkbox("风向修正（有效横风分量）", value=True)
 
     with st.expander("AI预测配置", expanded=False):
-        enable_ai_prediction = st.checkbox("启用AI残差预测（XGBoost）", value=False)
+        enable_ai_prediction = st.checkbox("启用AI残差预测 (XGBoost)", value=False)
         if enable_ai_prediction:
-            ai_confidence = st.slider("预测置信区间（百分比）", 80, 99, 95)
+            ai_confidence = st.slider("预测置信区间 (%)", 80, 99, 95)
             ai_lookback = st.number_input("历史回溯窗口（小时）", value=6, min_value=1, max_value=24)
 
     # 保存修正配置到 session_state
@@ -947,10 +947,10 @@ with tab_line:
             min_gain = (min_val - static_val) / static_val * 100
             avg_gain = (avg_val - static_val) / static_val * 100
 
-            k1.metric("最低载流量（系统瓶颈）", f"{min_val:.0f} 安", f"{min_gain:+.1f}% 对比静态")
-            k2.metric("最高载流量", f"{max_val:.0f} 安")
-            k3.metric("平均载流量", f"{avg_val:.0f} 安", f"{avg_gain:+.1f}%")
-            k4.metric("静态额定值（基准）", f"{static_val:.0f} 安")
+            k1.metric("最低载流量（系统瓶颈）", f"{min_val:.0f} A", f"{min_gain:+.1f}% 对比静态")
+            k2.metric("最高载流量", f"{max_val:.0f} A")
+            k3.metric("平均载流量", f"{avg_val:.0f} A", f"{avg_gain:+.1f}%")
+            k4.metric("静态额定值（基准）", f"{static_val:.0f} A")
 
             st.divider()
 
@@ -967,7 +967,7 @@ with tab_line:
                 x=plot_times,
                 y=[static_val] * len(plot_times),
                 mode='lines',
-                name=f'静态额定值（{static_val:.0f}安）',
+                name=f'静态额定值 ({static_val:.0f}A)',
                 line=dict(color='red', dash='dash')
             ))
             fig.add_trace(go.Scatter(
@@ -976,9 +976,9 @@ with tab_line:
                 name='增容空间', showlegend=False
             ))
             fig.update_layout(
-                title="全线瓶颈载流量分析（SRTM地形修正）",
+                title="全线瓶颈载流量分析 (SRTM地形修正)",
                 xaxis_title="日期时间",
-                yaxis_title="最大允许电流（安）",
+                yaxis_title="最大允许电流 (A)",
                 height=400,
                 hovermode='x unified',
                 # 关键修改：显示日期和时间，换行显示
@@ -1013,26 +1013,26 @@ with tab_line:
                             - 坡向: {terr['aspect']:.1f}°
                             """)
 
-                st.markdown(f"**平均修正风速**: {np.mean(sel_wind):.2f} 米/秒")
-                st.markdown(f"**最高环境温度**: {np.max(sel_temp):.1f} 摄氏度")
+                st.markdown(f"**平均修正风速**: {np.mean(sel_wind):.2f} m/s")
+                st.markdown(f"**最高环境温度**: {np.max(sel_temp):.1f} °C")
 
             with t_col2:
                 fig_tower = make_subplots(specs=[[{"secondary_y": True}]])
 
                 fig_tower.add_trace(
-                    go.Scatter(x=plot_times, y=sel_temp, name="环境温度（摄氏度）",
+                    go.Scatter(x=plot_times, y=sel_temp, name="环境温度 (°C)",
                                line=dict(color='orange', width=2)),
                     secondary_y=False
                 )
 
                 fig_tower.add_trace(
-                    go.Scatter(x=plot_times, y=sel_wind, name="修正后风速（米/秒）",
+                    go.Scatter(x=plot_times, y=sel_wind, name="修正后风速 (m/s)",
                                fill='tozeroy', line=dict(color='lightblue', width=1), opacity=0.5),
                     secondary_y=False
                 )
 
                 fig_tower.add_trace(
-                    go.Scatter(x=plot_times, y=sel_curr, name="允许载流量（安）",
+                    go.Scatter(x=plot_times, y=sel_curr, name="允许载流量 (A)",
                                line=dict(color='green', width=3)),
                     secondary_y=True
                 )
@@ -1045,8 +1045,8 @@ with tab_line:
                     xaxis=dict(tickformat="%Y-%m-%d\n%H:%M")  # 显示日期
                 )
 
-                fig_tower.update_yaxes(title_text="温度（摄氏度）/风速（米/秒）", secondary_y=False)
-                fig_tower.update_yaxes(title_text="载流量（安）", secondary_y=True)
+                fig_tower.update_yaxes(title_text="温度 (°C) / 风速 (m/s)", secondary_y=False)
+                fig_tower.update_yaxes(title_text="载流量 (A)", secondary_y=True)
 
                 st.plotly_chart(fig_tower, use_container_width=True)
 
@@ -1057,7 +1057,7 @@ with tab_line:
                     x=plot_times,
                     y=[str(p) for p in positions],
                     colorscale='Viridis',
-                    colorbar=dict(title='风速（米/秒）')
+                    colorbar=dict(title='风速 (m/s)')
                 ))
                 fig_heat.update_layout(
                     title="全线修正风速时空分布",
@@ -1104,8 +1104,8 @@ with tab_correction:
                 avg_now = np.mean(w_now)
                 change_pct = (avg_now - avg_orig) / avg_orig * 100 if avg_orig > 0 else 0
 
-                st.metric("原始平均风速", f"{avg_orig:.2f} 米/秒")
-                st.metric("修正后平均风速", f"{avg_now:.2f} 米/秒", f"{change_pct:+.1f}%")
+                st.metric("原始平均风速", f"{avg_orig:.2f} m/s")
+                st.metric("修正后平均风速", f"{avg_now:.2f} m/s", f"{change_pct:+.1f}%")
 
                 # 各修正因子统计
                 corr_cfg = st.session_state.get('correction_config', {})
@@ -1131,7 +1131,7 @@ with tab_correction:
                 ))
                 fig_wind_cmp.update_layout(
                     title=f"塔位 {positions[sel_corr_idx]} - 风速修正对比",
-                    xaxis_title="日期时间", yaxis_title="风速（米/秒）",
+                    xaxis_title="日期时间", yaxis_title="风速 (m/s)",
                     height=350, hovermode='x unified',
                     xaxis=dict(tickformat="%Y-%m-%d\n%H:%M")
                 )
@@ -1159,16 +1159,16 @@ with tab_correction:
                 ))
                 fig_solar_cmp.update_layout(
                     title="沙漠环境辐射修正（地表反射+长波辐射）",
-                    xaxis_title="日期时间", yaxis_title="辐射强度（瓦/平方米）",
+                    xaxis_title="日期时间", yaxis_title="辐射强度 (W/m²)",
                     height=350, hovermode='x unified',
                     xaxis=dict(tickformat="%Y-%m-%d\n%H:%M")
                 )
                 st.plotly_chart(fig_solar_cmp, use_container_width=True)
 
                 sc1, sc2, sc3 = st.columns(3)
-                sc1.metric("原始平均辐射", f"{np.mean(corr_details['solar_orig']):.1f} 瓦/平方米")
-                sc2.metric("修正后平均辐射", f"{np.mean(data['solar']):.1f} 瓦/平方米")
-                sc3.metric("平均辐射增量", f"{np.mean(corr_details['desert_solar_delta']):.1f} 瓦/平方米")
+                sc1.metric("原始平均辐射", f"{np.mean(corr_details['solar_orig']):.1f} W/m²")
+                sc2.metric("修正后平均辐射", f"{np.mean(data['solar']):.1f} W/m²")
+                sc3.metric("平均辐射增量", f"{np.mean(corr_details['desert_solar_delta']):.1f} W/m²")
 
             # ---- 修正因子热力图 ----
             st.divider()
@@ -1210,13 +1210,13 @@ with tab_correction:
                 max_rating = np.max(line_rating)
 
                 rc1, rc2, rc3 = st.columns(3)
-                rc1.metric("修正后最低载流量", f"{min_rating:.0f} 安")
-                rc2.metric("修正后平均载流量", f"{avg_rating:.0f} 安")
-                rc3.metric("修正后最高载流量", f"{max_rating:.0f} 安")
+                rc1.metric("修正后最低载流量", f"{min_rating:.0f} A")
+                rc2.metric("修正后平均载流量", f"{avg_rating:.0f} A")
+                rc3.metric("修正后最高载流量", f"{max_rating:.0f} A")
 
         # ---- AI预测部分 ----
         st.divider()
-        st.markdown("##### AI残差预测（XGBoost）")
+        st.markdown("##### AI残差预测 (XGBoost)")
 
         corr_cfg = st.session_state.get('correction_config', {})
         if not corr_cfg.get('ai_enabled', False):
@@ -1266,7 +1266,7 @@ with tab_correction:
                 ))
                 fig_ai.update_layout(
                     title="AI残差预测 - 物理模型对比AI修正",
-                    xaxis_title="日期时间", yaxis_title="载流量（安）",
+                    xaxis_title="日期时间", yaxis_title="载流量 (A)",
                     height=400, hovermode='x unified',
                     xaxis=dict(tickformat="%Y-%m-%d\n%H:%M")
                 )
@@ -1276,8 +1276,8 @@ with tab_correction:
                 mae = np.mean(np.abs(predicted - line_rating))
                 rmse = np.sqrt(np.mean((predicted - line_rating) ** 2))
                 ai1, ai2, ai3 = st.columns(3)
-                ai1.metric("平均绝对误差", f"{mae:.1f} 安")
-                ai2.metric("均方根误差", f"{rmse:.1f} 安")
-                ai3.metric("平均置信区间宽度", f"{np.mean(upper - lower):.1f} 安")
+                ai1.metric("平均绝对误差 (MAE)", f"{mae:.1f} A")
+                ai2.metric("均方根误差 (RMSE)", f"{rmse:.1f} A")
+                ai3.metric("平均置信区间宽度", f"{np.mean(upper - lower):.1f} A")
             else:
                 st.warning("请先完成线路全景分析计算。")

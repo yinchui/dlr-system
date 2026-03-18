@@ -5,7 +5,6 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from scipy.interpolate import interp1d
 
 
 @dataclass
@@ -80,9 +79,9 @@ def interpolate_analysis_dataset(dataset: WeatherDataset, interval_minutes: int,
     elevations = np.zeros(len(dataset.positions))
 
     for idx, pos in enumerate(dataset.positions):
-        temps[idx, :] = interp1d(dataset.times_float, dataset.temps[pos], kind="linear")(times_new)
-        winds[idx, :] = interp1d(dataset.times_float, dataset.wind_speeds[pos], kind="linear")(times_new)
-        angles[idx, :] = interp1d(dataset.times_float, dataset.wind_dirs[pos], kind="linear")(times_new) % 360
+        temps[idx, :] = np.interp(times_new, dataset.times_float, dataset.temps[pos])
+        winds[idx, :] = np.interp(times_new, dataset.times_float, dataset.wind_speeds[pos])
+        angles[idx, :] = np.interp(times_new, dataset.times_float, dataset.wind_dirs[pos]) % 360
         elevations[idx] = np.mean(dataset.elevations[pos])
 
     return {

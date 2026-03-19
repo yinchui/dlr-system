@@ -952,8 +952,6 @@ with tab_line:
             k3.metric("平均载流量", f"{avg_val:.0f} A", f"{avg_gain:+.1f}%")
             k4.metric("静态额定值（基准）", f"{static_val:.0f} A")
 
-            st.divider()
-
             # --- 图表 1: 全线瓶颈载流量 ---
             fig = go.Figure()
             fig.add_trace(go.Scatter(
@@ -979,16 +977,15 @@ with tab_line:
                 title="全线瓶颈载流量分析 (SRTM地形修正)",
                 xaxis_title="日期时间",
                 yaxis_title="最大允许电流 (A)",
-                height=400,
+                height=300,
+                margin=dict(t=40, b=30),
                 hovermode='x unified',
-                # 关键修改：显示日期和时间，换行显示
                 xaxis=dict(tickformat="%Y-%m-%d\n%H:%M")
             )
             st.plotly_chart(fig, use_container_width=True)
 
             # --- 图表 2: 单塔详情 ---
-            st.divider()
-            st.subheader("🔍 单塔微气象与修正详情")
+            st.markdown("##### 🔍 单塔微气象与修正详情")
 
             t_col1, t_col2 = st.columns([1, 3])
             positions = data['positions']
@@ -1039,7 +1036,8 @@ with tab_line:
 
                 fig_tower.update_layout(
                     title=f"杆塔 {positions[selected_tower_idx]}：微气象修正与载流量详情",
-                    height=450,
+                    height=320,
+                    margin=dict(t=40, b=30),
                     hovermode='x unified',
                     legend=dict(orientation="h", y=1.1),
                     xaxis=dict(tickformat="%Y-%m-%d\n%H:%M")  # 显示日期

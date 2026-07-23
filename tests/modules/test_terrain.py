@@ -308,6 +308,97 @@ def test_load_tower_coordinates_detects_header_and_preserves_leading_zeros(
     assert result["001"] == {"lon": 120.005, "lat": 49.995}
 
 
+@pytest.mark.parametrize("numeric_filter", [36, 36.0, np.float64(36)])
+def test_numeric_tower_filter_matches_unique_zero_padded_id(tmp_path, numeric_filter):
+    path = tmp_path / "numeric-filter.xlsx"
+    pd.DataFrame(
+        {
+            "运行编号": ["036号", "037号"],
+            "经度": [120.005, 120.015],
+            "纬度": [49.995, 49.985],
+        }
+    ).to_excel(path, index=False)
+
+    result = terrain.load_tower_coordinates(path, tower_nums=[numeric_filter])
+
+    assert list(result) == ["036"]
+
+
+def test_string_tower_filter_does_not_merge_leading_zero_id(tmp_path):
+    path = tmp_path / "string-filter.xlsx"
+    pd.DataFrame(
+        {
+            "运行编号": ["036号"],
+            "经度": [120.005],
+            "纬度": [49.995],
+        }
+    ).to_excel(path, index=False)
+
+    result = terrain.load_tower_coordinates(path, tower_nums=["36"])
+
+    assert result == {}
+
+
+def test_numeric_tower_filter_rejects_ambiguous_equivalent_ids(tmp_path):
+    path = tmp_path / "ambiguous-filter.xlsx"
+    pd.DataFrame(
+        {
+            "运行编号": ["36号", "036号"],
+            "经度": [120.005, 120.015],
+            "纬度": [49.995, 49.985],
+        }
+    ).to_excel(path, index=False)
+
+    result = terrain.load_tower_coordinates(path, tower_nums=[36])
+
+    assert result == {}
+
+
+def test_duplicate_canonical_tower_with_same_coordinates_is_deduplicated(tmp_path):
+    path = tmp_path / "same-coordinate-duplicate.xlsx"
+    pd.DataFrame(
+        {
+            "运行编号": ["001号", "001号"],
+            "经度": [120.005, 120.005],
+            "纬度": [49.995, 49.995],
+        }
+    ).to_excel(path, index=False)
+
+    result = terrain.load_tower_coordinates(path)
+
+    assert result == {"001": {"lon": 120.005, "lat": 49.995}}
+
+
+def test_conflicting_duplicate_canonical_tower_is_isolated(tmp_path):
+    path = tmp_path / "conflicting-coordinate-duplicate.xlsx"
+    pd.DataFrame(
+        {
+            "运行编号": ["001号", "001号", "002号", "001号"],
+            "经度": [120.005, 120.015, 120.025, 120.005],
+            "纬度": [49.995, 49.985, 49.975, 49.995],
+        }
+    ).to_excel(path, index=False)
+
+    result = terrain.load_tower_coordinates(path)
+
+    assert result == {"002": {"lon": 120.025, "lat": 49.975}}
+
+
+def test_numeric_filter_keeps_isolated_equivalent_id_ambiguous(tmp_path):
+    path = tmp_path / "isolated-equivalent-filter.xlsx"
+    pd.DataFrame(
+        {
+            "运行编号": ["36号", "036号", "036号"],
+            "经度": [120.005, 120.015, 120.025],
+            "纬度": [49.995, 49.985, 49.975],
+        }
+    ).to_excel(path, index=False)
+
+    result = terrain.load_tower_coordinates(path, tower_nums=[36])
+
+    assert result == {}
+
+
 def test_canonical_terrain_lookup_uses_tower_id_keys(tmp_path):
     dem = terrain.load_dem_data(write_test_geotiff(tmp_path))
 
@@ -358,6 +449,31 @@ def test_legacy_integer_lookup_retains_array_index_keys():
     assert all(sample["reason"] == "missing_dem" for sample in result.values())
 
 
+def test_dataframe_float_legacy_positions_keep_array_index_keys(tmp_path):
+    positions = pd.Series([36, np.nan]).dropna().to_numpy()
+    dem = terrain.load_dem_data(write_test_geotiff(tmp_path))
+
+    result = terrain.build_terrain_lookup(
+        dem,
+        {"36": {"lon": 120.005, "lat": 49.995}},
+        positions,
+    )
+
+    assert positions.dtype == np.float64
+    assert list(result) == [0]
+    assert result[0]["source"] == "measured"
+
+
+@pytest.mark.parametrize(
+    "position",
+    [True, -1.0, 36.5, float("nan"), float("inf")],
+)
+def test_invalid_numeric_positions_do_not_enter_legacy_mode(position):
+    result = terrain.build_terrain_lookup(None, {}, [position])
+
+    assert 0 not in result
+
+
 def test_legacy_integer_lookup_matches_unique_zero_padded_loader_id(tmp_path):
     tower_path = tmp_path / "legacy-tower.xlsx"
     pd.DataFrame(
@@ -402,3 +518,117 @@ def test_terrain_sample_supports_mapping_access(tmp_path):
     assert isinstance(sample, terrain.TerrainSample)
     assert sample["slope"] == sample.get("slope")
     assert dict(sample)["source"] == "measured"
+
+
+def test_terrain_upload_pair_commits_both_values_and_cleans_temp_files():
+    seen_paths = []
+    new_dem = object()
+    new_coordinates = {"001": {"lon": 120.0, "lat": 49.0}}
+
+    def dem_loader(path):
+        path = Path(path)
+        seen_paths.append(path)
+        assert path.read_bytes() == b"dem-bytes"
+        return new_dem
+
+    def tower_loader(path):
+        path = Path(path)
+        seen_paths.append(path)
+        assert path.read_bytes() == b"tower-bytes"
+        return new_coordinates
+
+    attempt = terrain.load_terrain_upload_pair(
+        b"dem-bytes",
+        b"tower-bytes",
+        dem_loader=dem_loader,
+        tower_loader=tower_loader,
+    )
+    state = {"dem_data": object(), "tower_coords": {"old": {}}}
+
+    updated = terrain.commit_terrain_snapshot(state, attempt)
+
+    assert updated is True
+    assert state == {"dem_data": new_dem, "tower_coords": new_coordinates}
+    assert len(seen_paths) == 2
+    assert all(not path.exists() for path in seen_paths)
+
+
+def test_failed_terrain_upload_pair_preserves_previous_snapshot_and_cleans_files():
+    seen_paths = []
+
+    def dem_loader(path):
+        seen_paths.append(Path(path))
+        return object()
+
+    def tower_loader(path):
+        seen_paths.append(Path(path))
+        return {}
+
+    attempt = terrain.load_terrain_upload_pair(
+        b"new-dem",
+        b"bad-towers",
+        dem_loader=dem_loader,
+        tower_loader=tower_loader,
+    )
+    previous_dem = object()
+    previous_coordinates = {"001": {"lon": 120.0, "lat": 49.0}}
+    state = {
+        "dem_data": previous_dem,
+        "tower_coords": previous_coordinates,
+    }
+
+    updated = terrain.commit_terrain_snapshot(state, attempt)
+
+    assert updated is False
+    assert state["dem_data"] is previous_dem
+    assert state["tower_coords"] is previous_coordinates
+    assert all(not path.exists() for path in seen_paths)
+
+
+def test_terrain_upload_pair_cleans_temp_files_when_loader_raises():
+    seen_paths = []
+
+    def dem_loader(path):
+        seen_paths.append(Path(path))
+        return object()
+
+    def tower_loader(path):
+        seen_paths.append(Path(path))
+        raise RuntimeError("tower parse failed")
+
+    with pytest.raises(RuntimeError, match="tower parse failed"):
+        terrain.load_terrain_upload_pair(
+            b"new-dem",
+            b"bad-towers",
+            dem_loader=dem_loader,
+            tower_loader=tower_loader,
+        )
+
+    assert len(seen_paths) == 2
+    assert all(not path.exists() for path in seen_paths)
+
+
+def test_terrain_upload_pair_cleans_partial_file_when_upload_write_fails(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(terrain.tempfile, "tempdir", str(tmp_path))
+
+    with pytest.raises(TypeError):
+        terrain.load_terrain_upload_pair(object(), b"tower-bytes")
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_page_uses_atomic_terrain_snapshot_boundary():
+    app_path = Path(__file__).parents[2] / "dispatch_app_st.py"
+    source = app_path.read_text(encoding="utf-8")
+    start = source.index('if st.button("🔄 加载地形数据"):')
+    end = source.index("    st.divider()", start)
+    load_block = source[start:end]
+
+    assert "load_terrain_upload_pair" in load_block
+    assert "commit_terrain_snapshot" in load_block
+    assert "NamedTemporaryFile" not in load_block
+    assert "st.session_state.dem_data =" not in load_block
+    assert "st.session_state.tower_coords =" not in load_block

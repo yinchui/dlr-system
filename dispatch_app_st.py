@@ -523,35 +523,32 @@ with st.sidebar:
         status = st.empty()
         status.text("正在加载地形数据...")
 
-        # 加载DEM
-        if dem_upload:
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as tmp:
-                tmp.write(dem_upload.read())
-                tmp_path = tmp.name
-            dem_data = load_dem_data(tmp_path)
-            if dem_data:
-                st.session_state.dem_data = dem_data
+        if dem_upload and tower_upload:
+            terrain_attempt = terrain_module.load_terrain_upload_pair(
+                dem_upload.read(),
+                tower_upload.read(),
+                dem_loader=load_dem_data,
+                tower_loader=load_tower_coordinates,
+            )
+            if terrain_attempt.dem_data:
                 status.success("✓ DEM加载成功")
             else:
                 status.error("✗ DEM加载失败")
-        else:
-            status.warning("⚠️ 请先上传DEM文件")
 
-        # 加载杆塔坐标
-        if tower_upload:
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
-                tmp.write(tower_upload.read())
-                tmp_path = tmp.name
-            tower_coords = load_tower_coordinates(tmp_path)
-            if tower_coords:
-                st.session_state.tower_coords = tower_coords
-                st.info(f"✓ 成功读取 {len(tower_coords)} 个杆塔坐标 (编号: {sorted(tower_coords.keys())})")
+            if terrain_attempt.tower_coords:
+                st.info(f"✓ 成功读取 {len(terrain_attempt.tower_coords)} 个杆塔坐标 (编号: {sorted(terrain_attempt.tower_coords.keys())})")
             else:
                 st.error("✗ 杆塔坐标读取失败")
+
+            terrain_module.commit_terrain_snapshot(
+                st.session_state,
+                terrain_attempt,
+            )
         else:
-            status.warning("⚠️ 请先上传杆塔坐标文件")
+            if not dem_upload:
+                status.warning("⚠️ 请先上传DEM文件")
+            if not tower_upload:
+                status.warning("⚠️ 请先上传杆塔坐标文件")
 
     st.divider()
     st.header("2. 高级功能")

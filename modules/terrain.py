@@ -1,10 +1,11 @@
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, MutableMapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from math import atan, atan2, cos, degrees, hypot, isfinite, radians, sin
-from numbers import Integral
+from numbers import Integral, Real
 import os
 import re
+import tempfile
 from typing import Any
 
 import numpy as np
@@ -76,6 +77,16 @@ class TerrainSample(Mapping[str, Any]):
 
     def __len__(self) -> int:
         return len(_SAMPLE_KEYS)
+
+
+@dataclass(frozen=True)
+class TerrainLoadAttempt:
+    dem_data: Any
+    tower_coords: Any
+
+    @property
+    def success(self) -> bool:
+        return self.dem_data is not None and bool(self.tower_coords)
 
 
 class MissingTowerColumnsError(ValueError):
@@ -366,16 +377,9 @@ def load_tower_coordinates(excel_file, tower_nums=None) -> dict[str, dict[str, f
             f"关键列未找到！检测到的列: {frame.columns.tolist()}"
         )
 
-    filters = None
-    if tower_nums is not None:
-        filters = set()
-        for tower_num in tower_nums:
-            try:
-                filters.add(_normalize_tower_id(tower_num))
-            except (TypeError, ValueError):
-                continue
-
     output = {}
+    observed_ids = set()
+    conflicting_ids = set()
     for _, row in frame.iterrows():
         try:
             tower_id = _normalize_tower_id(row[name_col])
@@ -385,14 +389,124 @@ def load_tower_coordinates(excel_file, tower_nums=None) -> dict[str, dict[str, f
             continue
         if not isfinite(longitude) or not isfinite(latitude):
             continue
-        if filters is not None and tower_id not in filters:
+        observed_ids.add(tower_id)
+        if tower_id in conflicting_ids:
             continue
-        output[tower_id] = {"lon": longitude, "lat": latitude}
-    return output
+        coordinates = {"lon": longitude, "lat": latitude}
+        if tower_id not in output:
+            output[tower_id] = coordinates
+        elif output[tower_id] != coordinates:
+            output.pop(tower_id)
+            conflicting_ids.add(tower_id)
+    return _filter_tower_coordinates(
+        output,
+        tower_nums,
+        numeric_candidate_ids=observed_ids,
+    )
 
 
-def _is_legacy_integer(value) -> bool:
-    return isinstance(value, Integral) and not isinstance(value, (bool, np.bool_))
+def _is_legacy_numeric_position(value) -> bool:
+    if isinstance(value, (bool, np.bool_)):
+        return False
+    if isinstance(value, (Integral, np.integer)):
+        return int(value) >= 0
+    if not isinstance(value, (Real, np.floating)):
+        return False
+    numeric = float(value)
+    return isfinite(numeric) and numeric >= 0 and numeric.is_integer()
+
+
+def _filter_tower_coordinates(
+    coordinates: Mapping,
+    tower_nums,
+    *,
+    numeric_candidate_ids=None,
+) -> dict:
+    if tower_nums is None:
+        return dict(coordinates)
+
+    if numeric_candidate_ids is None:
+        numeric_candidate_ids = coordinates
+
+    selected_ids = set()
+    for tower_num in tower_nums:
+        if _is_legacy_numeric_position(tower_num):
+            number = int(tower_num)
+            matches = [
+                tower_id
+                for tower_id in numeric_candidate_ids
+                if int(tower_id) == number
+            ]
+            if len(matches) == 1 and matches[0] in coordinates:
+                selected_ids.add(matches[0])
+            continue
+        try:
+            tower_id = _normalize_tower_id(tower_num)
+        except (TypeError, ValueError):
+            continue
+        if tower_id in coordinates:
+            selected_ids.add(tower_id)
+    return {
+        tower_id: coordinate
+        for tower_id, coordinate in coordinates.items()
+        if tower_id in selected_ids
+    }
+
+
+def _write_temporary_upload(content: bytes, suffix: str) -> str:
+    path = None
+    completed = False
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temporary_file:
+            path = temporary_file.name
+            temporary_file.write(content)
+        completed = True
+        return path
+    finally:
+        if path is not None and not completed:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
+def load_terrain_upload_pair(
+    dem_content: bytes,
+    tower_content: bytes,
+    *,
+    dem_loader=load_dem_data,
+    tower_loader=load_tower_coordinates,
+) -> TerrainLoadAttempt:
+    temporary_paths = []
+    try:
+        dem_path = _write_temporary_upload(dem_content, ".tif")
+        temporary_paths.append(dem_path)
+        tower_path = _write_temporary_upload(tower_content, ".xlsx")
+        temporary_paths.append(tower_path)
+        dem_data = dem_loader(dem_path)
+        tower_coords = tower_loader(tower_path)
+        return TerrainLoadAttempt(dem_data=dem_data, tower_coords=tower_coords)
+    finally:
+        for path in temporary_paths:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
+def commit_terrain_snapshot(
+    state: MutableMapping,
+    attempt: TerrainLoadAttempt,
+) -> bool:
+    if not attempt.success:
+        return False
+    state.update(
+        {
+            "dem_data": attempt.dem_data,
+            "tower_coords": attempt.tower_coords,
+        }
+    )
+    return True
 
 
 def _find_coordinates(
@@ -436,7 +550,9 @@ def build_terrain_lookup(
     weather_positions: list,
 ) -> dict:
     positions = list(weather_positions)
-    legacy_mode = bool(positions) and all(_is_legacy_integer(value) for value in positions)
+    legacy_mode = bool(positions) and all(
+        _is_legacy_numeric_position(value) for value in positions
+    )
     output = {}
 
     for index, position in enumerate(positions):

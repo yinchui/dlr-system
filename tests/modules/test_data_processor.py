@@ -166,9 +166,117 @@ def test_canonical_weather_rejects_invalid_role():
 
 def test_normalize_tower_id_requires_a_parseable_number():
     assert data_processor.normalize_tower_id("001号") == "001"
+    assert data_processor.normalize_tower_id("塔001号") == "001"
     assert data_processor.normalize_tower_id(36) == "36"
     with pytest.raises(ValueError, match="无法解析杆塔编号"):
         data_processor.normalize_tower_id("塔A")
+
+
+@pytest.mark.parametrize("value", [36.0, "36.0"])
+def test_normalize_tower_id_normalizes_integer_decimal_values(value):
+    assert data_processor.normalize_tower_id(value) == "36"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [36.5, "36.5", float("nan"), float("inf"), "-inf"],
+)
+def test_normalize_tower_id_rejects_non_integer_or_non_finite_values(value):
+    with pytest.raises(ValueError, match="无法解析杆塔编号"):
+        data_processor.normalize_tower_id(value)
+
+
+def test_canonical_weather_rejects_non_integer_legacy_tower_without_tail_match():
+    raw = pd.DataFrame(
+        {
+            "位置": [36.0, 36.5],
+            "日期": ["2026-07-23", "2026-07-23"],
+            "时刻": ["00:00", "00:30"],
+            "环境温度": [20.0, 20.0],
+            "风速": [2.0, 2.0],
+            "风向": [90.0, 90.0],
+        }
+    )
+
+    result = data_processor.canonicalize_weather_frame(raw, role="physical")
+
+    assert result.frame["tower_id"].tolist() == ["36"]
+    assert result.report.reasons["invalid_tower_id"] == 1
+
+
+@pytest.mark.parametrize(
+    ("invalid_time", "valid_time"),
+    [
+        ("2026-03-08 02:30", "2026-03-08 03:30"),
+        ("2026-11-01 01:30", "2026-11-01 03:30"),
+    ],
+)
+def test_canonical_weather_drops_dst_invalid_time_but_keeps_valid_row(
+    invalid_time,
+    valid_time,
+):
+    raw = pd.DataFrame(
+        {
+            "时间": [invalid_time, valid_time],
+            "杆塔": ["001号", "002号"],
+            "风速WS(m/s)": [2.0, 2.0],
+            "风向WD(°)": [90.0, 90.0],
+            "温度TEM(℃)": [20.0, 20.0],
+        }
+    )
+
+    result = data_processor.canonicalize_weather_frame(
+        raw,
+        role="physical",
+        timezone="America/New_York",
+    )
+
+    assert result.frame["tower_id"].tolist() == ["002"]
+    assert result.report.dropped_rows == 1
+    assert result.report.reasons["invalid_timestamp"] == 1
+
+
+def test_canonical_weather_parses_mixed_timezone_offsets_row_by_row():
+    raw = pd.DataFrame(
+        {
+            "时间": [
+                "2026-07-23 00:00:00+08:00",
+                "2026-07-23 00:00:00+09:00",
+            ],
+            "杆塔": ["001号", "002号"],
+            "风速WS(m/s)": [2.0, 2.0],
+            "风向WD(°)": [90.0, 90.0],
+            "温度TEM(℃)": [20.0, 20.0],
+        }
+    )
+
+    result = data_processor.canonicalize_weather_frame(
+        raw,
+        role="physical",
+        timezone="Asia/Shanghai",
+    )
+
+    assert result.frame["timestamp"].map(lambda value: value.isoformat()).tolist() == [
+        "2026-07-23T00:00:00+08:00",
+        "2026-07-22T23:00:00+08:00",
+    ]
+
+
+def test_canonical_weather_drops_new_format_row_when_direction_is_missing():
+    raw = pd.DataFrame(
+        {
+            "时间": ["2026-07-23 00:00"],
+            "杆塔": ["001号"],
+            "风速WS(m/s)": [2.0],
+            "温度TEM(℃)": [20.0],
+        }
+    )
+
+    result = data_processor.canonicalize_weather_frame(raw, role="physical")
+
+    assert result.frame.empty
+    assert result.report.dropped_rows == 1
+    assert result.report.reasons["missing_wind_direction"] == 1
 
 
 def test_interpolate_analysis_dataset_returns_expected_shapes():

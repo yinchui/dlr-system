@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import numpy as np
 import pandas as pd
+from pytz.exceptions import AmbiguousTimeError, NonExistentTimeError
 
 from config.config import PHYSICAL_BOUNDS, PROJECT_TIMEZONE
 
@@ -105,10 +106,27 @@ def _tower_number(value):
 
 def normalize_tower_id(value) -> str:
     text = str(value).strip()
-    match = re.search(r"(\d+)(?=\s*号|$)", text)
-    if match:
-        return match.group(1)
+    label_match = re.search(r"(?<![\d.])(\d+)\s*号$", text)
+    if label_match:
+        return label_match.group(1)
+    if re.fullmatch(r"\d+", text):
+        return text
+
+    numeric = pd.to_numeric(text, errors="coerce")
+    if pd.notna(numeric) and np.isfinite(numeric) and numeric >= 0:
+        integer = int(numeric)
+        if numeric == integer:
+            return str(integer)
     raise ValueError("无法解析杆塔编号")
+
+
+def _parse_datetime_value(value):
+    if pd.isna(value):
+        return pd.NaT
+    try:
+        return pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return pd.NaT
 
 
 def _normalize_tower_time_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -121,16 +139,20 @@ def _normalize_tower_time_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     normalized = pd.DataFrame(index=df.index)
     normalized["position"] = df[tower_col].map(_tower_number)
-    parsed_time = pd.to_datetime(df[time_col], errors="coerce")
-    normalized["date"] = parsed_time.dt.strftime("%Y-%m-%d")
-    normalized["time_str"] = parsed_time.dt.strftime("%H:%M")
+    parsed_time = df[time_col].map(_parse_datetime_value)
+    normalized["date"] = parsed_time.map(
+        lambda value: value.strftime("%Y-%m-%d") if pd.notna(value) else np.nan
+    )
+    normalized["time_str"] = parsed_time.map(
+        lambda value: value.strftime("%H:%M") if pd.notna(value) else np.nan
+    )
     normalized["wind_speed"] = pd.to_numeric(df[wind_col], errors="coerce")
 
     direction_col = _find_column(columns, lambda c: "风向WD" in c or "WD(" in c)
     temp_col = _find_column(columns, lambda c: "温度TEM" in c or "TEM(" in c)
     humidity_col = _find_column(columns, lambda c: "相对湿度RHU" in c or "RHU(" in c)
     normalized["wind_direction"] = (
-        pd.to_numeric(df[direction_col], errors="coerce") if direction_col else 0.0
+        pd.to_numeric(df[direction_col], errors="coerce") if direction_col else np.nan
     )
     normalized["ambient_temp"] = (
         pd.to_numeric(df[temp_col], errors="coerce") if temp_col else np.nan
@@ -345,7 +367,7 @@ def _parse_timestamp(value, target_timezone: ZoneInfo):
                 nonexistent="raise",
             )
         return timestamp.tz_convert(target_timezone)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, AmbiguousTimeError, NonExistentTimeError):
         return pd.NaT
 
 

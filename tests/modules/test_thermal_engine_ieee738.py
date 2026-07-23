@@ -264,6 +264,43 @@ def test_steady_state_temperature_expands_verified_bracket_and_rejects_no_root()
     assert params == before
 
 
+def test_steady_state_temperature_accepts_verified_low_endpoint_immediately():
+    calculator = EngineThermalCalculator()
+    params = {
+        **copy.deepcopy(DRAKE_STEADY_PARAMS),
+        "T_s": DRAKE_STEADY_PARAMS["T_a"],
+        "T_avg": DRAKE_STEADY_PARAMS["T_a"],
+        "solar_radiation": 0.0,
+    }
+    before = copy.deepcopy(params)
+    current = math.sqrt(0.5e-6 / calculator.calculate_resistance(params))
+
+    temperature = calculator.calculate_steady_state_temperature(
+        params, current=current, max_iter=1, tol=1e-12
+    )
+
+    assert temperature == params["T_a"]
+    assert params == before
+
+
+def test_steady_state_temperature_accepts_verified_high_endpoint_immediately():
+    calculator = EngineThermalCalculator()
+    params = {
+        **copy.deepcopy(DRAKE_STEADY_PARAMS),
+        "T_s": 200.0,
+        "T_avg": 200.0,
+    }
+    before = copy.deepcopy(params)
+    current = calculator.calculate_steady_state_current(params)
+
+    temperature = calculator.calculate_steady_state_temperature(
+        params, current=current, max_iter=1, tol=1e-12
+    )
+
+    assert temperature == 200.0
+    assert params == before
+
+
 def test_steady_state_temperature_rejects_discontinuous_resistance_pseudo_root():
     params = copy.deepcopy(DRAKE_STEADY_PARAMS)
     before = copy.deepcopy(params)
@@ -307,7 +344,7 @@ def test_steady_state_temperature_keeps_true_drake_rated_temperature_root():
     current = calculator.calculate_steady_state_current(params)
 
     temperature = calculator.calculate_steady_state_temperature(
-        params, current=current, max_iter=200, tol=1e-12
+        params, current=current, max_iter=3, tol=1e-12
     )
 
     assert temperature == pytest.approx(100.0, abs=1e-9)

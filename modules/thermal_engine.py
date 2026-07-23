@@ -120,29 +120,47 @@ class ThermalCalculator:
                 - balance.q_radiation
             )
 
+        def residual_is_verified(residual: float) -> bool:
+            return (
+                abs(residual)
+                <= self._STEADY_STATE_RESIDUAL_TOLERANCE_W_PER_M
+            )
+
         low = ambient_temp
         low_residual = heat_residual(low)
-        if low_residual == 0.0:
+        if residual_is_verified(low_residual):
             return low
 
         high = min(
             max(200.0, low + 1.0), self._MAX_CONDUCTOR_TEMPERATURE_C
         )
         high_residual = heat_residual(high)
+        if residual_is_verified(high_residual):
+            return high
         while high_residual > 0.0 and high < self._MAX_CONDUCTOR_TEMPERATURE_C:
             high = min(
                 low + 2.0 * (high - low),
                 self._MAX_CONDUCTOR_TEMPERATURE_C,
             )
             high_residual = heat_residual(high)
+            if residual_is_verified(high_residual):
+                return high
         if high_residual > 0.0:
             raise ValueError("steady-state root is outside the physical temperature range")
 
         for _ in range(max_iter):
             mid = (low + high) / 2.0
             if mid == low or mid == high:
+                candidate_temp, candidate_residual = min(
+                    ((low, low_residual), (high, high_residual)),
+                    key=lambda candidate: abs(candidate[1]),
+                )
+                if residual_is_verified(candidate_residual):
+                    return candidate_temp
                 raise ValueError("steady-state root did not converge within max_iter")
             mid_residual = heat_residual(mid)
+            if residual_is_verified(mid_residual):
+                return mid
             if mid_residual > 0.0:
                 low = mid
                 low_residual = mid_residual
@@ -154,10 +172,7 @@ class ThermalCalculator:
                     ((low, low_residual), (high, high_residual)),
                     key=lambda candidate: abs(candidate[1]),
                 )
-                if (
-                    abs(candidate_residual)
-                    <= self._STEADY_STATE_RESIDUAL_TOLERANCE_W_PER_M
-                ):
+                if residual_is_verified(candidate_residual):
                     return candidate_temp
         raise ValueError("steady-state root did not converge within max_iter")
 

@@ -682,7 +682,7 @@ class LineAnalyzer:
             raise ValueError(f"{name} must contain finite numbers")
         try:
             array = np.asarray(values, dtype=float)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(f"{name} must contain finite numbers") from exc
         if array.shape != expected_shape:
             raise ValueError(f"{name} must have shape {expected_shape}")
@@ -1006,7 +1006,7 @@ class LineAnalyzer:
             raise ValueError(f"{key} must contain finite numbers")
         try:
             values = np.asarray(container[key], dtype=float)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(f"{key} must contain finite numbers") from exc
         if values.ndim != 1:
             raise ValueError(f"{key} must be one-dimensional")

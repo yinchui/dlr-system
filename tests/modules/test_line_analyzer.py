@@ -7,6 +7,9 @@ import pytest
 from modules.thermal_engine import LineAnalyzer, ThermalCalculator
 
 
+HUGE = 10 ** 1000
+
+
 def drake_conductor():
     return {
         "D0": 0.02814,
@@ -221,6 +224,16 @@ def test_line_analyzer_rejects_nonfinite_weather(analyzer, key, index):
         )
 
 
+def test_line_analyzer_rejects_overflowing_weather_values(analyzer):
+    weather = weather_matrix()
+    weather["elevations"] = [HUGE, HUGE]
+
+    with pytest.raises(ValueError, match="elevations"):
+        analyzer.calculate_max_current_for_points(
+            **weather, base_params=drake_conductor()
+        )
+
+
 def test_line_analyzer_rejects_scalar_time_axis(analyzer):
     weather = weather_matrix()
     weather["times"] = 10.0
@@ -424,6 +437,16 @@ def test_dynamic_temperature_rejects_boolean_current_samples(analyzer):
         )
 
 
+def test_dynamic_temperature_rejects_overflowing_current_samples(analyzer):
+    with pytest.raises(ValueError, match="current_profile"):
+        analyzer.calculate_dynamic_temperature(
+            env_params={"temp": np.array([100.0])},
+            params=drake_thermal_params(),
+            current_profile=[HUGE],
+            dt_hours=1.0,
+        )
+
+
 def test_find_max_current_for_window_rejects_nonincreasing_times(analyzer):
     params = {**drake_thermal_params(), "max_allow_temp": 125.0}
 
@@ -435,6 +458,19 @@ def test_find_max_current_for_window_rejects_nonincreasing_times(analyzer):
             },
             base_static=1025.0,
             params=params,
+            dt_hours=1.0,
+        )
+
+
+def test_find_max_current_for_window_rejects_overflowing_weather(analyzer):
+    with pytest.raises(ValueError, match="temp"):
+        analyzer.find_max_current_for_window(
+            env_params={
+                "times": [0.0, 1.0],
+                "temp": [HUGE, HUGE],
+            },
+            base_static=100.0,
+            params={**drake_thermal_params(), "max_allow_temp": 125.0},
             dt_hours=1.0,
         )
 

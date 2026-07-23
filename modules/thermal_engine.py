@@ -27,6 +27,7 @@ class ThermalCalculator:
     """基于 IEEE Std 738-2023 的裸导线电流-温度关系计算器。"""
 
     _MAX_CONDUCTOR_TEMPERATURE_C = 1004.0
+    _STEADY_STATE_RESIDUAL_TOLERANCE_W_PER_M = 1e-6
 
     def __init__(self):
         # --- 基础材料参数 ---
@@ -139,13 +140,25 @@ class ThermalCalculator:
 
         for _ in range(max_iter):
             mid = (low + high) / 2.0
+            if mid == low or mid == high:
+                raise ValueError("steady-state root did not converge within max_iter")
             mid_residual = heat_residual(mid)
             if mid_residual > 0.0:
                 low = mid
+                low_residual = mid_residual
             else:
                 high = mid
+                high_residual = mid_residual
             if high - low < tol:
-                return (low + high) / 2.0
+                candidate_temp, candidate_residual = min(
+                    ((low, low_residual), (high, high_residual)),
+                    key=lambda candidate: abs(candidate[1]),
+                )
+                if (
+                    abs(candidate_residual)
+                    <= self._STEADY_STATE_RESIDUAL_TOLERANCE_W_PER_M
+                ):
+                    return candidate_temp
         raise ValueError("steady-state root did not converge within max_iter")
 
     def calculate_transient_temperature(self, params: Dict, time_steps: List[float],

@@ -257,20 +257,58 @@ def test_steady_state_temperature_expands_verified_bracket_and_rejects_no_root()
         - balance.q_radiation
     )
 
-    assert 200.0 < temperature < 1004.0
-    assert residual == pytest.approx(0.0, abs=1e-3)
+    assert temperature == pytest.approx(475.232159, abs=1e-6)
+    assert residual == pytest.approx(0.0, abs=1e-6)
     with pytest.raises(ValueError, match="physical temperature range"):
         calculator.calculate_steady_state_temperature(params, current=1_000_000.0)
+    assert params == before
+
+
+def test_steady_state_temperature_rejects_discontinuous_resistance_pseudo_root():
+    params = copy.deepcopy(DRAKE_STEADY_PARAMS)
+    before = copy.deepcopy(params)
+
+    with pytest.raises(ValueError):
+        EngineThermalCalculator().calculate_steady_state_temperature(
+            params,
+            current=1025.2248468542948,
+            max_iter=200,
+            tol=1e-12,
+        )
+
     assert params == before
 
 
 def test_steady_state_temperature_keeps_normal_drake_solution():
     params = copy.deepcopy(DRAKE_STEADY_PARAMS)
     before = copy.deepcopy(params)
+    calculator = EngineThermalCalculator()
 
-    temperature = EngineThermalCalculator().calculate_steady_state_temperature(
-        params, current=1000.0
+    temperature = calculator.calculate_steady_state_temperature(params, current=1000.0)
+    balance = calculator.calculate_heat_balance(
+        {**params, "T_s": temperature, "T_avg": temperature}
+    )
+    residual = (
+        1000.0 ** 2 * balance.resistance
+        + balance.q_solar
+        - balance.q_convection
+        - balance.q_radiation
     )
 
     assert temperature == pytest.approx(97.5, abs=0.1)
+    assert residual == pytest.approx(0.0, abs=1e-6)
+    assert params == before
+
+
+def test_steady_state_temperature_keeps_true_drake_rated_temperature_root():
+    params = copy.deepcopy(DRAKE_STEADY_PARAMS)
+    before = copy.deepcopy(params)
+    calculator = EngineThermalCalculator()
+    current = calculator.calculate_steady_state_current(params)
+
+    temperature = calculator.calculate_steady_state_temperature(
+        params, current=current, max_iter=200, tol=1e-12
+    )
+
+    assert temperature == pytest.approx(100.0, abs=1e-9)
     assert params == before

@@ -7,10 +7,6 @@
 # 1.01 so that it reproduces this official example.
 DRAKE_STEADY_PARAMS = {
     "D0": 0.02814,
-    "R25": 7.283e-5,
-    "R75": 8.688e-5,
-    "R200": 1.220e-4,
-    # Legacy aliases retained while callers move to the IEEE-named inputs above.
     "R_low_25": 7.283e-5,
     "R_high_75": 8.688e-5,
     "R_high_200": 1.220e-4,

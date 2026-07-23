@@ -500,12 +500,42 @@ def commit_terrain_snapshot(
 ) -> bool:
     if not attempt.success:
         return False
-    state.update(
-        {
-            "dem_data": attempt.dem_data,
-            "tower_coords": attempt.tower_coords,
-        }
-    )
+
+    missing = object()
+    keys = ("dem_data", "tower_coords")
+    previous_values = {}
+    for key in keys:
+        try:
+            previous_values[key] = state[key]
+        except KeyError:
+            previous_values[key] = missing
+
+    try:
+        state["dem_data"] = attempt.dem_data
+        state["tower_coords"] = attempt.tower_coords
+    except Exception as commit_error:
+        rollback_errors = []
+        for key in keys:
+            try:
+                previous_value = previous_values[key]
+                if previous_value is missing:
+                    try:
+                        del state[key]
+                    except KeyError:
+                        pass
+                else:
+                    state[key] = previous_value
+            except Exception as rollback_error:
+                rollback_errors.append((key, rollback_error))
+
+        if rollback_errors:
+            details = "; ".join(
+                f"{key}: {error}" for key, error in rollback_errors
+            )
+            raise RuntimeError(
+                f"Terrain snapshot commit failed; rollback incomplete ({details})"
+            ) from commit_error
+        raise
     return True
 
 

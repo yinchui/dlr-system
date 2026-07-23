@@ -1,3 +1,4 @@
+from collections.abc import MutableMapping
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -12,6 +13,48 @@ from rasterio.io import MemoryFile
 from rasterio.transform import from_origin
 
 import modules.terrain as terrain
+
+
+class _FailingTerrainState(MutableMapping):
+    def __init__(
+        self,
+        initial,
+        *,
+        mutate_tower_before_failure=False,
+        fail_dem_rollback=False,
+    ):
+        self.data = dict(initial)
+        self._old_dem = self.data.get("dem_data")
+        self._tower_write_failed = False
+        self._mutate_tower_before_failure = mutate_tower_before_failure
+        self._fail_dem_rollback = fail_dem_rollback
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+    def __setitem__(self, key, value):
+        if key == "tower_coords" and not self._tower_write_failed:
+            self._tower_write_failed = True
+            if self._mutate_tower_before_failure:
+                self.data[key] = value
+            raise RuntimeError("tower write failed")
+        if (
+            key == "dem_data"
+            and self._tower_write_failed
+            and self._fail_dem_rollback
+            and value is self._old_dem
+        ):
+            raise RuntimeError("dem rollback failed")
+        self.data[key] = value
+
+    def __delitem__(self, key):
+        del self.data[key]
+
+    def __iter__(self):
+        return iter(self.data)
+
+    def __len__(self):
+        return len(self.data)
 
 
 def write_test_geotiff(
@@ -583,6 +626,57 @@ def test_failed_terrain_upload_pair_preserves_previous_snapshot_and_cleans_files
     assert state["dem_data"] is previous_dem
     assert state["tower_coords"] is previous_coordinates
     assert all(not path.exists() for path in seen_paths)
+
+
+def test_terrain_snapshot_commit_rolls_back_existing_values_on_second_write_failure():
+    old_dem = object()
+    old_towers = {"old": {}}
+    state = _FailingTerrainState(
+        {"dem_data": old_dem, "tower_coords": old_towers}
+    )
+    attempt = terrain.TerrainLoadAttempt(
+        dem_data=object(),
+        tower_coords={"001": {"lon": 120.0, "lat": 49.0}},
+    )
+
+    with pytest.raises(RuntimeError, match="tower write failed"):
+        terrain.commit_terrain_snapshot(state, attempt)
+
+    assert state.data["dem_data"] is old_dem
+    assert state.data["tower_coords"] is old_towers
+
+
+def test_terrain_snapshot_commit_removes_new_keys_after_second_write_failure():
+    state = _FailingTerrainState({})
+    attempt = terrain.TerrainLoadAttempt(
+        dem_data=object(),
+        tower_coords={"001": {"lon": 120.0, "lat": 49.0}},
+    )
+
+    with pytest.raises(RuntimeError, match="tower write failed"):
+        terrain.commit_terrain_snapshot(state, attempt)
+
+    assert state.data == {}
+
+
+def test_terrain_snapshot_commit_reports_rollback_failure_and_keeps_restoring():
+    old_dem = object()
+    old_towers = {"old": {}}
+    state = _FailingTerrainState(
+        {"dem_data": old_dem, "tower_coords": old_towers},
+        mutate_tower_before_failure=True,
+        fail_dem_rollback=True,
+    )
+    attempt = terrain.TerrainLoadAttempt(
+        dem_data=object(),
+        tower_coords={"001": {"lon": 120.0, "lat": 49.0}},
+    )
+
+    with pytest.raises(RuntimeError, match="rollback.*dem rollback failed") as error:
+        terrain.commit_terrain_snapshot(state, attempt)
+
+    assert str(error.value.__cause__) == "tower write failed"
+    assert state.data["tower_coords"] is old_towers
 
 
 def test_terrain_upload_pair_cleans_temp_files_when_loader_raises():

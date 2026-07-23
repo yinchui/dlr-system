@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 
 import modules.ai_training as ai_training
-from modules.ai_prediction import ResidualPredictor
+from modules.ai_prediction import FeatureBuilder, ResidualPredictor
 from modules.ai_training import ResidualTrainer
 
 
@@ -69,9 +69,9 @@ def make_training_frame(
         timestamps = pd.to_datetime(
             [
                 "2025-01-01 00:00",
-                "2025-01-01 01:00",
+                "2025-01-01 00:30",
                 "2025-01-02 00:00",
-                "2025-01-02 01:00",
+                "2025-01-02 00:30",
             ],
             utc=True,
         )
@@ -387,3 +387,15 @@ def test_default_estimator_has_deterministic_xgboost_parameters(monkeypatch):
         "random_state": 42,
         "n_jobs": 1,
     }
+
+
+def test_training_persists_feature_cadence_in_bundle_and_metadata():
+    trainer = ResidualTrainer(
+        estimator_factory=constant_factory,
+        feature_builder=FeatureBuilder(cadence_minutes=60),
+    )
+
+    result = trainer.train_target(make_training_frame(), target="wind_speed")
+
+    assert result.bundle.cadence_minutes == 60.0
+    assert result.metadata["cadence_minutes"] == 60.0

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
+from numbers import Real
 from pathlib import Path
 from typing import Optional
 
@@ -9,7 +10,7 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from config.config import PHYSICAL_BOUNDS
+from config.config import DEFAULT_INTERVAL_MINUTES, PHYSICAL_BOUNDS
 
 
 _OPTIONAL_FEATURES = {
@@ -73,6 +74,25 @@ class FeatureBuilder:
         "dataset_role",
     )
 
+    def __init__(self, cadence_minutes: Real = DEFAULT_INTERVAL_MINUTES):
+        if (
+            isinstance(cadence_minutes, bool)
+            or not isinstance(cadence_minutes, Real)
+            or not np.isfinite(cadence_minutes)
+            or cadence_minutes <= 0
+        ):
+            raise ValueError("cadence_minutes must be a positive finite number")
+        try:
+            cadence = pd.Timedelta(minutes=float(cadence_minutes))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "cadence_minutes must define a valid interval"
+            ) from exc
+        if pd.isna(cadence) or cadence <= pd.Timedelta(0):
+            raise ValueError("cadence_minutes must define a valid interval")
+        self.cadence_minutes = float(cadence_minutes)
+        self._cadence_nanoseconds = int(cadence.value)
+
     def feature_columns(self, physical_col: str) -> list[str]:
         if not isinstance(physical_col, str) or not physical_col.strip():
             raise ValueError("physical_col must be a non-empty string")
@@ -129,22 +149,10 @@ class FeatureBuilder:
         )
         return columns
 
-    @staticmethod
-    def _cadence_ns(timestamp_values: pd.Series) -> Optional[int]:
-        nanoseconds = timestamp_values.astype("int64").to_numpy()
-        positive_differences = np.diff(nanoseconds)
-        positive_differences = positive_differences[positive_differences > 0]
-        if positive_differences.size == 0:
-            return None
-        values, counts = np.unique(positive_differences, return_counts=True)
-        maximum_count = counts.max()
-        return int(values[counts == maximum_count].min())
-
-    @classmethod
-    def _ordered_with_segments(cls, frame: pd.DataFrame) -> pd.DataFrame:
+    def _ordered_with_segments(self, frame: pd.DataFrame) -> pd.DataFrame:
         working = frame.copy(deep=True)
         working["__feature_row_order__"] = np.arange(len(working), dtype=np.int64)
-        group_columns = cls._group_columns(working)
+        group_columns = self._group_columns(working)
         duplicate_columns = [*group_columns, "timestamp"]
         if working.duplicated(subset=duplicate_columns, keep=False).any():
             raise ValueError(
@@ -161,16 +169,12 @@ class FeatureBuilder:
         for _, positions in grouped.indices.items():
             positions = np.asarray(positions, dtype=np.int64)
             group_timestamps = ordered.iloc[positions]["timestamp"]
-            cadence_ns = cls._cadence_ns(group_timestamps)
             group_segments = np.zeros(len(positions), dtype=np.int64)
             if len(positions) > 1:
                 differences = np.diff(
                     group_timestamps.astype("int64").to_numpy()
                 )
-                if cadence_ns is None:
-                    breaks = np.ones(len(differences), dtype=bool)
-                else:
-                    breaks = differences != cadence_ns
+                breaks = differences != self._cadence_nanoseconds
                 group_segments[1:] = np.cumsum(breaks)
             group_segments += next_segment
             segments[positions] = group_segments
@@ -306,6 +310,7 @@ class ModelBundle:
     line_id: Optional[str] = None
     tower_id: Optional[str] = None
     metadata: dict = field(default_factory=dict)
+    cadence_minutes: float = float(DEFAULT_INTERVAL_MINUTES)
 
 
 class ResidualPredictor:
@@ -322,7 +327,10 @@ class ResidualPredictor:
         return cls(bundles)
 
     def build_features(
-        self, df: pd.DataFrame, physical_col: str
+        self,
+        df: pd.DataFrame,
+        physical_col: str,
+        cadence_minutes: Optional[Real] = None,
     ) -> pd.DataFrame:
         if not isinstance(df, pd.DataFrame):
             raise TypeError("df must be a pandas DataFrame")
@@ -330,7 +338,12 @@ class ResidualPredictor:
         feature_input = df.copy(deep=True)
         if legacy_single_tower:
             feature_input["tower_id"] = "__legacy_single_tower__"
-        features = self.feature_builder.transform(
+        feature_builder = (
+            self.feature_builder
+            if cadence_minutes is None
+            else FeatureBuilder(cadence_minutes=cadence_minutes)
+        )
+        features = feature_builder.transform(
             feature_input, physical_col=physical_col
         )
         if legacy_single_tower:
@@ -414,7 +427,11 @@ class ResidualPredictor:
             raise ValueError("model target does not match requested target")
         self._validate_bundle_scope(output, bundle)
 
-        features = self.build_features(output, physical_col)
+        features = self.build_features(
+            output,
+            physical_col,
+            cadence_minutes=bundle.cadence_minutes,
+        )
         missing = [
             column
             for column in bundle.feature_columns

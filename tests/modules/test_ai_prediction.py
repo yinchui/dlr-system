@@ -23,6 +23,12 @@ class ExplodingModel:
         raise OSError("model unavailable")
 
 
+class RecordingLagModel:
+    def predict(self, features):
+        self.lag_values = features["lag_1"].tolist()
+        return np.zeros(len(features))
+
+
 def make_interleaved_two_tower_training_frame():
     return pd.DataFrame(
         {
@@ -32,8 +38,8 @@ def make_interleaved_two_tower_training_frame():
                 [
                     "2025-12-10 00:00",
                     "2025-12-10 00:00",
-                    "2025-12-10 01:00",
-                    "2025-12-10 01:00",
+                    "2025-12-10 00:30",
+                    "2025-12-10 00:30",
                 ]
             ),
             "source_file_hash": ["dataset-a"] * 4,
@@ -80,10 +86,10 @@ def test_lag_resets_across_dataset_and_irregular_time_gap():
             "timestamp": pd.to_datetime(
                 [
                     "2025-01-01 00:00",
-                    "2025-01-01 01:00",
+                    "2025-01-01 00:30",
                     "2025-01-01 04:00",
                     "2025-01-01 05:00",
-                    "2025-01-01 06:00",
+                    "2025-01-01 05:30",
                 ]
             ),
             "source_file_hash": ["a", "a", "a", "b", "b"],
@@ -120,6 +126,66 @@ def test_lag_resets_when_truth_source_hash_changes():
     )
 
     assert features["lag_1"].tolist() == [1.0, 1.0, 3.0]
+
+
+def test_explicit_cadence_resets_every_gap_without_guessing_from_group():
+    frame = pd.DataFrame(
+        {
+            "tower_id": ["001"] * 4,
+            "timestamp": pd.to_datetime(
+                [
+                    "2025-01-01 00:00",
+                    "2025-01-01 01:00",
+                    "2025-01-01 03:00",
+                    "2025-01-01 05:00",
+                ]
+            ),
+            "wind_speed_local": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+
+    features = FeatureBuilder(cadence_minutes=60).transform(
+        frame, physical_col="wind_speed_local"
+    )
+
+    assert features["lag_1"].tolist() == [1.0, 1.0, 3.0, 4.0]
+
+
+def test_predictor_uses_cadence_persisted_in_model_bundle():
+    frame = pd.DataFrame(
+        {
+            "tower_id": ["001", "001"],
+            "timestamp": pd.to_datetime(
+                ["2025-01-01 00:00", "2025-01-01 01:00"]
+            ),
+            "wind_speed_local": [3.0, 4.0],
+        }
+    )
+    model = RecordingLagModel()
+    bundle = ModelBundle(
+        target_name="wind_speed",
+        feature_columns=["lag_1"],
+        model=model,
+        cadence_minutes=60,
+    )
+
+    ResidualPredictor({"wind_speed": bundle}).predict(
+        frame, target_name="wind_speed", physical_col="wind_speed_local"
+    )
+
+    assert model.lag_values == [3.0, 3.0]
+
+
+def test_model_bundle_keeps_residual_bounds_positional_compatibility():
+    bundle = ModelBundle(
+        "wind_speed",
+        ["wind_speed_local"],
+        OffsetModel(),
+        None,
+        (-5.0, 5.0),
+    )
+
+    assert bundle.residual_bounds == (-5.0, 5.0)
 
 
 def test_feature_columns_are_deterministic_and_cycles_are_finite():

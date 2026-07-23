@@ -5,7 +5,7 @@ from typing import Any, Mapping, Optional
 import numpy as np
 import pandas as pd
 
-from config.config import CORRECTION_DEFAULTS
+from config.config import CORRECTION_DEFAULTS, PHYSICAL_BOUNDS
 
 
 @dataclass
@@ -27,6 +27,13 @@ class CorrectionOptions:
 class WeatherCorrectionService:
     """Apply local weather corrections once and retain the physical measurements."""
 
+    REQUIRED_PHYSICAL_COLUMNS = (
+        "wind_speed",
+        "ambient_temp",
+        "solar_radiation",
+        "wind_direction",
+    )
+
     @staticmethod
     def _finite(value: Any, default: float = 0.0, minimum: Optional[float] = None) -> float:
         try:
@@ -38,6 +45,37 @@ class WeatherCorrectionService:
         if minimum is not None:
             number = max(minimum, number)
         return float(number)
+
+    @classmethod
+    def _validated_physical_inputs(cls, df: pd.DataFrame) -> dict[str, pd.Series]:
+        missing = [column for column in cls.REQUIRED_PHYSICAL_COLUMNS if column not in df.columns]
+        if missing:
+            raise ValueError(f"缺少必需气象列: {', '.join(missing)}")
+
+        physical = {
+            column: pd.to_numeric(df[column], errors="coerce")
+            for column in cls.REQUIRED_PHYSICAL_COLUMNS
+        }
+        invalid_rows: list[str] = []
+
+        for column, values in physical.items():
+            invalid = ~np.isfinite(values.to_numpy(dtype=float))
+            if column == "wind_speed":
+                lower, upper = PHYSICAL_BOUNDS[column]
+                invalid |= (values < lower).to_numpy() | (values > upper).to_numpy()
+            elif column == "ambient_temp":
+                lower, upper = PHYSICAL_BOUNDS[column]
+                invalid |= (values < lower).to_numpy() | (values > upper).to_numpy()
+            elif column == "solar_radiation":
+                invalid |= (values < 0.0).to_numpy()
+
+            if invalid.any():
+                rows = [str(index) for index in df.index[invalid]]
+                invalid_rows.append(f"{column} 非法行: {', '.join(rows)}")
+
+        if invalid_rows:
+            raise ValueError("; ".join(invalid_rows))
+        return physical
 
     @classmethod
     def _terrain_for_row(
@@ -86,6 +124,7 @@ class WeatherCorrectionService:
     def apply(self, df: pd.DataFrame, terrain_lookup: Optional[dict], options: CorrectionOptions) -> pd.DataFrame:
         if not isinstance(df, pd.DataFrame):
             raise TypeError("df 必须是 pandas DataFrame")
+        physical = self._validated_physical_inputs(df)
         if "correction_stage" in df.columns:
             existing_stages = df["correction_stage"].dropna().astype(str)
             if (existing_stages != "original").any():
@@ -94,15 +133,9 @@ class WeatherCorrectionService:
         corrected = df.copy(deep=True)
         corrected.attrs = copy.deepcopy(df.attrs)
 
-        wind_physical = corrected.get("wind_speed", pd.Series(0.0, index=corrected.index)).map(
-            lambda value: self._finite(value, minimum=0.0)
-        )
-        temp_physical = corrected.get("ambient_temp", pd.Series(0.0, index=corrected.index)).map(
-            lambda value: self._finite(value)
-        )
-        solar_physical = corrected.get("solar_radiation", pd.Series(0.0, index=corrected.index)).map(
-            lambda value: self._finite(value, minimum=0.0)
-        )
+        wind_physical = physical["wind_speed"]
+        temp_physical = physical["ambient_temp"]
+        solar_physical = physical["solar_radiation"]
 
         corrected["wind_speed_physical"] = wind_physical
         corrected["ambient_temp_physical"] = temp_physical

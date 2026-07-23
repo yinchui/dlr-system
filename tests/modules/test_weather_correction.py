@@ -208,13 +208,84 @@ def test_terrain_lookup_matches_tower_id_position_or_legacy_index_per_row():
     assert corrected["wind_speed_local"].tolist() == pytest.approx([5.2, 5.2, 5.2])
 
 
-def test_invalid_correction_inputs_and_missing_terrain_stay_finite():
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        (column, value)
+        for column in (
+            "wind_speed",
+            "ambient_temp",
+            "solar_radiation",
+            "wind_direction",
+        )
+        for value in (np.nan, np.inf)
+    ],
+)
+def test_apply_rejects_nonfinite_physical_observations(column, value):
+    source = weather_frame(**{column: [value]})
+
+    with pytest.raises(ValueError, match=rf"{column}.*非法行"):
+        WeatherCorrectionService().apply(source, terrain_lookup={}, options=CorrectionOptions())
+
+
+@pytest.mark.parametrize(
+    "column",
+    ("wind_speed", "ambient_temp", "solar_radiation", "wind_direction"),
+)
+def test_apply_rejects_missing_required_physical_columns(column):
+    source = weather_frame().drop(columns=column)
+
+    with pytest.raises(ValueError, match=rf"缺少必需气象列.*{column}"):
+        WeatherCorrectionService().apply(source, terrain_lookup={}, options=CorrectionOptions())
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("wind_speed", -0.1),
+        ("wind_speed", 75.1),
+        ("ambient_temp", -60.1),
+        ("ambient_temp", 70.1),
+        ("solar_radiation", -0.1),
+    ],
+)
+def test_apply_rejects_out_of_range_physical_observations(column, value):
+    source = weather_frame(**{column: [value]})
+
+    with pytest.raises(ValueError, match=rf"{column}.*非法行"):
+        WeatherCorrectionService().apply(source, terrain_lookup={}, options=CorrectionOptions())
+
+
+def test_apply_keeps_zero_physical_observations_valid():
     corrected = WeatherCorrectionService().apply(
         weather_frame(
-            ambient_temp=[np.nan],
-            wind_speed=[np.inf],
-            wind_direction=[np.nan],
-            solar_radiation=[np.inf],
+            ambient_temp=[0.0],
+            wind_speed=[0.0],
+            wind_direction=[0.0],
+            solar_radiation=[0.0],
+        ),
+        terrain_lookup={},
+        options=CorrectionOptions(
+            enable_vertical=False,
+            enable_terrain=False,
+            enable_desert=False,
+            enable_wind_direction=False,
+        ),
+    )
+
+    assert corrected.loc[0, "wind_speed_local"] == pytest.approx(0.0)
+    assert corrected.loc[0, "ambient_temp_local"] == pytest.approx(0.0)
+    assert corrected.loc[0, "solar_radiation_local"] == pytest.approx(0.0)
+    assert corrected.loc[0, "wind_angle_deg"] == pytest.approx(90.0)
+
+
+def test_invalid_correction_options_keep_valid_observations_finite():
+    corrected = WeatherCorrectionService().apply(
+        weather_frame(
+            ambient_temp=[20.0],
+            wind_speed=[4.0],
+            wind_direction=[0.0],
+            solar_radiation=[600.0],
         ),
         terrain_lookup=None,
         options=CorrectionOptions(
@@ -286,6 +357,81 @@ def test_legacy_matrix_adapter_is_pure_and_rejects_repeated_correction():
 
     with pytest.raises(ValueError, match="已经修正"):
         adapter(corrected, {}, {"line_azimuth": 0.0})
+
+
+def test_legacy_matrix_adapter_propagates_invalid_physical_observations():
+    line_data = {
+        "positions": [36],
+        "times": np.array([0.0]),
+        "winds": np.array([[np.nan]]),
+        "temps": np.array([[20.0]]),
+        "solar": np.array([600.0]),
+        "angles": np.array([[0.0]]),
+    }
+
+    with pytest.raises(ValueError, match=r"wind_speed.*非法行"):
+        matrix_adapter()(line_data, {}, {"line_azimuth": 0.0})
+
+
+def test_legacy_matrix_adapter_uses_complete_index_terrain_mapping_without_crossing_towers():
+    line_data = {
+        "positions": [1, 2],
+        "times": np.array([0.0]),
+        "winds": np.array([[4.0], [4.0]]),
+        "temps": np.array([[20.0], [20.0]]),
+        "solar": np.array([600.0]),
+        "angles": np.array([[180.0], [180.0]]),
+        "terrain_data": {
+            0: {"slope": 0.0, "aspect": 0.0},
+            1: {"slope": 45.0, "aspect": 0.0},
+        },
+    }
+
+    corrected = matrix_adapter()(
+        line_data,
+        {"terrain": True},
+        {"line_azimuth": 0.0},
+    )
+
+    np.testing.assert_allclose(corrected["winds"], [[4.0], [5.2]])
+
+
+def test_legacy_matrix_adapter_uses_complete_canonical_terrain_mapping():
+    line_data = {
+        "positions": ["001", "002"],
+        "times": np.array([0.0]),
+        "winds": np.array([[4.0], [4.0]]),
+        "temps": np.array([[20.0], [20.0]]),
+        "solar": np.array([600.0]),
+        "angles": np.array([[180.0], [180.0]]),
+        "terrain_data": {
+            "001": {"slope": 0.0, "aspect": 0.0},
+            "002": {"slope": 45.0, "aspect": 0.0},
+        },
+    }
+
+    corrected = matrix_adapter()(
+        line_data,
+        {"terrain": True},
+        {"line_azimuth": 0.0},
+    )
+
+    np.testing.assert_allclose(corrected["winds"], [[4.0], [5.2]])
+
+
+def test_legacy_matrix_adapter_rejects_ambiguous_partial_terrain_mapping():
+    line_data = {
+        "positions": [1, 2],
+        "times": np.array([0.0]),
+        "winds": np.array([[4.0], [4.0]]),
+        "temps": np.array([[20.0], [20.0]]),
+        "solar": np.array([600.0]),
+        "angles": np.array([[180.0], [180.0]]),
+        "terrain_data": {1: {"slope": 45.0, "aspect": 0.0}},
+    }
+
+    with pytest.raises(ValueError, match="地形键歧义"):
+        matrix_adapter()(line_data, {"terrain": True}, {"line_azimuth": 0.0})
 
 
 def test_page_keeps_controls_but_delegates_all_weather_math_to_service():

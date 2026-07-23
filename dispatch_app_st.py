@@ -89,12 +89,47 @@ def apply_weather_corrections(line_data, correction_config, conductor_params):
 
     terrain_lookup = {}
     terrain_data = corrected_data.get('terrain_data') or {}
-    for index, position in enumerate(positions):
-        for key in (position, str(position), index, str(index)):
-            terrain = terrain_data.get(key) if hasattr(terrain_data, 'get') else None
-            if terrain is not None:
-                terrain_lookup[position] = terrain
-                break
+    if terrain_data:
+        if not hasattr(terrain_data, 'get'):
+            raise ValueError('terrain_data 必须是映射')
+
+        def matching_key(candidates):
+            for key in candidates:
+                try:
+                    if key in terrain_data:
+                        return key
+                except TypeError:
+                    continue
+            return None
+
+        index_keys = [matching_key((index, str(index))) for index in range(n_pos)]
+        position_keys = [
+            matching_key((position, str(position)))
+            for position in positions
+        ]
+        if all(key is not None for key in index_keys):
+            selected_keys = index_keys
+        elif all(key is not None for key in position_keys):
+            selected_keys = position_keys
+        else:
+            owners = {}
+            selected_keys = []
+            for index, (index_key, position_key) in enumerate(
+                zip(index_keys, position_keys)
+            ):
+                row_keys = [key for key in (index_key, position_key) if key is not None]
+                if len(set((type(key), key) for key in row_keys)) > 1:
+                    raise ValueError('地形键歧义')
+                for key in row_keys:
+                    marker = (type(key), key)
+                    owner = owners.setdefault(marker, index)
+                    if owner != index:
+                        raise ValueError('地形键歧义')
+                selected_keys.append(row_keys[0] if row_keys else None)
+
+        for position, key in zip(positions, selected_keys):
+            if key is not None:
+                terrain_lookup[position] = terrain_data[key]
 
     source_frame = pd.DataFrame({
         'position': np.repeat(positions, n_times),

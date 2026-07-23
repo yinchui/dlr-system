@@ -118,15 +118,69 @@ def test_clear_sky_solar_matches_drake_reference_without_measured_radiation():
     assert result.q_solar == pytest.approx(22.45, abs=0.25)
 
 
-def test_resistance_at_100_c_matches_drake_and_is_continuous():
+def test_solar_azimuth_at_equinox_equator_preserves_east_west_direction():
+    calculator = EngineThermalCalculator()
+    params = {
+        "latitude": 0.0,
+        "day_of_year": 81,
+        "time": 9.0,
+        "line_azimuth": 0.0,
+        "elevation": 0.0,
+        "D0": 0.02814,
+        "absorptivity": 0.8,
+    }
+
+    morning_azimuth = calculator.calculate_solar_azimuth(params)
+    afternoon_azimuth = calculator.calculate_solar_azimuth({**params, "time": 15.0})
+    solar_altitude = calculator.calculate_solar_altitude(params)
+    perpendicular_gain = (
+        params["absorptivity"]
+        * calculator.calculate_elevation_corrected_radiation(
+            params, calculator.calculate_solar_radiation(params, solar_altitude)
+        )
+        * params["D0"]
+    )
+
+    assert morning_azimuth == pytest.approx(90.0, abs=1e-10)
+    assert afternoon_azimuth == pytest.approx(270.0, abs=1e-10)
+    assert calculator.calculate_solar_gain(params) == pytest.approx(perpendicular_gain)
+
+
+@pytest.mark.parametrize(
+    ("time", "expected_azimuth"),
+    [(11.0, 113.98441942855138), (13.0, 246.01558057144862)],
+)
+def test_solar_azimuth_preserves_normal_morning_and_afternoon_quadrants(
+    time, expected_azimuth
+):
+    params = {**DRAKE_STEADY_PARAMS, "time": time}
+
+    assert EngineThermalCalculator().calculate_solar_azimuth(params) == pytest.approx(
+        expected_azimuth, abs=1e-10
+    )
+
+
+def test_resistance_at_100_c_uses_the_drake_25_to_75_segment():
     calculator = EngineThermalCalculator()
     at_100 = calculator.calculate_resistance({**DRAKE_STEADY_PARAMS, "T_avg": 100.0})
     below = calculator.calculate_resistance({**DRAKE_STEADY_PARAMS, "T_avg": 100.0 - 1e-6})
-    above = calculator.calculate_resistance({**DRAKE_STEADY_PARAMS, "T_avg": 100.0 + 1e-6})
 
     assert at_100 == pytest.approx(9.391e-5, rel=1e-4)
     assert below == pytest.approx(at_100, abs=1e-10)
-    assert above == pytest.approx(at_100, abs=1e-10)
+
+
+def test_resistance_above_100_c_uses_ieee_25_to_200_endpoints_directly():
+    params = {
+        "T_s": 150.0,
+        "T_avg": 150.0,
+        "R_low_25": 1.0,
+        "R_high_75": 2.0,
+        "R_high_200": 10.0,
+    }
+
+    assert EngineThermalCalculator().calculate_resistance(params) == pytest.approx(
+        7.428571428571429
+    )
 
 
 def test_compatibility_import_and_legacy_entries_share_heat_balance_values():
@@ -183,3 +237,40 @@ def test_equal_conductor_and_ambient_temperature_is_finite():
     assert result.q_radiation == pytest.approx(0.0)
     assert result.current_a == 0.0
     assert all(math.isfinite(value) for value in vars(result).values())
+
+
+def test_steady_state_temperature_expands_verified_bracket_and_rejects_no_root():
+    calculator = EngineThermalCalculator()
+    params = copy.deepcopy(DRAKE_STEADY_PARAMS)
+    before = copy.deepcopy(params)
+
+    temperature = calculator.calculate_steady_state_temperature(
+        params, current=3000.0, max_iter=100, tol=1e-6
+    )
+    balance = calculator.calculate_heat_balance(
+        {**params, "T_s": temperature, "T_avg": temperature}
+    )
+    residual = (
+        3000.0 ** 2 * balance.resistance
+        + balance.q_solar
+        - balance.q_convection
+        - balance.q_radiation
+    )
+
+    assert 200.0 < temperature < 1004.0
+    assert residual == pytest.approx(0.0, abs=1e-3)
+    with pytest.raises(ValueError, match="physical temperature range"):
+        calculator.calculate_steady_state_temperature(params, current=1_000_000.0)
+    assert params == before
+
+
+def test_steady_state_temperature_keeps_normal_drake_solution():
+    params = copy.deepcopy(DRAKE_STEADY_PARAMS)
+    before = copy.deepcopy(params)
+
+    temperature = EngineThermalCalculator().calculate_steady_state_temperature(
+        params, current=1000.0
+    )
+
+    assert temperature == pytest.approx(97.5, abs=0.1)
+    assert params == before

@@ -25,6 +25,25 @@ def test_calculate_max_current_for_points_returns_expected_shapes():
     assert result["corrected_winds"][0, 0] > 0
 
 
+def test_find_max_current_for_window_uses_one_interval_per_time_gap():
+    calculator = ThermalCalculator()
+    analyzer = LineAnalyzer(calculator)
+    params = _temperature_params()
+    params["max_allow_temp"] = 100.0
+    before = copy.deepcopy(params)
+    env_params = {
+        "times": np.array([0.0, 1.0, 2.0]),
+        "temp": np.array([40.0, 40.0, 40.0]),
+    }
+
+    result = analyzer.find_max_current_for_window(
+        env_params, base_static=500.0, params=params, dt_hours=1.0
+    )
+
+    assert 500.0 <= result <= 1500.0
+    assert params == before
+
+
 def _temperature_params():
     return {
         "D0": 0.02814,
@@ -58,7 +77,7 @@ def test_temperature_calculations_preserve_callers_nested_input():
     time_steps_before = list(time_steps)
     current_profile_before = list(current_profile)
 
-    calculator.calculate_steady_state_temperature(params, current=500.0, max_iter=2)
+    calculator.calculate_steady_state_temperature(params, current=500.0)
     calculator.calculate_transient_temperature(
         params,
         time_steps=time_steps,

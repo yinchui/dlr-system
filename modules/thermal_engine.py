@@ -26,6 +26,8 @@ class HeatBalanceResult:
 class ThermalCalculator:
     """基于 IEEE Std 738-2023 的裸导线电流-温度关系计算器。"""
 
+    _MAX_CONDUCTOR_TEMPERATURE_C = 1004.0
+
     def __init__(self):
         # --- 基础材料参数 ---
         self.material_properties = {
@@ -103,31 +105,48 @@ class ThermalCalculator:
         if tol <= 0.0:
             raise ValueError("tol must be greater than zero")
         params = dict(params)
+        ambient_temp = self._finite_number(params, 'T_a')
+        if ambient_temp >= self._MAX_CONDUCTOR_TEMPERATURE_C:
+            raise ValueError("T_a is outside the physical temperature range")
 
-        Ta = params['T_a']
-        low = Ta
-        high = 200.0
+        def heat_residual(conductor_temp: float) -> float:
+            trial = {**params, 'T_s': conductor_temp, 'T_avg': conductor_temp}
+            balance = self.calculate_heat_balance(trial)
+            return (
+                current ** 2 * balance.resistance
+                + balance.q_solar
+                - balance.q_convection
+                - balance.q_radiation
+            )
+
+        low = ambient_temp
+        low_residual = heat_residual(low)
+        if low_residual == 0.0:
+            return low
+
+        high = min(
+            max(200.0, low + 1.0), self._MAX_CONDUCTOR_TEMPERATURE_C
+        )
+        high_residual = heat_residual(high)
+        while high_residual > 0.0 and high < self._MAX_CONDUCTOR_TEMPERATURE_C:
+            high = min(
+                low + 2.0 * (high - low),
+                self._MAX_CONDUCTOR_TEMPERATURE_C,
+            )
+            high_residual = heat_residual(high)
+        if high_residual > 0.0:
+            raise ValueError("steady-state root is outside the physical temperature range")
 
         for _ in range(max_iter):
-            mid = (low + high) / 2
-            params['T_s'] = mid
-            params['T_avg'] = mid
-
-            r = self.calculate_resistance(params)
-            left = current ** 2 * r
-
-            q_c = self.calculate_convection(params)
-            q_r = self.calculate_radiation(params)
-            q_s = self.calculate_solar_gain(params)
-            right = q_c + q_r - q_s
-
-            if left > right:
+            mid = (low + high) / 2.0
+            mid_residual = heat_residual(mid)
+            if mid_residual > 0.0:
                 low = mid
             else:
                 high = mid
             if high - low < tol:
-                return mid
-        return (low + high) / 2
+                return (low + high) / 2.0
+        raise ValueError("steady-state root did not converge within max_iter")
 
     def calculate_transient_temperature(self, params: Dict, time_steps: List[float],
                                         initial_temp: float, current_profile: List[float]) -> List[float]:
@@ -354,18 +373,15 @@ class ThermalCalculator:
         resistance_25 = self._positive_number(params, 'R_low_25', 7.283e-5)
         resistance_75 = self._positive_number(params, 'R_high_75', 8.688e-5)
         resistance_200 = self._positive_number(params, 'R_high_200', 1.220e-4)
-        resistance_100 = resistance_25 + (
-            (resistance_75 - resistance_25) / (75.0 - 25.0)
-        ) * (100.0 - 25.0)
 
         if average_temp <= 100.0:
             resistance = resistance_25 + (
                 (resistance_75 - resistance_25) / (75.0 - 25.0)
             ) * (average_temp - 25.0)
         else:
-            resistance = resistance_100 + (
-                (resistance_200 - resistance_100) / (200.0 - 100.0)
-            ) * (average_temp - 100.0)
+            resistance = resistance_25 + (
+                (resistance_200 - resistance_25) / (200.0 - 25.0)
+            ) * (average_temp - 25.0)
         if not math.isfinite(resistance) or resistance <= 0.0:
             raise ValueError("T_avg produces nonpositive resistance")
         return resistance
@@ -409,16 +425,7 @@ class ThermalCalculator:
         numerator = math.sin(math.radians(omega))
         denominator = math.sin(math.radians(lat)) * math.cos(math.radians(omega)) - \
                       math.cos(math.radians(lat)) * math.tan(math.radians(delta))
-        if abs(denominator) < 1e-10:
-            chi = 0.0
-        else:
-            chi = numerator / denominator
-        if omega < 0:
-            C = 180 if chi < 0 else 0
-        else:
-            C = 360 if chi < 0 else 180
-        Zc = C + math.degrees(math.atan(chi))
-        return Zc % 360
+        return (math.degrees(math.atan2(numerator, denominator)) + 180.0) % 360.0
 
     def calculate_solar_radiation(self, params: Dict, Hc: float) -> float:
         coeff = self.solar_coeff_clear['SI']
@@ -577,11 +584,8 @@ class LineAnalyzer:
 
         for _ in range(15):
             mid = (low + high) / 2
-            current_profile = [mid] * len(env_params['times'])
-
-            steps = [(env_params['times'][1] - env_params['times'][0]) * 3600] * len(current_profile)
-            if len(steps) > 1:
-                steps = steps[:-1]
+            steps = (np.diff(env_params['times']) * 3600).tolist()
+            current_profile = [mid] * len(steps)
 
             temps = self.calculator.calculate_transient_temperature(
                 params, steps, env_params['temp'][0], current_profile

@@ -123,6 +123,32 @@ def test_wind_direction_uses_circular_interpolation():
     assert middle < 5 or middle > 355
 
 
+def test_resampling_preserves_exact_end_when_span_is_not_divisible():
+    weather_pipeline = weather_pipeline_module()
+    source = make_weather_frame(
+        ["001", "001"],
+        ["2026-07-23 00:00", "2026-07-23 00:50"],
+        [10.0, 25.0],
+        [2.0, 7.0],
+        [350.0, 10.0],
+    )
+
+    result = weather_pipeline.resample_weather_by_tower(
+        source, interval_minutes=30
+    )
+
+    assert result["timestamp"].tolist() == list(
+        timestamps(
+            "2026-07-23 00:00",
+            "2026-07-23 00:30",
+            "2026-07-23 00:50",
+        )
+    )
+    assert result.iloc[-1]["ambient_temp"] == pytest.approx(25.0)
+    assert result.iloc[-1]["wind_speed"] == pytest.approx(7.0)
+    assert result.iloc[-1]["wind_direction"] == pytest.approx(10.0)
+
+
 def test_circular_interpolation_leaves_unbounded_endpoints_missing():
     weather_pipeline = weather_pipeline_module()
     series = pd.Series(
@@ -253,6 +279,68 @@ def test_resampling_requires_canonical_weather_columns():
     )
 
     with pytest.raises(ValueError, match="ambient_temp"):
+        weather_pipeline.resample_weather_by_tower(source)
+
+
+def test_resampling_accepts_canonical_physical_role():
+    weather_pipeline = weather_pipeline_module()
+    source = make_direction_wrap_weather(0.0, 90.0)
+
+    result = weather_pipeline.resample_weather_by_tower(
+        source, interval_minutes=30
+    )
+
+    assert result["dataset_role"].tolist() == [
+        "physical",
+        "physical",
+        "physical",
+    ]
+
+
+def test_resampling_rejects_truth_before_it_can_interpolate_future_values():
+    weather_pipeline = weather_pipeline_module()
+    truth = make_weather_frame(
+        ["001", "001"],
+        ["2026-07-23 00:00", "2026-07-23 01:00"],
+        [0.0, 60.0],
+        [0.0, 60.0],
+        [0.0, 0.0],
+        role="truth",
+        source_hash="truth-hash",
+    )
+
+    with pytest.raises(ValueError, match="真实值.*backward alignment"):
+        weather_pipeline.resample_weather_by_tower(
+            truth, interval_minutes=30
+        )
+
+
+def test_resampling_rejects_mixed_dataset_roles():
+    weather_pipeline = weather_pipeline_module()
+    source = make_direction_wrap_weather(0.0, 90.0)
+    source["dataset_role"] = ["physical", "truth"]
+
+    with pytest.raises(ValueError, match="真实值.*backward alignment"):
+        weather_pipeline.resample_weather_by_tower(source)
+
+
+@pytest.mark.parametrize("invalid_role", ["", "forecast", None])
+def test_resampling_rejects_empty_or_unknown_dataset_role(invalid_role):
+    weather_pipeline = weather_pipeline_module()
+    source = make_direction_wrap_weather(0.0, 90.0)
+    source["dataset_role"] = invalid_role
+
+    with pytest.raises(ValueError, match="真实值.*backward alignment"):
+        weather_pipeline.resample_weather_by_tower(source)
+
+
+def test_resampling_requires_dataset_role_column():
+    weather_pipeline = weather_pipeline_module()
+    source = make_direction_wrap_weather(0.0, 90.0).drop(
+        columns="dataset_role"
+    )
+
+    with pytest.raises(ValueError, match="dataset_role"):
         weather_pipeline.resample_weather_by_tower(source)
 
 

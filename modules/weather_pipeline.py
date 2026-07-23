@@ -14,6 +14,7 @@ _REQUIRED_WEATHER_COLUMNS = (
     "ambient_temp",
     "wind_speed",
     "wind_direction",
+    "dataset_role",
 )
 
 _INTERPOLATED_WEATHER_COLUMNS = {
@@ -75,6 +76,18 @@ def _validate_weather_frame(frame: pd.DataFrame, label: str):
     return timezone
 
 
+def _validate_resampling_role(source: pd.DataFrame) -> None:
+    if source.empty:
+        return
+    if source["dataset_role"].isna().any() or not source[
+        "dataset_role"
+    ].eq("physical").all():
+        raise ValueError(
+            "重采样仅允许 dataset_role=physical；"
+            "真实值必须通过 backward alignment 对齐"
+        )
+
+
 def _interpolate_numeric(series: pd.Series) -> pd.Series:
     numeric = pd.to_numeric(series, errors="coerce").astype(float)
     method = "time" if isinstance(numeric.index, pd.DatetimeIndex) else "linear"
@@ -129,6 +142,8 @@ def _resample_one_tower(
         end=indexed.index[-1],
         freq=interval,
     )
+    if grid[-1] != indexed.index[-1]:
+        grid = grid.append(pd.DatetimeIndex([indexed.index[-1]]))
     interpolation_index = indexed.index.union(grid).sort_values()
     output = pd.DataFrame(index=grid)
 
@@ -162,6 +177,7 @@ def resample_weather_by_tower(
         raise ValueError("interval_minutes 必须是正数")
 
     _validate_weather_frame(source, "source")
+    _validate_resampling_role(source)
     original_attrs = source.attrs.copy()
     working = source.copy(deep=True)
     if working.empty:

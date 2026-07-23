@@ -6,6 +6,7 @@ from plotly.subplots import make_subplots
 import requests
 from datetime import datetime, timedelta, date
 from thermal_functions import ThermalCalculator, EnvironmentGenerator, LineAnalyzer
+from modules.data_processor import normalize_weather_input_dataframe
 import os
 import io
 import glob
@@ -402,13 +403,19 @@ STANDARD_CONDUCTORS = {
 # ==============================================================================
 
 def load_weather_data_from_files(uploaded_files: list) -> dict:
-    """从多个Excel文件读取气象数据"""
+    """从多个Excel/CSV文件读取气象数据"""
     all_data = []
     for file in uploaded_files:
         try:
-            df = pd.read_excel(file)
-            df.columns = df.columns.str.strip()
-            all_data.append(df)
+            fname = file.name.lower()
+            if fname.endswith('.csv'):
+                df = pd.read_csv(file, encoding='utf-8-sig')
+            else:
+                df = pd.read_excel(file)
+            normalized = normalize_weather_input_dataframe(df)
+            if normalized.attrs.get('input_format') == 'tower_time':
+                st.info(f"✓ 已识别新格式气象数据: {file.name}")
+            all_data.append(normalized)
             st.success(f"✓ 成功读取: {file.name}")
         except Exception as e:
             st.warning(f"✗ 读取失败 {file.name}: {e}")
@@ -421,35 +428,9 @@ def load_weather_data_from_files(uploaded_files: list) -> dict:
 
 
 def process_weather_data(df: pd.DataFrame) -> dict:
-    """处理合并后的气象数据"""
+    """处理已规范化的气象数据，并兼容直接传入的旧/新原始表格。"""
     try:
-        df.columns = df.columns.str.strip()
-
-        # 灵活的列名匹配
-        col_renames = {}
-        for col in df.columns:
-            if '位置' in col:
-                col_renames[col] = 'position'
-            elif '日期' in col:
-                col_renames[col] = 'date'
-            elif '时刻' in col:
-                col_renames[col] = 'time_str'
-            elif '太阳辐射' in col:
-                col_renames[col] = 'solar_radiation'
-            elif '海拔' in col:
-                col_renames[col] = 'elevation'
-            elif '导线温度' in col:
-                col_renames[col] = 'wire_temp'
-            elif '风速' in col and '相对湿度' not in col:
-                col_renames[col] = 'wind_speed'
-            elif '相对湿度' in col:
-                col_renames[col] = 'humidity'
-            elif '风向' in col:
-                col_renames[col] = 'wind_direction'
-            elif '环境温度' in col:
-                col_renames[col] = 'ambient_temp'
-
-        df = df.rename(columns=col_renames)
+        df = normalize_weather_input_dataframe(df)
 
         # 清理数据
         df = df.dropna(subset=['position', 'time_str', 'ambient_temp', 'wind_speed', 'wind_direction'])
@@ -809,10 +790,10 @@ with tab_line:
         st.markdown("#####  数据配置")
 
         weather_files = st.file_uploader(
-            "上传气象数据Excel文件 (支持多个)",
-            type=['xlsx'],
+            "上传气象数据文件 (支持多个Excel/CSV)",
+            type=['xlsx', 'csv'],
             accept_multiple_files=True,
-            help="必需列：位置|日期|时刻|环境温度|风速|风向  可选列：太阳辐射强度|海拔高度|相对湿度"
+            help="格式1(Excel): 位置|日期|时刻|环境温度|风速|风向  \n格式2(CSV): 时间|杆塔|经度|纬度|风速WS|风向WD|温度TEM|相对湿度RHU"
         )
 
         if weather_files:

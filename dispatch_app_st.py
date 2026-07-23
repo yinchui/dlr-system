@@ -107,9 +107,17 @@ def apply_weather_corrections(line_data, correction_config, conductor_params):
             matching_key((position, str(position)))
             for position in positions
         ]
-        if all(key is not None for key in index_keys):
+        index_complete = all(key is not None for key in index_keys)
+        position_complete = all(key is not None for key in position_keys)
+        if index_complete and position_complete:
+            index_markers = [(type(key), key) for key in index_keys]
+            position_markers = [(type(key), key) for key in position_keys]
+            if index_markers != position_markers:
+                raise ValueError('地形键歧义')
             selected_keys = index_keys
-        elif all(key is not None for key in position_keys):
+        elif index_complete:
+            selected_keys = index_keys
+        elif position_complete:
             selected_keys = position_keys
         else:
             owners = {}

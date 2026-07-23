@@ -396,6 +396,29 @@ def test_legacy_matrix_adapter_uses_complete_index_terrain_mapping_without_cross
     np.testing.assert_allclose(corrected["winds"], [[4.0], [5.2]])
 
 
+def test_legacy_matrix_adapter_allows_identical_complete_terrain_key_modes():
+    line_data = {
+        "positions": [0, 1],
+        "times": np.array([0.0]),
+        "winds": np.array([[4.0], [4.0]]),
+        "temps": np.array([[20.0], [20.0]]),
+        "solar": np.array([600.0]),
+        "angles": np.array([[180.0], [180.0]]),
+        "terrain_data": {
+            0: {"slope": 0.0, "aspect": 0.0},
+            1: {"slope": 45.0, "aspect": 0.0},
+        },
+    }
+
+    corrected = matrix_adapter()(
+        line_data,
+        {"terrain": True},
+        {"line_azimuth": 0.0},
+    )
+
+    np.testing.assert_allclose(corrected["winds"], [[4.0], [5.2]])
+
+
 def test_legacy_matrix_adapter_uses_complete_canonical_terrain_mapping():
     line_data = {
         "positions": ["001", "002"],
@@ -417,6 +440,25 @@ def test_legacy_matrix_adapter_uses_complete_canonical_terrain_mapping():
     )
 
     np.testing.assert_allclose(corrected["winds"], [[4.0], [5.2]])
+
+
+def test_legacy_matrix_adapter_rejects_ambiguous_complete_terrain_mapping():
+    line_data = {
+        "positions": [1, 2],
+        "times": np.array([0.0]),
+        "winds": np.array([[4.0], [4.0]]),
+        "temps": np.array([[20.0], [20.0]]),
+        "solar": np.array([600.0]),
+        "angles": np.array([[180.0], [180.0]]),
+        "terrain_data": {
+            0: {"slope": 0.0, "aspect": 0.0},
+            1: {"slope": 45.0, "aspect": 0.0},
+            "2": {"slope": 0.0, "aspect": 0.0},
+        },
+    }
+
+    with pytest.raises(ValueError, match="地形键歧义"):
+        matrix_adapter()(line_data, {"terrain": True}, {"line_azimuth": 0.0})
 
 
 def test_legacy_matrix_adapter_rejects_ambiguous_partial_terrain_mapping():

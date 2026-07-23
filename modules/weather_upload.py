@@ -38,7 +38,11 @@ class WeatherUploadResult:
 
 
 def freeze_uploaded_file(uploaded_file) -> UploadBlob:
-    content = uploaded_file.getvalue()
+    raw_content = uploaded_file.getvalue()
+    try:
+        content = bytes(raw_content)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("上传文件内容必须可转换为 bytes") from exc
     return UploadBlob(
         name=uploaded_file.name,
         content=content,

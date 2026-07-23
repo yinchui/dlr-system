@@ -204,6 +204,51 @@ def test_canonical_weather_rejects_non_integer_legacy_tower_without_tail_match()
     assert result.report.reasons["invalid_tower_id"] == 1
 
 
+def test_legacy_weather_keeps_valid_row_when_numeric_tower_ids_are_invalid():
+    raw = pd.DataFrame(
+        {
+            "位置": [36.0, float("inf"), 36.5],
+            "日期": ["2026-07-23"] * 3,
+            "时刻": ["00:00", "00:30", "01:00"],
+            "环境温度": [20.0] * 3,
+            "风速": [2.0] * 3,
+            "风向": [90.0] * 3,
+        }
+    )
+
+    normalized = normalize_weather_input_dataframe(raw)
+    result = data_processor.canonicalize_weather_frame(raw, role="physical")
+
+    assert normalized.loc[0, "position"] == 36
+    assert normalized.loc[1:, "position"].isna().all()
+    assert result.frame["tower_id"].tolist() == ["36"]
+    assert result.report.reasons["invalid_tower_id"] == 2
+
+
+def test_new_weather_keeps_valid_row_when_numeric_tower_ids_are_invalid():
+    raw = pd.DataFrame(
+        {
+            "时间": [
+                "2026-07-23 00:00",
+                "2026-07-23 00:30",
+                "2026-07-23 01:00",
+            ],
+            "杆塔": [36.0, float("inf"), 36.5],
+            "风速WS(m/s)": [2.0] * 3,
+            "风向WD(°)": [90.0] * 3,
+            "温度TEM(℃)": [20.0] * 3,
+        }
+    )
+
+    normalized = normalize_weather_input_dataframe(raw)
+    result = data_processor.canonicalize_weather_frame(raw, role="physical")
+
+    assert normalized.loc[0, "position"] == 36
+    assert normalized.loc[1:, "position"].isna().all()
+    assert result.frame["tower_id"].tolist() == ["36"]
+    assert result.report.reasons["invalid_tower_id"] == 2
+
+
 @pytest.mark.parametrize(
     ("invalid_time", "valid_time"),
     [

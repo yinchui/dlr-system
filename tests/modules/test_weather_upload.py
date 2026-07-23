@@ -52,6 +52,30 @@ def test_freeze_uploaded_file_calculates_sha256():
     assert frozen.sha256 == hashlib.sha256(content).hexdigest()
 
 
+def test_freeze_uploaded_file_snapshots_mutable_content():
+    weather_upload = weather_upload_module()
+    mutable_content = bytearray(b"abc")
+    uploaded = FakeUploadedFile("weather.csv", mutable_content)
+
+    frozen = weather_upload.freeze_uploaded_file(uploaded)
+    mutable_content[0] = ord("z")
+
+    assert frozen.content == b"abc"
+    assert isinstance(frozen.content, bytes)
+    assert frozen.sha256 == hashlib.sha256(b"abc").hexdigest()
+    assert uploaded.getvalue_calls == 1
+
+
+def test_freeze_uploaded_file_rejects_non_bytes_convertible_content():
+    weather_upload = weather_upload_module()
+    uploaded = FakeUploadedFile("weather.csv", object())
+
+    with pytest.raises(TypeError, match="bytes"):
+        weather_upload.freeze_uploaded_file(uploaded)
+
+    assert uploaded.getvalue_calls == 1
+
+
 def test_freeze_uploaded_files_returns_empty_tuple_for_empty_input():
     weather_upload = weather_upload_module()
 

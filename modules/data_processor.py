@@ -99,7 +99,10 @@ def _find_column(columns, predicate):
 def _tower_number(value):
     numeric = pd.to_numeric(value, errors="coerce")
     if pd.notna(numeric):
-        return int(numeric)
+        if not np.isfinite(numeric):
+            return np.nan
+        integer = int(numeric)
+        return integer if numeric == integer else np.nan
     match = re.search(r"(\d+)", str(value))
     return int(match.group(1)) if match else np.nan
 

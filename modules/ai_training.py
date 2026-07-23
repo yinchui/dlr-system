@@ -139,6 +139,11 @@ class ResidualTrainer:
             raise ValueError(
                 "physical_col must name terrain-corrected weather"
             )
+        allowed_truth_columns = _TARGET_COLUMNS[target]["truth"]
+        if truth_col is not None and truth_col not in allowed_truth_columns:
+            raise ValueError(
+                "truth_col must name truth weather for the requested target"
+            )
         if physical_col is None:
             physical_col = next(
                 (
@@ -152,7 +157,7 @@ class ResidualTrainer:
             truth_col = next(
                 (
                     column
-                    for column in _TARGET_COLUMNS[target]["truth"]
+                    for column in allowed_truth_columns
                     if column in frame.columns
                 ),
                 None,

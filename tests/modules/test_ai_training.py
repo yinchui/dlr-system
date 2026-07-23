@@ -337,6 +337,22 @@ def test_training_rejects_raw_physical_column_override():
         )
 
 
+@pytest.mark.parametrize(
+    "truth_col", ["dlr_truth", "ambient_temp_truth", "wind_speed_local"]
+)
+def test_training_rejects_non_weather_or_mismatched_truth_override(truth_col):
+    frame = make_training_frame()
+    if truth_col not in frame.columns:
+        frame[truth_col] = 1000.0
+
+    with pytest.raises(ValueError, match="truth|weather"):
+        ResidualTrainer(estimator_factory=constant_factory).train_target(
+            frame,
+            target="wind_speed",
+            truth_col=truth_col,
+        )
+
+
 def test_training_does_not_mutate_input_frame():
     frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
     original = frame.copy(deep=True)

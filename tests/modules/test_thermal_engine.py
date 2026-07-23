@@ -19,7 +19,8 @@ def test_calculate_max_current_for_points_returns_expected_shapes():
         solar=np.array([0.0, 50.0]),
         times=np.array([0.0, 1.0]),
         max_temp=80.0,
-        terrain_data={0: {"slope": 12.0, "aspect": 270.0, "elevation": 1100.0}},
+        base_params=_temperature_params(),
+        terrain_data=None,
     )
     assert result["max_currents"].shape == (1, 2)
     assert result["corrected_winds"][0, 0] > 0

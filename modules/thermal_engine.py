@@ -1,6 +1,7 @@
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from numbers import Integral
+from numbers import Integral, Number
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
@@ -28,6 +29,7 @@ class ThermalCalculator:
 
     _MAX_CONDUCTOR_TEMPERATURE_C = 1004.0
     _STEADY_STATE_RESIDUAL_TOLERANCE_W_PER_M = 1e-6
+    _MAX_TRANSIENT_STEP_SECONDS = 10.0
 
     def __init__(self):
         # --- 基础材料参数 ---
@@ -206,26 +208,46 @@ class ThermalCalculator:
 
         temps = [initial_temp]
         current_temp = initial_temp
+        heat_capacity = self.calculate_heat_capacity(params)
+        if not validated_steps:
+            self._calculate_transient_heat_terms(
+                {**params, 'T_avg': current_temp, 'T_s': current_temp}
+            )
 
-        mc_p = self.calculate_heat_capacity(params)
-        if mc_p <= 0:
-            return [initial_temp] * (len(time_steps) + 1)
-
-        for i, dt in enumerate(validated_steps):
-            params['T_avg'] = current_temp
-            params['T_s'] = current_temp
-
-            q_c = self.calculate_convection(params)
-            q_r = self.calculate_radiation(params)
-            q_s = self.calculate_solar_gain(params)
-            r = self.calculate_resistance(params)
-            current = validated_currents[i]
-
-            delta_T = (1 / mc_p) * (r * current ** 2 + q_s - q_c - q_r) * dt
-            current_temp += delta_T
+        for dt, current in zip(validated_steps, validated_currents):
+            substep_count = math.ceil(dt / self._MAX_TRANSIENT_STEP_SECONDS)
+            remaining = dt
+            for _ in range(substep_count):
+                substep = min(self._MAX_TRANSIENT_STEP_SECONDS, remaining)
+                trial = {**params, 'T_avg': current_temp, 'T_s': current_temp}
+                q_convection, q_radiation, q_solar, resistance = (
+                    self._calculate_transient_heat_terms(trial)
+                )
+                heat_flow = (
+                    resistance * current ** 2
+                    + q_solar
+                    - q_convection
+                    - q_radiation
+                )
+                current_temp += heat_flow * substep / heat_capacity
+                if not math.isfinite(current_temp) or current_temp <= -273.15:
+                    raise ValueError("transient temperature is outside the physical range")
+                remaining -= substep
             temps.append(current_temp)
 
         return temps
+
+    def _calculate_transient_heat_terms(
+        self, params: Dict
+    ) -> Tuple[float, float, float, float]:
+        """返回允许热流反向的暂态 qc、qr、qs 和 R。"""
+        q_convection = self._calculate_convection_components(
+            params, allow_heat_gain=True
+        )[3]
+        q_radiation = self._calculate_radiation(params, allow_heat_gain=True)
+        q_solar = self._calculate_solar_gain(params)
+        resistance = self._calculate_resistance(params)
+        return q_convection, q_radiation, q_solar, resistance
 
     # --------------------------------------------------------------------------
     # IEEE 738 分项计算方法
@@ -255,7 +277,7 @@ class ThermalCalculator:
             value = default
         else:
             raise ValueError(f"{key} is required")
-        if isinstance(value, bool):
+        if isinstance(value, (bool, np.bool_)):
             raise ValueError(f"{key} must be a finite number")
         try:
             number = float(value)
@@ -280,20 +302,30 @@ class ThermalCalculator:
         return value
 
     @classmethod
-    def _temperatures(cls, params: Dict) -> Tuple[float, float]:
+    def _physical_temperatures(cls, params: Dict) -> Tuple[float, float]:
         conductor = cls._finite_number(params, 'T_s')
         ambient = cls._finite_number(params, 'T_a')
         if conductor <= -273.15:
             raise ValueError("T_s must be above absolute zero")
         if ambient <= -273.15:
             raise ValueError("T_a must be above absolute zero")
+        return conductor, ambient
+
+    @classmethod
+    def _temperatures(cls, params: Dict) -> Tuple[float, float]:
+        conductor, ambient = cls._physical_temperatures(params)
         if conductor < ambient:
             raise ValueError("T_s must be greater than or equal to T_a")
         return conductor, ambient
 
-    def _calculate_convection_components(self, params: Dict) -> Tuple[float, float, float, float]:
+    def _calculate_convection_components(
+        self, params: Dict, *, allow_heat_gain: bool = False
+    ) -> Tuple[float, float, float, float]:
         diameter = self._positive_number(params, 'D0')
-        conductor_temp, ambient_temp = self._temperatures(params)
+        if allow_heat_gain:
+            conductor_temp, ambient_temp = self._physical_temperatures(params)
+        else:
+            conductor_temp, ambient_temp = self._temperatures(params)
         wind_speed = self._finite_number(params, 'wind_speed')
         if wind_speed < 0.0:
             raise ValueError("wind_speed must be nonnegative")
@@ -302,6 +334,8 @@ class ThermalCalculator:
 
         film_temp = (conductor_temp + ambient_temp) / 2.0
         temperature_difference = conductor_temp - ambient_temp
+        difference_magnitude = abs(temperature_difference)
+        heat_flow_sign = -1.0 if temperature_difference < 0.0 else 1.0
         density = (
             1.293 - 1.525e-4 * elevation + 6.379e-9 * elevation ** 2
         ) / (1.0 + 0.00367 * film_temp)
@@ -321,9 +355,10 @@ class ThermalCalculator:
             3.645
             * density ** 0.5
             * diameter ** 0.75
-            * temperature_difference ** 1.25
+            * difference_magnitude ** 1.25
         )
         if wind_speed == 0.0:
+            q_natural *= heat_flow_sign
             return q_natural, 0.0, 0.0, q_natural
 
         reynolds = diameter * density * wind_speed / viscosity
@@ -332,21 +367,30 @@ class ThermalCalculator:
             angle_factor
             * (1.01 + 1.35 * reynolds ** 0.52)
             * conductivity
-            * temperature_difference
+            * difference_magnitude
         )
         q_high_re = (
             angle_factor
             * 0.754
             * reynolds ** 0.60
             * conductivity
-            * temperature_difference
+            * difference_magnitude
         )
-        return q_natural, q_low_re, q_high_re, max(q_natural, q_low_re, q_high_re)
+        q_convection = max(q_natural, q_low_re, q_high_re)
+        return tuple(
+            heat_flow_sign * value
+            for value in (q_natural, q_low_re, q_high_re, q_convection)
+        )
 
-    def _calculate_radiation(self, params: Dict) -> float:
+    def _calculate_radiation(
+        self, params: Dict, *, allow_heat_gain: bool = False
+    ) -> float:
         diameter = self._positive_number(params, 'D0')
         emissivity = self._fraction(params, 'emissivity')
-        conductor_temp, ambient_temp = self._temperatures(params)
+        if allow_heat_gain:
+            conductor_temp, ambient_temp = self._physical_temperatures(params)
+        else:
+            conductor_temp, ambient_temp = self._temperatures(params)
         return 17.8 * diameter * emissivity * (
             ((conductor_temp + 273.0) / 100.0) ** 4
             - ((ambient_temp + 273.0) / 100.0) ** 4
@@ -415,14 +459,32 @@ class ThermalCalculator:
         return resistance
 
     def calculate_heat_capacity(self, params: Dict) -> float:
-        """计算热容量"""
-        materials = params['materials']
+        """按各材料单位长度质量计算导线总热容量，单位 J/(m*°C)。"""
+        materials = params.get('materials')
+        if (
+            not isinstance(materials, Sequence)
+            or isinstance(materials, (str, bytes))
+            or not materials
+        ):
+            raise ValueError("materials must be a non-empty sequence")
+
         total = 0.0
-        for material in materials:
-            mat_type = material['type']
-            mass = material.get('mass', material.get('density', 0))
-            cp = self.material_properties.get(mat_type, {'cp': 0})['cp']
+        for index, material in enumerate(materials):
+            if not isinstance(material, Mapping):
+                raise ValueError(f"materials[{index}] must be a mapping")
+            mat_type = material.get('type')
+            if mat_type not in self.material_properties:
+                raise ValueError(f"materials[{index}].type is unsupported")
+            mass_key = 'mass' if 'mass' in material else 'density'
+            if mass_key not in material:
+                raise ValueError(f"materials[{index}].mass is required")
+            mass = self._finite_number(material, mass_key)
+            if mass <= 0.0:
+                raise ValueError(f"materials[{index}].mass must be greater than zero")
+            cp = self.material_properties[mat_type]['cp']
             total += mass * cp
+        if not math.isfinite(total) or total <= 0.0:
+            raise ValueError("materials produce invalid heat capacity")
         return total
 
     # --------------------------------------------------------------------------
@@ -499,130 +561,233 @@ class LineAnalyzer:
                                          temps: np.ndarray, winds: np.ndarray, angles: np.ndarray,
                                          solar: np.ndarray, times: np.ndarray, max_temp: float = 80,
                                          base_params: Dict = None, terrain_data: Dict = None) -> Dict:
-        """
-        批量计算全线最大载流量，并返回修正后的微气象数据
-
-        返回:
-            Dict: {
-                'max_currents': np.ndarray,
-                'corrected_winds': np.ndarray,
-                'local_temps': np.ndarray
-            }
-        """
-        num_points = len(observation_points)
-        num_times = len(times)
-
-        # 初始化结果矩阵
-        max_currents = np.zeros((num_points, num_times))
-        corrected_winds = np.zeros((num_points, num_times))  # 新增：存储地形修正后的风速
-        local_temps = np.zeros((num_points, num_times))  # 新增：存储环境温度
-
         if base_params is None:
-            base_params = {
-                'D0': 0.0369, 'emissivity': 0.8, 'absorptivity': 0.8,
-                'R_low_25': 7.283e-5, 'R_high_75': 8.688e-5, 'latitude': 40,
-                'day_of_year': 201, 'line_azimuth': 90,
-                'materials': [{'type': 'aluminum', 'mass': 1.116}, {'type': 'steel', 'mass': 0.5126}]
-            }
+            raise ValueError("base_params must explicitly select a conductor")
+        if not isinstance(base_params, Mapping):
+            raise ValueError("base_params must be a mapping")
+        if terrain_data is not None:
+            if not isinstance(terrain_data, Mapping) or len(terrain_data) > 0:
+                raise ValueError("地形和气象修正必须在上游一次完成")
+
+        points = np.asarray(observation_points)
+        if points.ndim != 1 or len(points) == 0:
+            raise ValueError("observation_points must be a non-empty one-dimensional array")
+        time_shape = np.asarray(times).shape
+        if len(time_shape) != 1:
+            raise ValueError("times must be one-dimensional")
+        time_values = self._validated_array(times, "times", time_shape)
+        if len(time_values) == 0:
+            raise ValueError("times must not be empty")
+
+        num_points = len(points)
+        num_times = len(time_values)
+        elevation_values = self._validated_array(
+            elevations, "elevations", (num_points,)
+        )
+        temp_values = self._validated_array(
+            temps, "temps", (num_points, num_times)
+        )
+        wind_values = self._validated_array(
+            winds, "winds", (num_points, num_times)
+        )
+        angle_values = self._validated_array(
+            angles, "angles", (num_points, num_times)
+        )
+        solar_values = self._validated_array(solar, "solar", (num_times,))
+        if np.any(temp_values <= -273.15):
+            raise ValueError("temps must be above absolute zero")
+        if np.any(wind_values < 0.0):
+            raise ValueError("winds must be nonnegative")
+        if np.any(solar_values < 0.0):
+            raise ValueError("solar must be nonnegative")
+
+        maximum_temp = self.calculator._finite_number(
+            {"max_temp": max_temp}, "max_temp"
+        )
+        if maximum_temp <= -273.15:
+            raise ValueError("max_temp must be above absolute zero")
+        if np.any(temp_values > maximum_temp):
+            raise ValueError("max_temp must be greater than or equal to temps")
+
+        max_currents = np.zeros((num_points, num_times), dtype=float)
 
         for i in range(num_points):
             for j in range(num_times):
-                params = base_params.copy()
-
-                current_solar = solar[j] if isinstance(solar, np.ndarray) and len(solar) == num_times else (
-                    solar if isinstance(solar, (float, int)) else 0)
-
-                # 设置当前时空点的环境参数
+                params = dict(base_params)
                 params.update({
-                    'T_s': max_temp,
-                    'T_avg': max_temp,
-                    'T_a': temps[i, j],
-                    'wind_speed': winds[i, j],
-                    'wind_speed_original': winds[i, j],
-                    'wind_angle': angles[i, j],
-                    'wind_direction_original': angles[i, j],
-                    'elevation': elevations[i],
-                    'time': times[j],
-                    'solar_radiation': current_solar
+                    'T_s': maximum_temp,
+                    'T_avg': maximum_temp,
+                    'T_a': temp_values[i, j],
+                    'wind_speed': wind_values[i, j],
+                    'wind_angle': angle_values[i, j],
+                    'elevation': elevation_values[i],
+                    'time': time_values[j],
+                    'solar_radiation': solar_values[j],
                 })
+                max_currents[i, j] = self.calculator.calculate_steady_state_current(
+                    params
+                )
 
-                # 注入地形数据
-                if terrain_data and i in terrain_data:
-                    terrain = terrain_data[i]
-                    params['slope'] = terrain.get('slope', 0)
-                    params['aspect'] = terrain.get('aspect', 0)
-
-                # 计算载流量
-                # 注意：calculate_steady_state_current 会在内部修改 params['wind_speed'] 为修正后风速
-                current_val = self.calculator.calculate_steady_state_current(params)
-
-                # 保存结果
-                max_currents[i, j] = current_val
-                corrected_winds[i, j] = params['wind_speed']  # 获取修正后的风速
-                local_temps[i, j] = params['T_a']  # 获取该点的环境温度
-
-        # 返回字典结构
+        point_identifiers = [
+            value
+            if not isinstance(value, Number) or isinstance(value, bool)
+            else f"position_{index}"
+            for index, value in enumerate(points.tolist())
+        ]
+        bottleneck_indices = np.argmin(max_currents, axis=0)
         return {
             'max_currents': max_currents,
-            'corrected_winds': corrected_winds,
-            'local_temps': local_temps
+            'corrected_winds': wind_values.copy(),
+            'local_temps': temp_values.copy(),
+            'bottleneck_tower_ids': np.asarray(
+                [point_identifiers[index] for index in bottleneck_indices],
+                dtype=object,
+            ),
         }
+
+    @staticmethod
+    def _validated_array(values, name: str, expected_shape: Tuple[int, ...]) -> np.ndarray:
+        if LineAnalyzer._contains_boolean(values):
+            raise ValueError(f"{name} must contain finite numbers")
+        try:
+            array = np.asarray(values, dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must contain finite numbers") from exc
+        if array.shape != expected_shape:
+            raise ValueError(f"{name} must have shape {expected_shape}")
+        if not np.all(np.isfinite(array)):
+            raise ValueError(f"{name} must contain finite numbers")
+        return array.copy()
 
     def calculate_time_to_max_temp(self, params: Dict, current: float, max_temp: float,
                                    initial_temp: float, time_step: float = 10) -> float:
         """计算达到限值的时间"""
-        current_temp = initial_temp
-        time = 0.0
+        validated_current = self.calculator._finite_number(
+            {'current': current}, 'current'
+        )
+        if validated_current < 0.0:
+            raise ValueError("current must be nonnegative")
+        target_temp = self.calculator._finite_number(
+            {'max_temp': max_temp}, 'max_temp'
+        )
+        current_temp = self.calculator._finite_number(
+            {'initial_temp': initial_temp}, 'initial_temp'
+        )
+        if target_temp <= -273.15:
+            raise ValueError("max_temp must be above absolute zero")
+        if current_temp <= -273.15:
+            raise ValueError("initial_temp must be above absolute zero")
+        requested_step = self.calculator._finite_number(
+            {'time_step': time_step}, 'time_step'
+        )
+        if requested_step <= 0.0:
+            raise ValueError("time_step must be greater than zero")
+        if target_temp <= current_temp:
+            return 0.0
 
-        mc_p = self.calculator.calculate_heat_capacity(params)
-        if mc_p <= 0:
-            return float('inf')
-
-        while current_temp < max_temp:
-            params['T_avg'] = current_temp
-            params['T_s'] = current_temp
-
-            q_c = self.calculator.calculate_convection(params)
-            q_r = self.calculator.calculate_radiation(params)
-            q_s = self.calculator.calculate_solar_gain(params)
-            r = self.calculator.calculate_resistance(params)
-
-            delta_T = (1 / mc_p) * (r * current ** 2 + q_s - q_c - q_r) * time_step
-
-            if delta_T <= 0:
+        integration_step = min(
+            requested_step, self.calculator._MAX_TRANSIENT_STEP_SECONDS
+        )
+        elapsed = 0.0
+        while elapsed < 7200.0:
+            step = min(integration_step, 7200.0 - elapsed)
+            next_temp = self.calculator.calculate_transient_temperature(
+                params=params,
+                time_steps=[step],
+                initial_temp=current_temp,
+                current_profile=[validated_current],
+            )[-1]
+            if next_temp <= current_temp:
                 return float('inf')
-
-            current_temp += delta_T
-            time += time_step
-            if time > 7200:
-                return float('inf')
-
-        return time
+            current_temp = next_temp
+            elapsed += step
+            if current_temp >= target_temp:
+                return elapsed
+        return float('inf')
 
     def find_max_current_for_window(self, env_params, base_static, params, dt_hours, start_hour=0, end_hour=2):
         """日前调度：寻找时间窗口内的最大允许电流"""
-        time_mask = (env_params['times'] >= start_hour) & (env_params['times'] <= end_hour)
+        interval_hours = self.calculator._finite_number(
+            {'dt_hours': dt_hours}, 'dt_hours'
+        )
+        if interval_hours <= 0.0:
+            raise ValueError("dt_hours must be greater than zero")
+        times = self._one_dimensional_finite_array(env_params, 'times')
+        temperatures = self._one_dimensional_finite_array(env_params, 'temp')
+        if len(times) != len(temperatures):
+            raise ValueError("temp must have the same length as times")
+        if len(times) == 0:
+            raise ValueError("times must not be empty")
+        time_differences = np.diff(times)
+        if np.any(time_differences <= 0.0):
+            raise ValueError("times must be strictly increasing")
+        if not np.allclose(
+            time_differences,
+            interval_hours,
+            rtol=1e-9,
+            atol=1e-12,
+        ):
+            raise ValueError("dt_hours must match every interval in times")
+        weather = self._validated_dynamic_weather(env_params, len(times))
+        initial_temp = self._initial_conductor_temperature(params, weather)
+
+        start = self.calculator._finite_number(
+            {'start_hour': start_hour}, 'start_hour'
+        )
+        end = self.calculator._finite_number({'end_hour': end_hour}, 'end_hour')
+        if end < start:
+            raise ValueError("end_hour must be greater than or equal to start_hour")
+        time_mask = (times >= start) & (times <= end)
         time_indices = np.where(time_mask)[0]
         if len(time_indices) == 0:
-            return 0
+            return 0.0
 
-        target_temp = params['max_allow_temp']
-        low = base_static
-        high = base_static * 3.0
+        target_temp = self.calculator._finite_number(params, 'max_allow_temp')
+        low = self.calculator._finite_number(
+            {'base_static': base_static}, 'base_static'
+        )
+        if low < 0.0:
+            raise ValueError("base_static must be nonnegative")
+        steps = (time_differences * 3600.0).tolist()
+
+        def maximum_temperature(current: float) -> float:
+            profile = [current] * len(steps)
+            temperatures_for_current = self._integrate_dynamic_profile(
+                params=params,
+                weather=weather,
+                time_steps=steps,
+                current_profile=profile,
+                initial_temp=initial_temp,
+            )
+            return float(np.max(temperatures_for_current[time_indices]))
+
+        def current_is_safe(current: float) -> bool:
+            try:
+                return maximum_temperature(current) <= target_temp
+            except (OverflowError, ValueError):
+                return False
+
+        if maximum_temperature(0.0) > target_temp:
+            raise ValueError("当前天气和温度限制下不存在可行电流")
+
+        if current_is_safe(low):
+            high = max(low * 3.0, 1.0)
+            for _ in range(40):
+                if not current_is_safe(high):
+                    break
+                low = high
+                high *= 2.0
+                if not math.isfinite(high):
+                    raise ValueError("无法建立不可行电流上界")
+            else:
+                raise ValueError("无法建立不可行电流上界")
+        else:
+            high = low
+            low = 0.0
 
         for _ in range(15):
             mid = (low + high) / 2
-            steps = (np.diff(env_params['times']) * 3600).tolist()
-            current_profile = [mid] * len(steps)
-
-            temps = self.calculator.calculate_transient_temperature(
-                params, steps, env_params['temp'][0], current_profile
-            )
-
-            relevant_temps = np.array(temps)[time_indices]
-            max_t = np.max(relevant_temps)
-
-            if max_t <= target_temp:
+            if current_is_safe(mid):
                 low = mid
             else:
                 high = mid
@@ -636,10 +801,159 @@ class LineAnalyzer:
 
     def calculate_dynamic_temperature(self, env_params, params, current_profile, dt_hours):
         """计算全时段温度"""
-        steps = [dt_hours * 3600] * len(current_profile)
-        temps = self.calculator.calculate_transient_temperature(
-            params, steps, env_params['temp'][0], current_profile
+        interval_hours = self.calculator._finite_number(
+            {'dt_hours': dt_hours}, 'dt_hours'
         )
-        if len(temps) > len(current_profile):
-            temps = temps[:len(current_profile)]
-        return np.array(temps), np.array(temps)
+        if interval_hours <= 0.0:
+            raise ValueError("dt_hours must be greater than zero")
+        currents = self._one_dimensional_finite_array(
+            {'current_profile': current_profile}, 'current_profile'
+        )
+        if len(currents) == 0:
+            raise ValueError("current_profile must not be empty")
+        if np.any(currents < 0.0):
+            raise ValueError("current_profile must be nonnegative")
+        if isinstance(env_params, Mapping) and 'times' in env_params:
+            times = self._one_dimensional_finite_array(env_params, 'times')
+            if len(times) != len(currents):
+                raise ValueError("times must have the same length as the samples")
+            time_differences = np.diff(times)
+            if np.any(time_differences <= 0.0):
+                raise ValueError("times must be strictly increasing")
+            if not np.allclose(
+                time_differences,
+                interval_hours,
+                rtol=1e-9,
+                atol=1e-12,
+            ):
+                raise ValueError("dt_hours must match every interval in times")
+        weather = self._validated_dynamic_weather(env_params, len(currents))
+        initial_temp = self._initial_conductor_temperature(params, weather)
+        steps = [interval_hours * 3600.0] * (len(currents) - 1)
+        result = self._integrate_dynamic_profile(
+            params=params,
+            weather=weather,
+            time_steps=steps,
+            current_profile=currents[:-1].tolist(),
+            initial_temp=initial_temp,
+        )
+        return result, result.copy()
+
+    def _validated_dynamic_weather(
+        self, env_params, sample_count: int
+    ) -> Dict[str, np.ndarray]:
+        if not isinstance(env_params, Mapping):
+            raise ValueError("env_params must be a mapping")
+
+        fields = (
+            (("temp",), "T_a", True),
+            (("wind", "wind_speed", "winds"), "wind_speed", False),
+            (("angle", "wind_angle", "angles"), "wind_angle", False),
+            (("solar", "solar_radiation"), "solar_radiation", False),
+            (("elevation", "elevations"), "elevation", False),
+            (("time", "times"), "time", False),
+        )
+        weather = {}
+        for aliases, thermal_key, required in fields:
+            present = [alias for alias in aliases if alias in env_params]
+            if not present:
+                if required:
+                    raise ValueError(f"{aliases[0]} is required")
+                continue
+            if len(present) > 1:
+                raise ValueError(
+                    f"{thermal_key} weather aliases are ambiguous: {present}"
+                )
+            source_key = present[0]
+            values = self._one_dimensional_finite_array(env_params, source_key)
+            if len(values) != sample_count:
+                raise ValueError(
+                    f"{source_key} must have the same length as the samples"
+                )
+            weather[thermal_key] = values
+
+        if np.any(weather['T_a'] <= -273.15):
+            raise ValueError("temp must be above absolute zero")
+        if 'wind_speed' in weather and np.any(weather['wind_speed'] < 0.0):
+            raise ValueError("wind must be nonnegative")
+        if 'solar_radiation' in weather and np.any(
+            weather['solar_radiation'] < 0.0
+        ):
+            raise ValueError("solar must be nonnegative")
+        return weather
+
+    def _initial_conductor_temperature(
+        self, params: Dict, weather: Dict[str, np.ndarray]
+    ) -> float:
+        if not isinstance(params, Mapping):
+            raise ValueError("params must be a mapping")
+        initial = params.get('T_s', weather['T_a'][0])
+        initial_temp = self.calculator._finite_number(
+            {'initial_temp': initial}, 'initial_temp'
+        )
+        if initial_temp <= -273.15:
+            raise ValueError("initial_temp must be above absolute zero")
+        return initial_temp
+
+    def _integrate_dynamic_profile(
+        self,
+        params: Dict,
+        weather: Dict[str, np.ndarray],
+        time_steps: List[float],
+        current_profile: List[float],
+        initial_temp: float,
+    ) -> np.ndarray:
+        if len(time_steps) != len(current_profile):
+            raise ValueError("time_steps and current_profile must have the same length")
+
+        temperatures = [initial_temp]
+        current_temp = initial_temp
+        if not time_steps:
+            validation_params = dict(params)
+            validation_params.update(
+                {key: values[0] for key, values in weather.items()}
+            )
+            self.calculator.calculate_transient_temperature(
+                validation_params, [], current_temp, []
+            )
+            return np.asarray(temperatures, dtype=float)
+
+        for index, (time_step, current) in enumerate(
+            zip(time_steps, current_profile)
+        ):
+            interval_params = dict(params)
+            interval_params.update(
+                {key: values[index] for key, values in weather.items()}
+            )
+            current_temp = self.calculator.calculate_transient_temperature(
+                params=interval_params,
+                time_steps=[time_step],
+                initial_temp=current_temp,
+                current_profile=[current],
+            )[-1]
+            temperatures.append(current_temp)
+        return np.asarray(temperatures, dtype=float)
+
+    @staticmethod
+    def _one_dimensional_finite_array(container, key: str) -> np.ndarray:
+        if not isinstance(container, Mapping) or key not in container:
+            raise ValueError(f"{key} is required")
+        if LineAnalyzer._contains_boolean(container[key]):
+            raise ValueError(f"{key} must contain finite numbers")
+        try:
+            values = np.asarray(container[key], dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} must contain finite numbers") from exc
+        if values.ndim != 1:
+            raise ValueError(f"{key} must be one-dimensional")
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"{key} must contain finite numbers")
+        return values.copy()
+
+    @staticmethod
+    def _contains_boolean(values) -> bool:
+        try:
+            objects = np.asarray(values, dtype=object)
+        except (TypeError, ValueError):
+            return False
+        return any(isinstance(value, (bool, np.bool_)) for value in objects.flat)

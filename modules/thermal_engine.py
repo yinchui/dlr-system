@@ -1,5 +1,6 @@
 import math
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
@@ -44,41 +45,6 @@ class ThermalCalculator:
             'US': {'A': 1, 'B': 3.500e-5, 'C': -1.000e-9}
         }
 
-        # --- 地形微气候修正参数 ---
-        self.ALPHA_ROUGHNESS = 0.15  # 地表粗糙度指数
-        self.REF_HEIGHT_GRID = 10.0  # 参考高度 (气象站高度)
-        self.LINE_AVG_HEIGHT = 20.0  # 导线平均高度
-
-    def apply_micro_climate_corrections(self, grid_wind_speed: float, grid_wind_dir: float,
-                                        slope: float, aspect: float) -> Tuple[float, float]:
-        """
-        核心地形修正函数 - 从 dynamic_temperature_calculation.py 集成
-        """
-        # 1. 垂直高度修正 - Hellman指数法
-        v_vertical_corrected = grid_wind_speed * (self.LINE_AVG_HEIGHT / self.REF_HEIGHT_GRID) ** self.ALPHA_ROUGHNESS
-
-        # 2. 地形风速修正 - 基于坡度和相对风向
-        if slope < 2:
-            # 平坦地形
-            topo_factor = 1.0
-        else:
-            # 有起伏的地形
-            angle_diff_rad = math.radians(grid_wind_dir - aspect)
-            impact = math.cos(angle_diff_rad)  # 风向与坡向的相关性
-
-            if impact < -0.5:
-                # 迎风坡 - 风速加速
-                topo_factor = 1.0 + min((slope / 45.0) * 0.4, 0.3)
-            elif impact > 0.5:
-                # 背风坡 - 风速减弱
-                topo_factor = 1.0 - min((slope / 45.0) * 0.4, 0.3)
-            else:
-                # 斜侧风 - 风速基本不变
-                topo_factor = 1.0
-
-        v_final = v_vertical_corrected * topo_factor
-        return v_final, topo_factor
-
     def calculate_heat_balance(self, params: Dict) -> HeatBalanceResult:
         """一次计算 IEEE 738 稳态热平衡的全部分项。"""
         local_params = dict(params)
@@ -102,9 +68,40 @@ class ThermalCalculator:
         """计算稳态电流。"""
         return self.calculate_heat_balance(params).current_a
 
+    @staticmethod
+    def wind_angle_factor(angle: float) -> float:
+        """返回归一到导线轴线 0..90 度后的 IEEE 738 风向因子。"""
+        if isinstance(angle, bool):
+            raise ValueError("wind_angle must be a finite number")
+        try:
+            wind_angle = float(angle)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("wind_angle must be a finite number") from exc
+        if not math.isfinite(wind_angle):
+            raise ValueError("wind_angle must be a finite number")
+
+        effective_angle = wind_angle % 180.0
+        if effective_angle > 90.0:
+            effective_angle = 180.0 - effective_angle
+        phi = math.radians(effective_angle)
+        return (
+            1.194
+            - math.cos(phi)
+            + 0.194 * math.cos(2.0 * phi)
+            + 0.368 * math.sin(2.0 * phi)
+        )
+
     def calculate_steady_state_temperature(self, params: Dict, current: float,
                                            max_iter: int = 100, tol: float = 1e-3) -> float:
         """已知电流推导温度"""
+        current = self._finite_number({'current': current}, 'current')
+        if current < 0.0:
+            raise ValueError("current must be nonnegative")
+        if isinstance(max_iter, bool) or not isinstance(max_iter, Integral) or max_iter <= 0:
+            raise ValueError("max_iter must be a positive integer")
+        tol = self._finite_number({'tol': tol}, 'tol')
+        if tol <= 0.0:
+            raise ValueError("tol must be greater than zero")
         params = dict(params)
 
         Ta = params['T_a']
@@ -135,6 +132,29 @@ class ThermalCalculator:
     def calculate_transient_temperature(self, params: Dict, time_steps: List[float],
                                         initial_temp: float, current_profile: List[float]) -> List[float]:
         """计算暂态温度变化"""
+        initial_temp = self._finite_number(
+            {'initial_temp': initial_temp}, 'initial_temp'
+        )
+        if initial_temp <= -273.15:
+            raise ValueError("initial_temp must be above absolute zero")
+        if len(time_steps) != len(current_profile):
+            raise ValueError("time_steps and current_profile must have the same length")
+
+        validated_steps = []
+        validated_currents = []
+        for time_step in time_steps:
+            value = self._finite_number({'time_steps': time_step}, 'time_steps')
+            if value <= 0.0:
+                raise ValueError("time_steps values must be greater than zero")
+            validated_steps.append(value)
+        for profile_current in current_profile:
+            value = self._finite_number(
+                {'current_profile': profile_current}, 'current_profile'
+            )
+            if value < 0.0:
+                raise ValueError("current_profile values must be nonnegative")
+            validated_currents.append(value)
+
         params = dict(params)
 
         temps = [initial_temp]
@@ -144,7 +164,7 @@ class ThermalCalculator:
         if mc_p <= 0:
             return [initial_temp] * (len(time_steps) + 1)
 
-        for i, dt in enumerate(time_steps):
+        for i, dt in enumerate(validated_steps):
             params['T_avg'] = current_temp
             params['T_s'] = current_temp
 
@@ -152,7 +172,7 @@ class ThermalCalculator:
             q_r = self.calculate_radiation(params)
             q_s = self.calculate_solar_gain(params)
             r = self.calculate_resistance(params)
-            current = current_profile[i]
+            current = validated_currents[i]
 
             delta_T = (1 / mc_p) * (r * current ** 2 + q_s - q_c - q_r) * dt
             current_temp += delta_T
@@ -260,16 +280,7 @@ class ThermalCalculator:
             return q_natural, 0.0, 0.0, q_natural
 
         reynolds = diameter * density * wind_speed / viscosity
-        effective_angle = wind_angle % 180.0
-        if effective_angle > 90.0:
-            effective_angle = 180.0 - effective_angle
-        phi = math.radians(effective_angle)
-        angle_factor = (
-            1.194
-            - math.cos(phi)
-            + 0.194 * math.cos(2.0 * phi)
-            + 0.368 * math.sin(2.0 * phi)
-        )
+        angle_factor = self.wind_angle_factor(wind_angle)
         q_low_re = (
             angle_factor
             * (1.01 + 1.35 * reynolds ** 0.52)

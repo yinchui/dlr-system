@@ -49,20 +49,35 @@ def test_zero_wind_uses_natural_convection_only():
     [(0.0, 0.388), (90.0, 1.0), (180.0, 0.388), (-90.0, 1.0), (270.0, 1.0)],
 )
 def test_wind_angle_is_normalized_to_conductor_axis(angle, expected_factor):
-    calculator = EngineThermalCalculator()
-    perpendicular = calculator.calculate_heat_balance(
-        {**DRAKE_STEADY_PARAMS, "wind_speed": 5.0, "wind_angle": 90.0}
+    assert EngineThermalCalculator.wind_angle_factor(angle) == pytest.approx(
+        expected_factor, abs=1e-12
     )
 
-    result = calculator.calculate_heat_balance(
-        {**DRAKE_STEADY_PARAMS, "wind_speed": 5.0, "wind_angle": angle}
+
+@pytest.mark.parametrize("angle", [math.nan, math.inf, -math.inf, True, False])
+def test_wind_angle_factor_rejects_nonfinite_and_boolean_values(angle):
+    with pytest.raises(ValueError, match="wind_angle"):
+        EngineThermalCalculator.wind_angle_factor(angle)
+
+
+def test_convection_uses_public_wind_angle_factor():
+    class HalfAngleFactorCalculator(EngineThermalCalculator):
+        @staticmethod
+        def wind_angle_factor(angle):
+            return 0.5
+
+    perpendicular = EngineThermalCalculator().calculate_heat_balance(
+        {**DRAKE_STEADY_PARAMS, "wind_speed": 5.0, "wind_angle": 90.0}
+    )
+    result = HalfAngleFactorCalculator().calculate_heat_balance(
+        {**DRAKE_STEADY_PARAMS, "wind_speed": 5.0, "wind_angle": 12.0}
     )
 
     assert result.q_convection_low_re / perpendicular.q_convection_low_re == pytest.approx(
-        expected_factor, abs=1e-12
+        0.5, abs=1e-12
     )
     assert result.q_convection_high_re / perpendicular.q_convection_high_re == pytest.approx(
-        expected_factor, abs=1e-12
+        0.5, abs=1e-12
     )
 
 

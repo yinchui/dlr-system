@@ -961,6 +961,7 @@ dispatch_app_st.py 只做薄层：
 - 现有“处理数据 & 计算”按钮触发 pipeline；
 - 显式传 st.session_state.conductor_params；
 - 不再向热核传 terrain_data；
+- 暂态计算失败时由编排层使用同一导线、同一时刻的稳态额定值保守回退；Task 8 热核只显式报错，不提前吞异常；
 - 标题中的 IEEE 738-2013 改为 IEEE 738-2023；
 - 保留 line_data 兼容投影和现有图表形状；
 - AI 区域删除随机残差和 DLR 自参照 MAE/RMSE，在同一图表容器展示温度/风速物理值、AI 修正值、真实值；保留三列指标容器并显示风速 MAE、温度 MAE、已启用模型数；

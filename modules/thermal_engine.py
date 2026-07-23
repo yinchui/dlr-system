@@ -80,7 +80,7 @@ class ThermalCalculator:
             raise ValueError("wind_angle must be a finite number")
         try:
             wind_angle = float(angle)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError("wind_angle must be a finite number") from exc
         if not math.isfinite(wind_angle):
             raise ValueError("wind_angle must be a finite number")
@@ -181,35 +181,30 @@ class ThermalCalculator:
     def calculate_transient_temperature(self, params: Dict, time_steps: List[float],
                                         initial_temp: float, current_profile: List[float]) -> List[float]:
         """计算暂态温度变化"""
+        if not isinstance(params, Mapping):
+            raise ValueError("params must be a mapping")
         initial_temp = self._finite_number(
             {'initial_temp': initial_temp}, 'initial_temp'
         )
         if initial_temp <= -273.15:
             raise ValueError("initial_temp must be above absolute zero")
-        if len(time_steps) != len(current_profile):
+        validated_steps = self._finite_numeric_vector(time_steps, 'time_steps')
+        validated_currents = self._finite_numeric_vector(
+            current_profile, 'current_profile'
+        )
+        if len(validated_steps) != len(validated_currents):
             raise ValueError("time_steps and current_profile must have the same length")
-
-        validated_steps = []
-        validated_currents = []
-        for time_step in time_steps:
-            value = self._finite_number({'time_steps': time_step}, 'time_steps')
-            if value <= 0.0:
-                raise ValueError("time_steps values must be greater than zero")
-            validated_steps.append(value)
-        for profile_current in current_profile:
-            value = self._finite_number(
-                {'current_profile': profile_current}, 'current_profile'
-            )
-            if value < 0.0:
-                raise ValueError("current_profile values must be nonnegative")
-            validated_currents.append(value)
+        if np.any(validated_steps <= 0.0):
+            raise ValueError("time_steps values must be greater than zero")
+        if np.any(validated_currents < 0.0):
+            raise ValueError("current_profile values must be nonnegative")
 
         params = dict(params)
 
         temps = [initial_temp]
         current_temp = initial_temp
         heat_capacity = self.calculate_heat_capacity(params)
-        if not validated_steps:
+        if len(validated_steps) == 0:
             self._calculate_transient_heat_terms(
                 {**params, 'T_avg': current_temp, 'T_s': current_temp}
             )
@@ -281,11 +276,38 @@ class ThermalCalculator:
             raise ValueError(f"{key} must be a finite number")
         try:
             number = float(value)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(f"{key} must be a finite number") from exc
         if not math.isfinite(number):
             raise ValueError(f"{key} must be a finite number")
         return number
+
+    @staticmethod
+    def _finite_numeric_vector(values, key: str) -> np.ndarray:
+        if isinstance(values, np.ndarray) and np.issubdtype(values.dtype, np.bool_):
+            raise ValueError(f"{key} must be a one-dimensional finite numeric sequence")
+        try:
+            objects = np.asarray(values, dtype=object)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"{key} must be a one-dimensional finite numeric sequence"
+            ) from exc
+        if objects.ndim != 1:
+            raise ValueError(f"{key} must be a one-dimensional finite numeric sequence")
+        if any(
+            isinstance(value, (bool, np.bool_, str, bytes))
+            for value in objects.flat
+        ):
+            raise ValueError(f"{key} must be a one-dimensional finite numeric sequence")
+        try:
+            vector = np.asarray(values, dtype=float)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"{key} must be a one-dimensional finite numeric sequence"
+            ) from exc
+        if vector.ndim != 1 or not np.all(np.isfinite(vector)):
+            raise ValueError(f"{key} must be a one-dimensional finite numeric sequence")
+        return vector.copy()
 
     @classmethod
     def _positive_number(cls, params: Dict, key: str, default=None) -> float:
@@ -565,11 +587,12 @@ class LineAnalyzer:
             raise ValueError("base_params must explicitly select a conductor")
         if not isinstance(base_params, Mapping):
             raise ValueError("base_params must be a mapping")
+        conductor_params = self._validated_conductor_params(base_params)
         if terrain_data is not None:
             if not isinstance(terrain_data, Mapping) or len(terrain_data) > 0:
                 raise ValueError("地形和气象修正必须在上游一次完成")
 
-        points = np.asarray(observation_points)
+        points = np.asarray(observation_points, dtype=object)
         if points.ndim != 1 or len(points) == 0:
             raise ValueError("observation_points must be a non-empty one-dimensional array")
         time_shape = np.asarray(times).shape
@@ -613,7 +636,7 @@ class LineAnalyzer:
 
         for i in range(num_points):
             for j in range(num_times):
-                params = dict(base_params)
+                params = dict(conductor_params)
                 params.update({
                     'T_s': maximum_temp,
                     'T_avg': maximum_temp,
@@ -644,6 +667,14 @@ class LineAnalyzer:
                 dtype=object,
             ),
         }
+
+    def _validated_conductor_params(self, base_params: Mapping) -> Dict:
+        conductor_params = dict(base_params)
+        for key in ('D0', 'R_low_25', 'R_high_75', 'R_high_200'):
+            self.calculator._positive_number(conductor_params, key)
+        for key in ('emissivity', 'absorptivity'):
+            self.calculator._fraction(conductor_params, key)
+        return conductor_params
 
     @staticmethod
     def _validated_array(values, name: str, expected_shape: Tuple[int, ...]) -> np.ndarray:
@@ -682,6 +713,12 @@ class LineAnalyzer:
         )
         if requested_step <= 0.0:
             raise ValueError("time_step must be greater than zero")
+        self.calculator.calculate_transient_temperature(
+            params=params,
+            time_steps=[],
+            initial_temp=current_temp,
+            current_profile=[],
+        )
         if target_temp <= current_temp:
             return 0.0
 
@@ -712,6 +749,16 @@ class LineAnalyzer:
         )
         if interval_hours <= 0.0:
             raise ValueError("dt_hours must be greater than zero")
+        if not isinstance(params, Mapping):
+            raise ValueError("params must be a mapping")
+        target_temp = self.calculator._finite_number(params, 'max_allow_temp')
+        if target_temp <= -273.15:
+            raise ValueError("max_allow_temp must be above absolute zero")
+        low = self.calculator._finite_number(
+            {'base_static': base_static}, 'base_static'
+        )
+        if low < 0.0:
+            raise ValueError("base_static must be nonnegative")
         times = self._one_dimensional_finite_array(env_params, 'times')
         temperatures = self._one_dimensional_finite_array(env_params, 'temp')
         if len(times) != len(temperatures):
@@ -737,17 +784,12 @@ class LineAnalyzer:
         end = self.calculator._finite_number({'end_hour': end_hour}, 'end_hour')
         if end < start:
             raise ValueError("end_hour must be greater than or equal to start_hour")
+        self._validate_dynamic_thermal_inputs(params, weather, initial_temp)
         time_mask = (times >= start) & (times <= end)
         time_indices = np.where(time_mask)[0]
         if len(time_indices) == 0:
             return 0.0
 
-        target_temp = self.calculator._finite_number(params, 'max_allow_temp')
-        low = self.calculator._finite_number(
-            {'base_static': base_static}, 'base_static'
-        )
-        if low < 0.0:
-            raise ValueError("base_static must be nonnegative")
         steps = (time_differences * 3600.0).tolist()
 
         def maximum_temperature(current: float) -> float:
@@ -894,6 +936,28 @@ class LineAnalyzer:
         if initial_temp <= -273.15:
             raise ValueError("initial_temp must be above absolute zero")
         return initial_temp
+
+    def _validate_dynamic_thermal_inputs(
+        self,
+        params: Mapping,
+        weather: Dict[str, np.ndarray],
+        initial_temp: float,
+    ) -> None:
+        original_params = dict(params)
+        for key, values in weather.items():
+            original_params.setdefault(key, values[0])
+        self.calculator.calculate_transient_temperature(
+            original_params, [], initial_temp, []
+        )
+
+        for index in range(len(weather['T_a'])):
+            effective_params = dict(params)
+            effective_params.update(
+                {key: values[index] for key, values in weather.items()}
+            )
+            self.calculator.calculate_transient_temperature(
+                effective_params, [], initial_temp, []
+            )
 
     def _integrate_dynamic_profile(
         self,

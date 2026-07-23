@@ -166,3 +166,34 @@ def test_transient_rejects_numpy_boolean_steps_and_currents(
             initial_temp=100.0,
             current_profile=current_profile,
         )
+
+
+@pytest.mark.parametrize("field", ["time_steps", "current_profile"])
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        10.0,
+        None,
+        np.array([[10.0]]),
+        "5",
+        ["5"],
+        [10 ** 1000],
+        np.bool_(True),
+    ],
+)
+def test_transient_rejects_non_numeric_or_non_vector_profiles(
+    field, invalid_value
+):
+    arguments = {
+        "time_steps": [10.0],
+        "current_profile": [1200.0],
+    }
+    arguments[field] = invalid_value
+
+    with pytest.raises(ValueError, match=field):
+        ThermalCalculator().calculate_transient_temperature(
+            params=drake_transient_params(),
+            time_steps=arguments["time_steps"],
+            initial_temp=100.0,
+            current_profile=arguments["current_profile"],
+        )

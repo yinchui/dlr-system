@@ -84,6 +84,29 @@ def test_line_analyzer_requires_explicit_selected_conductor(analyzer):
         analyzer.calculate_max_current_for_points(**weather_matrix())
 
 
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "D0",
+        "R_low_25",
+        "R_high_75",
+        "R_high_200",
+        "emissivity",
+        "absorptivity",
+    ],
+)
+def test_line_analyzer_rejects_incomplete_selected_conductor(
+    analyzer, missing_field
+):
+    conductor = drake_conductor()
+    conductor.pop(missing_field)
+
+    with pytest.raises(ValueError, match=missing_field):
+        analyzer.calculate_max_current_for_points(
+            **weather_matrix(), base_params=conductor
+        )
+
+
 def test_line_analyzer_uses_selected_conductor(analyzer):
     first = analyzer.calculate_max_current_for_points(
         **weather_matrix(), base_params=drake_conductor()
@@ -136,6 +159,21 @@ def test_numeric_observation_coordinates_use_stable_position_identifiers(analyze
 
     assert result["bottleneck_tower_ids"].tolist() == [
         "position_0",
+        "position_1",
+    ]
+
+
+def test_mixed_observation_points_preserve_numeric_position_identifiers(analyzer):
+    weather = weather_matrix()
+    weather["observation_points"] = ["tower-A", 1.42]
+
+    result = analyzer.calculate_max_current_for_points(
+        **weather,
+        base_params=drake_conductor(),
+    )
+
+    assert result["bottleneck_tower_ids"].tolist() == [
+        "tower-A",
         "position_1",
     ]
 
@@ -432,6 +470,67 @@ def test_find_max_current_for_window_rejects_dt_mismatch(analyzer):
         )
 
 
+@pytest.mark.parametrize("base_static", [math.nan, np.bool_(True), -1.0])
+def test_empty_window_still_rejects_invalid_base_current(analyzer, base_static):
+    env_params, interval_hours = _short_window_environment()
+
+    with pytest.raises(ValueError, match="base_static"):
+        analyzer.find_max_current_for_window(
+            env_params=env_params,
+            base_static=base_static,
+            params=_short_window_params(),
+            dt_hours=interval_hours,
+            start_hour=10.0,
+            end_hour=12.0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("max_allow_temp", math.nan),
+        ("max_allow_temp", -273.15),
+        ("wind_speed", math.nan),
+        ("D0", 0.0),
+        ("materials", []),
+    ],
+)
+def test_empty_window_still_rejects_invalid_thermal_params(
+    analyzer, field, invalid_value
+):
+    env_params, interval_hours = _short_window_environment()
+    params = _short_window_params()
+    params[field] = invalid_value
+
+    with pytest.raises(ValueError, match=field):
+        analyzer.find_max_current_for_window(
+            env_params=env_params,
+            base_static=100.0,
+            params=params,
+            dt_hours=interval_hours,
+            start_hour=10.0,
+            end_hour=12.0,
+        )
+
+
+def test_empty_window_still_rejects_invalid_solar_time(analyzer):
+    params = drake_thermal_params()
+    params["max_allow_temp"] = 125.0
+
+    with pytest.raises(ValueError, match="time"):
+        analyzer.find_max_current_for_window(
+            env_params={
+                "times": np.array([25.0, 26.0, 27.0]),
+                "temp": np.array([40.0, 40.0, 40.0]),
+            },
+            base_static=100.0,
+            params=params,
+            dt_hours=1.0,
+            start_hour=100.0,
+            end_hour=102.0,
+        )
+
+
 def test_find_max_current_for_window_uses_each_interval_weather(analyzer):
     params = {
         **drake_thermal_params(),
@@ -577,4 +676,29 @@ def test_time_to_max_temperature_rejects_target_at_absolute_zero(analyzer):
             current=0.0,
             max_temp=-273.15,
             initial_temp=20.0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("wind_speed", math.nan),
+        ("time", math.nan),
+        ("D0", 0.0),
+        ("materials", []),
+    ],
+)
+def test_time_to_max_temperature_validates_params_before_early_return(
+    analyzer, field, invalid_value
+):
+    params = drake_thermal_params()
+    params[field] = invalid_value
+
+    with pytest.raises(ValueError, match=field):
+        analyzer.calculate_time_to_max_temp(
+            params=params,
+            current=0.0,
+            max_temp=80.0,
+            initial_temp=100.0,
+            time_step=10.0,
         )

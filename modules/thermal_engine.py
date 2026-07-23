@@ -30,6 +30,7 @@ class ThermalCalculator:
     _MAX_CONDUCTOR_TEMPERATURE_C = 1004.0
     _STEADY_STATE_RESIDUAL_TOLERANCE_W_PER_M = 1e-6
     _MAX_TRANSIENT_STEP_SECONDS = 10.0
+    _MAX_TRANSIENT_SUBSTEPS = 1_000_000
 
     def __init__(self):
         # --- 基础材料参数 ---
@@ -199,6 +200,10 @@ class ThermalCalculator:
         if np.any(validated_currents < 0.0):
             raise ValueError("current_profile values must be nonnegative")
 
+        substep_counts = self._validated_transient_substep_counts(
+            validated_steps
+        )
+
         params = dict(params)
 
         temps = [initial_temp]
@@ -209,8 +214,9 @@ class ThermalCalculator:
                 {**params, 'T_avg': current_temp, 'T_s': current_temp}
             )
 
-        for dt, current in zip(validated_steps, validated_currents):
-            substep_count = math.ceil(dt / self._MAX_TRANSIENT_STEP_SECONDS)
+        for dt, current, substep_count in zip(
+            validated_steps, validated_currents, substep_counts
+        ):
             remaining = dt
             for _ in range(substep_count):
                 substep = min(self._MAX_TRANSIENT_STEP_SECONDS, remaining)
@@ -308,6 +314,30 @@ class ThermalCalculator:
         if vector.ndim != 1 or not np.all(np.isfinite(vector)):
             raise ValueError(f"{key} must be a one-dimensional finite numeric sequence")
         return vector.copy()
+
+    def _validated_transient_substep_counts(self, time_steps) -> List[int]:
+        substep_counts = []
+        total_substeps = 0
+        for time_step in time_steps:
+            if isinstance(time_step, (bool, np.bool_, str, bytes)):
+                raise ValueError("time_steps values must be finite numbers")
+            try:
+                seconds = float(time_step)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("time_steps values must be finite numbers") from exc
+            if not math.isfinite(seconds) or seconds <= 0.0:
+                raise ValueError(
+                    "time_steps values must be finite and greater than zero"
+                )
+            substep_count = max(
+                1,
+                math.ceil(seconds / self._MAX_TRANSIENT_STEP_SECONDS),
+            )
+            total_substeps += substep_count
+            if total_substeps > self._MAX_TRANSIENT_SUBSTEPS:
+                raise ValueError("transient substep limit exceeded")
+            substep_counts.append(substep_count)
+        return substep_counts
 
     @classmethod
     def _positive_number(cls, params: Dict, key: str, default=None) -> float:
@@ -576,6 +606,10 @@ class EnvironmentGenerator:
 # ==============================================================================
 
 class LineAnalyzer:
+    _MIN_TIME_TO_MAX_STEP_SECONDS = 1e-3
+    _MAX_TIME_TO_MAX_ITERATIONS = 128
+    _TIME_TO_MAX_TOLERANCE_SECONDS = 1e-6
+
     def __init__(self, calculator: ThermalCalculator):
         self.calculator = calculator
 
@@ -616,7 +650,9 @@ class LineAnalyzer:
         angle_values = self._validated_array(
             angles, "angles", (num_points, num_times)
         )
-        solar_values = self._validated_array(solar, "solar", (num_times,))
+        solar_values = self._validated_scalar_or_array(
+            solar, "solar", num_times
+        )
         if np.any(temp_values <= -273.15):
             raise ValueError("temps must be above absolute zero")
         if np.any(wind_values < 0.0):
@@ -676,6 +712,13 @@ class LineAnalyzer:
             self.calculator._fraction(conductor_params, key)
         return conductor_params
 
+    def _validated_transient_conductor_params(self, params: Mapping) -> Dict:
+        if not isinstance(params, Mapping):
+            raise ValueError("params must be a mapping")
+        conductor_params = self._validated_conductor_params(params)
+        self.calculator.calculate_heat_capacity(conductor_params)
+        return conductor_params
+
     @staticmethod
     def _validated_array(values, name: str, expected_shape: Tuple[int, ...]) -> np.ndarray:
         if LineAnalyzer._contains_boolean(values):
@@ -690,9 +733,35 @@ class LineAnalyzer:
             raise ValueError(f"{name} must contain finite numbers")
         return array.copy()
 
+    @staticmethod
+    def _validated_scalar_or_array(
+        values, name: str, expected_length: int
+    ) -> np.ndarray:
+        if LineAnalyzer._contains_boolean(values):
+            raise ValueError(f"{name} must contain finite numbers")
+        try:
+            objects = np.asarray(values, dtype=object)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{name} must contain finite numbers") from exc
+        if objects.ndim == 0:
+            scalar = objects.item()
+            if isinstance(scalar, (str, bytes)):
+                raise ValueError(f"{name} must contain finite numbers")
+            try:
+                number = float(scalar)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{name} must contain finite numbers") from exc
+            if not math.isfinite(number):
+                raise ValueError(f"{name} must contain finite numbers")
+            return np.full(expected_length, number, dtype=float)
+        return LineAnalyzer._validated_array(
+            values, name, (expected_length,)
+        )
+
     def calculate_time_to_max_temp(self, params: Dict, current: float, max_temp: float,
                                    initial_temp: float, time_step: float = 10) -> float:
         """计算达到限值的时间"""
+        conductor_params = self._validated_transient_conductor_params(params)
         validated_current = self.calculator._finite_number(
             {'current': current}, 'current'
         )
@@ -711,36 +780,109 @@ class LineAnalyzer:
         requested_step = self.calculator._finite_number(
             {'time_step': time_step}, 'time_step'
         )
-        if requested_step <= 0.0:
-            raise ValueError("time_step must be greater than zero")
-        self.calculator.calculate_transient_temperature(
-            params=params,
-            time_steps=[],
-            initial_temp=current_temp,
-            current_profile=[],
+        if requested_step < self._MIN_TIME_TO_MAX_STEP_SECONDS:
+            raise ValueError(
+                "time_step must be at least "
+                f"{self._MIN_TIME_TO_MAX_STEP_SECONDS} seconds"
+            )
+
+        initial_heat_flow = self._transient_net_heat_flow(
+            conductor_params, validated_current, current_temp
         )
         if target_temp <= current_temp:
             return 0.0
 
-        integration_step = min(
-            requested_step, self.calculator._MAX_TRANSIENT_STEP_SECONDS
+        target_heat_flow = self._transient_net_heat_flow(
+            conductor_params, validated_current, target_temp
         )
-        elapsed = 0.0
-        while elapsed < 7200.0:
-            step = min(integration_step, 7200.0 - elapsed)
-            next_temp = self.calculator.calculate_transient_temperature(
-                params=params,
-                time_steps=[step],
+        ambient_temp = self.calculator._finite_number(
+            conductor_params, 'T_a'
+        )
+        target_is_reachable = target_heat_flow > 0.0
+        if target_temp >= ambient_temp:
+            target_balance = self.calculator.calculate_heat_balance(
+                {
+                    **conductor_params,
+                    'T_s': target_temp,
+                    'T_avg': target_temp,
+                }
+            )
+            required_joule_heat = (
+                target_balance.q_convection
+                + target_balance.q_radiation
+                - target_balance.q_solar
+            )
+            if required_joule_heat >= 0.0:
+                target_is_reachable = (
+                    validated_current > target_balance.current_a
+                )
+        if initial_heat_flow <= 0.0 or not target_is_reachable:
+            return float('inf')
+        if math.nextafter(current_temp, math.inf) >= target_temp:
+            return 0.0
+
+        evaluation_count = 0
+
+        def temperature_at(elapsed: float) -> float:
+            nonlocal evaluation_count
+            if evaluation_count >= self._MAX_TIME_TO_MAX_ITERATIONS:
+                raise ValueError("time-to-max iteration limit exceeded")
+            if not math.isfinite(elapsed) or elapsed <= 0.0:
+                raise ValueError("time-to-max search exhausted its time range")
+            evaluation_count += 1
+            return self.calculator.calculate_transient_temperature(
+                params=conductor_params,
+                time_steps=[elapsed],
                 initial_temp=current_temp,
                 current_profile=[validated_current],
             )[-1]
-            if next_temp <= current_temp:
-                return float('inf')
-            current_temp = next_temp
-            elapsed += step
-            if current_temp >= target_temp:
-                return elapsed
-        return float('inf')
+
+        safe_time = 0.0
+        unsafe_time = requested_step
+        while True:
+            candidate_temp = temperature_at(unsafe_time)
+            if candidate_temp >= target_temp:
+                break
+            safe_time = unsafe_time
+            unsafe_time *= 2.0
+            if not math.isfinite(unsafe_time):
+                raise ValueError("time-to-max search exhausted its time range")
+
+        while unsafe_time - safe_time > self._TIME_TO_MAX_TOLERANCE_SECONDS:
+            midpoint = (safe_time + unsafe_time) / 2.0
+            midpoint_temp = temperature_at(midpoint)
+            if midpoint_temp <= target_temp:
+                safe_time = midpoint
+            else:
+                unsafe_time = midpoint
+
+        if safe_time > 0.0 and temperature_at(safe_time) > target_temp:
+            raise ValueError("time-to-max safe bound verification failed")
+        return safe_time
+
+    def _transient_net_heat_flow(
+        self, params: Mapping, current: float, conductor_temp: float
+    ) -> float:
+        trial = {
+            **params,
+            'T_s': conductor_temp,
+            'T_avg': conductor_temp,
+        }
+        q_convection, q_radiation, q_solar, resistance = (
+            self.calculator._calculate_transient_heat_terms(trial)
+        )
+        try:
+            heat_flow = (
+                resistance * current ** 2
+                + q_solar
+                - q_convection
+                - q_radiation
+            )
+        except OverflowError as exc:
+            raise ValueError("current produces invalid transient heat flow") from exc
+        if not math.isfinite(heat_flow):
+            raise ValueError("current produces invalid transient heat flow")
+        return heat_flow
 
     def find_max_current_for_window(self, env_params, base_static, params, dt_hours, start_hour=0, end_hour=2):
         """日前调度：寻找时间窗口内的最大允许电流"""
@@ -751,7 +893,10 @@ class LineAnalyzer:
             raise ValueError("dt_hours must be greater than zero")
         if not isinstance(params, Mapping):
             raise ValueError("params must be a mapping")
-        target_temp = self.calculator._finite_number(params, 'max_allow_temp')
+        conductor_params = self._validated_transient_conductor_params(params)
+        target_temp = self.calculator._finite_number(
+            conductor_params, 'max_allow_temp'
+        )
         if target_temp <= -273.15:
             raise ValueError("max_allow_temp must be above absolute zero")
         low = self.calculator._finite_number(
@@ -776,7 +921,9 @@ class LineAnalyzer:
         ):
             raise ValueError("dt_hours must match every interval in times")
         weather = self._validated_dynamic_weather(env_params, len(times))
-        initial_temp = self._initial_conductor_temperature(params, weather)
+        initial_temp = self._initial_conductor_temperature(
+            conductor_params, weather
+        )
 
         start = self.calculator._finite_number(
             {'start_hour': start_hour}, 'start_hour'
@@ -784,19 +931,40 @@ class LineAnalyzer:
         end = self.calculator._finite_number({'end_hour': end_hour}, 'end_hour')
         if end < start:
             raise ValueError("end_hour must be greater than or equal to start_hour")
-        self._validate_dynamic_thermal_inputs(params, weather, initial_temp)
-        time_mask = (times >= start) & (times <= end)
-        time_indices = np.where(time_mask)[0]
-        if len(time_indices) == 0:
+        self._validate_dynamic_thermal_inputs(
+            conductor_params, weather, initial_temp
+        )
+        window_start = max(start, float(times[0]))
+        window_end = min(end, float(times[-1]))
+        if window_end < window_start:
             return 0.0
 
-        steps = (time_differences * 3600.0).tolist()
+        augmented_times = np.unique(
+            np.concatenate(
+                (
+                    times[times <= window_end],
+                    np.asarray([window_start, window_end], dtype=float),
+                )
+            )
+        )
+        weather_indices = (
+            np.searchsorted(times, augmented_times, side="right") - 1
+        )
+        augmented_weather = {
+            key: values[weather_indices].copy()
+            for key, values in weather.items()
+        }
+        time_indices = np.flatnonzero(
+            (augmented_times >= window_start)
+            & (augmented_times <= window_end)
+        )
+        steps = (np.diff(augmented_times) * 3600.0).tolist()
 
         def maximum_temperature(current: float) -> float:
             profile = [current] * len(steps)
             temperatures_for_current = self._integrate_dynamic_profile(
-                params=params,
-                weather=weather,
+                params=conductor_params,
+                weather=augmented_weather,
                 time_steps=steps,
                 current_profile=profile,
                 initial_temp=initial_temp,
@@ -848,6 +1016,7 @@ class LineAnalyzer:
         )
         if interval_hours <= 0.0:
             raise ValueError("dt_hours must be greater than zero")
+        conductor_params = self._validated_transient_conductor_params(params)
         currents = self._one_dimensional_finite_array(
             {'current_profile': current_profile}, 'current_profile'
         )
@@ -870,10 +1039,12 @@ class LineAnalyzer:
             ):
                 raise ValueError("dt_hours must match every interval in times")
         weather = self._validated_dynamic_weather(env_params, len(currents))
-        initial_temp = self._initial_conductor_temperature(params, weather)
+        initial_temp = self._initial_conductor_temperature(
+            conductor_params, weather
+        )
         steps = [interval_hours * 3600.0] * (len(currents) - 1)
         result = self._integrate_dynamic_profile(
-            params=params,
+            params=conductor_params,
             weather=weather,
             time_steps=steps,
             current_profile=currents[:-1].tolist(),
@@ -969,6 +1140,7 @@ class LineAnalyzer:
     ) -> np.ndarray:
         if len(time_steps) != len(current_profile):
             raise ValueError("time_steps and current_profile must have the same length")
+        self.calculator._validated_transient_substep_counts(time_steps)
 
         temperatures = [initial_temp]
         current_temp = initial_temp

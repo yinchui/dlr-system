@@ -254,6 +254,35 @@ def test_line_analyzer_rejects_boolean_weather_values(analyzer):
         )
 
 
+def test_line_analyzer_broadcasts_scalar_solar_radiation(analyzer):
+    scalar_weather = weather_matrix()
+    scalar_weather["solar"] = 50.0
+    array_weather = weather_matrix()
+    array_weather["solar"] = np.full(2, 50.0)
+
+    scalar_result = analyzer.calculate_max_current_for_points(
+        **scalar_weather, base_params=drake_conductor()
+    )
+    array_result = analyzer.calculate_max_current_for_points(
+        **array_weather, base_params=drake_conductor()
+    )
+
+    np.testing.assert_allclose(
+        scalar_result["max_currents"], array_result["max_currents"]
+    )
+
+
+@pytest.mark.parametrize("solar", [True, np.bool_(True), math.nan])
+def test_line_analyzer_rejects_invalid_scalar_solar(analyzer, solar):
+    weather = weather_matrix()
+    weather["solar"] = solar
+
+    with pytest.raises(ValueError, match="solar"):
+        analyzer.calculate_max_current_for_points(
+            **weather, base_params=drake_conductor()
+        )
+
+
 class RecordingThermalCalculator(ThermalCalculator):
     def __init__(self):
         super().__init__()
@@ -270,6 +299,22 @@ class RecordingThermalCalculator(ThermalCalculator):
                 "current_profile": list(current_profile),
             }
         )
+        return super().calculate_transient_temperature(
+            params, time_steps, initial_temp, current_profile
+        )
+
+
+class FailingIntervalThermalCalculator(ThermalCalculator):
+    def __init__(self):
+        super().__init__()
+        self.nonempty_transient_calls = 0
+
+    def calculate_transient_temperature(
+        self, params, time_steps, initial_temp, current_profile
+    ):
+        if time_steps:
+            self.nonempty_transient_calls += 1
+            raise RuntimeError("interval integration must not start")
         return super().calculate_transient_temperature(
             params, time_steps, initial_temp, current_profile
         )
@@ -447,6 +492,36 @@ def test_dynamic_temperature_rejects_overflowing_current_samples(analyzer):
         )
 
 
+def test_dynamic_temperature_enforces_total_substep_budget_before_integration():
+    calculator = FailingIntervalThermalCalculator()
+    analyzer = LineAnalyzer(calculator)
+    interval_seconds = 5_000_010.0
+
+    with pytest.raises(ValueError, match="substep"):
+        analyzer.calculate_dynamic_temperature(
+            env_params={"temp": np.array([40.0, 40.0, 40.0])},
+            params=drake_thermal_params(),
+            current_profile=[1200.0, 1200.0, 1200.0],
+            dt_hours=interval_seconds / 3600.0,
+        )
+
+    assert calculator.nonempty_transient_calls == 0
+
+
+@pytest.mark.parametrize("missing_field", ["R_low_25", "materials"])
+def test_dynamic_temperature_requires_complete_conductor(analyzer, missing_field):
+    params = drake_thermal_params()
+    params.pop(missing_field)
+
+    with pytest.raises(ValueError, match=missing_field):
+        analyzer.calculate_dynamic_temperature(
+            env_params={"temp": np.array([40.0])},
+            params=params,
+            current_profile=[500.0],
+            dt_hours=1.0,
+        )
+
+
 def test_find_max_current_for_window_rejects_nonincreasing_times(analyzer):
     params = {**drake_thermal_params(), "max_allow_temp": 125.0}
 
@@ -567,6 +642,40 @@ def test_empty_window_still_rejects_invalid_solar_time(analyzer):
         )
 
 
+def test_valid_window_without_data_overlap_returns_zero(analyzer):
+    env_params, interval_hours = _short_window_environment()
+
+    result = analyzer.find_max_current_for_window(
+        env_params=env_params,
+        base_static=100.0,
+        params=_short_window_params(),
+        dt_hours=interval_hours,
+        start_hour=10.0,
+        end_hour=12.0,
+    )
+
+    assert result == 0.0
+
+
+@pytest.mark.parametrize("missing_field", ["R_low_25", "materials"])
+def test_find_max_current_for_window_requires_complete_conductor(
+    analyzer, missing_field
+):
+    env_params, interval_hours = _short_window_environment()
+    params = _short_window_params()
+    params.pop(missing_field)
+
+    with pytest.raises(ValueError, match=missing_field):
+        analyzer.find_max_current_for_window(
+            env_params=env_params,
+            base_static=100.0,
+            params=params,
+            dt_hours=interval_hours,
+            start_hour=10.0,
+            end_hour=12.0,
+        )
+
+
 def test_find_max_current_for_window_uses_each_interval_weather(analyzer):
     params = {
         **drake_thermal_params(),
@@ -617,6 +726,136 @@ def _short_window_params():
         "solar_radiation": 0.0,
         "max_allow_temp": 100.2,
     }
+
+
+def test_find_max_current_for_window_checks_non_grid_end_boundary(analyzer):
+    env_params, interval_hours = _short_window_environment()
+    params = _short_window_params()
+    env_before = {key: values.copy() for key, values in env_params.items()}
+    params_before = copy.deepcopy(params)
+
+    result = analyzer.find_max_current_for_window(
+        env_params=env_params,
+        base_static=100.0,
+        params=params,
+        dt_hours=interval_hours,
+        start_hour=0.0,
+        end_hour=15.0 / 3600.0,
+    )
+    temperatures = analyzer.calculator.calculate_transient_temperature(
+        params=params,
+        time_steps=[10.0, 5.0],
+        initial_temp=100.0,
+        current_profile=[result, result],
+    )
+
+    assert result == pytest.approx(432.42, abs=0.05)
+    assert max(temperatures) <= 100.2 + 1e-6
+    for key, before in env_before.items():
+        np.testing.assert_array_equal(env_params[key], before)
+    assert params == params_before
+
+
+def test_find_max_current_for_window_handles_window_inside_one_interval(analyzer):
+    env_params, interval_hours = _short_window_environment()
+
+    result = analyzer.find_max_current_for_window(
+        env_params=env_params,
+        base_static=100.0,
+        params=_short_window_params(),
+        dt_hours=interval_hours,
+        start_hour=2.0 / 3600.0,
+        end_hour=8.0 / 3600.0,
+    )
+
+    assert result == pytest.approx(591.22, abs=0.05)
+
+
+def test_find_max_current_for_window_uses_left_weather_for_partial_intervals():
+    calculator = RecordingThermalCalculator()
+    analyzer = LineAnalyzer(calculator)
+    interval_hours = 10.0 / 3600.0
+    params = {
+        **drake_thermal_params(),
+        "T_s": 100.0,
+        "solar_radiation": 0.0,
+        "max_allow_temp": 125.0,
+    }
+
+    analyzer.find_max_current_for_window(
+        env_params={
+            "times": np.array([0.0, interval_hours, 2.0 * interval_hours]),
+            "temp": np.array([40.0, 40.0, 40.0]),
+            "wind": np.array([0.1, 8.0, 8.0]),
+            "solar": np.zeros(3),
+        },
+        base_static=100.0,
+        params=params,
+        dt_hours=interval_hours,
+        start_hour=5.0 / 3600.0,
+        end_hour=15.0 / 3600.0,
+    )
+
+    integration_calls = [
+        call for call in calculator.transient_calls if call["time_steps"]
+    ]
+    np.testing.assert_allclose(
+        [call["time_steps"][0] for call in integration_calls[:3]],
+        [5.0, 5.0, 5.0],
+        atol=1e-12,
+    )
+    assert [call["params"]["wind_speed"] for call in integration_calls[:3]] == [
+        0.1,
+        0.1,
+        8.0,
+    ]
+
+
+def test_find_max_current_for_window_preserves_pre_window_heat_history(analyzer):
+    env_params, interval_hours = _short_window_environment()
+    params = _short_window_params()
+
+    full_window = analyzer.find_max_current_for_window(
+        env_params=env_params,
+        base_static=100.0,
+        params=params,
+        dt_hours=interval_hours,
+        start_hour=0.0,
+        end_hour=20.0 / 3600.0,
+    )
+    later_window = analyzer.find_max_current_for_window(
+        env_params=env_params,
+        base_static=100.0,
+        params=params,
+        dt_hours=interval_hours,
+        start_hour=10.0 / 3600.0,
+        end_hour=20.0 / 3600.0,
+    )
+
+    assert later_window == pytest.approx(full_window, abs=1e-12)
+
+
+def test_window_augmented_axis_enforces_total_substep_budget_before_integration():
+    calculator = FailingIntervalThermalCalculator()
+    analyzer = LineAnalyzer(calculator)
+    interval_seconds = 5_000_000.0
+    interval_hours = interval_seconds / 3600.0
+
+    with pytest.raises(ValueError, match="substep"):
+        analyzer.find_max_current_for_window(
+            env_params={
+                "times": np.array([0.0, interval_hours, 2.0 * interval_hours]),
+                "temp": np.array([40.0, 40.0, 40.0]),
+                "solar": np.zeros(3),
+            },
+            base_static=100.0,
+            params={**drake_thermal_params(), "max_allow_temp": 125.0},
+            dt_hours=interval_hours,
+            start_hour=2_500_001.0 / 3600.0,
+            end_hour=2.0 * interval_hours,
+        )
+
+    assert calculator.nonempty_transient_calls == 0
 
 
 def test_find_max_current_for_window_searches_below_unsafe_base(analyzer):
@@ -689,7 +928,9 @@ def test_window_zero_current_check_handles_ambient_warming(analyzer):
     assert result >= 0.0
 
 
-def test_time_to_max_temperature_uses_ten_second_substeps_without_mutation(analyzer):
+def test_time_to_max_temperature_returns_verified_safe_left_without_mutation(
+    analyzer,
+):
     params = drake_thermal_params()
     before = copy.deepcopy(params)
 
@@ -700,9 +941,139 @@ def test_time_to_max_temperature_uses_ten_second_substeps_without_mutation(analy
         initial_temp=100.0,
         time_step=25.0,
     )
+    temperature_at_return = analyzer.calculator.calculate_transient_temperature(
+        params=params,
+        time_steps=[elapsed],
+        initial_temp=100.0,
+        current_profile=[1200.0],
+    )[-1]
 
-    assert elapsed == pytest.approx(10.0)
+    assert 0.0 < elapsed < 10.0
+    assert temperature_at_return <= 100.2
     assert params == before
+
+
+@pytest.mark.parametrize("time_step", [10.0, 1.0, 0.1])
+def test_time_to_max_temperature_never_returns_over_temperature_time(
+    analyzer, time_step
+):
+    params = drake_thermal_params()
+
+    elapsed = analyzer.calculate_time_to_max_temp(
+        params=params,
+        current=1200.0,
+        max_temp=100.2,
+        initial_temp=100.0,
+        time_step=time_step,
+    )
+    temperature_at_return = analyzer.calculator.calculate_transient_temperature(
+        params=params,
+        time_steps=[elapsed],
+        initial_temp=100.0,
+        current_profile=[1200.0],
+    )[-1]
+
+    assert temperature_at_return <= 100.2
+
+
+def test_time_to_max_temperature_reaches_target_after_legacy_two_hour_limit(
+    analyzer,
+):
+    params = drake_thermal_params()
+    target_temp = 100.0
+    target_rating = analyzer.calculator.calculate_steady_state_current(
+        {**params, "T_s": target_temp, "T_avg": target_temp}
+    )
+
+    elapsed = analyzer.calculate_time_to_max_temp(
+        params=params,
+        current=target_rating * 1.00001,
+        max_temp=target_temp,
+        initial_temp=40.0,
+        time_step=10.0,
+    )
+
+    assert math.isfinite(elapsed)
+    assert elapsed > 7200.0
+
+
+def test_time_to_max_temperature_uses_target_heat_flow_for_unreachable_case():
+    calculator = RecordingThermalCalculator()
+    analyzer = LineAnalyzer(calculator)
+    params = {**drake_thermal_params(), "solar_radiation": 0.0}
+    target_temp = 100.0
+    target_rating = calculator.calculate_steady_state_current(
+        {**params, "T_s": target_temp, "T_avg": target_temp}
+    )
+
+    elapsed = analyzer.calculate_time_to_max_temp(
+        params=params,
+        current=target_rating,
+        max_temp=target_temp,
+        initial_temp=40.0,
+        time_step=10.0,
+    )
+
+    assert elapsed == math.inf
+    assert not any(call["time_steps"] for call in calculator.transient_calls)
+
+
+def test_time_to_max_temperature_keeps_strictly_positive_target_heat_reachable(
+    analyzer,
+):
+    params = drake_thermal_params()
+    target_temp = 100.0
+    target_balance = analyzer.calculator.calculate_heat_balance(
+        {**params, "T_s": target_temp, "T_avg": target_temp}
+    )
+    current = math.nextafter(target_balance.current_a, math.inf)
+    initial_temp = math.nextafter(target_temp, -math.inf)
+    target_heat_flow = (
+        target_balance.resistance * current ** 2
+        + target_balance.q_solar
+        - target_balance.q_convection
+        - target_balance.q_radiation
+    )
+
+    elapsed = analyzer.calculate_time_to_max_temp(
+        params=params,
+        current=current,
+        max_temp=target_temp,
+        initial_temp=initial_temp,
+        time_step=10.0,
+    )
+
+    assert target_heat_flow > 0.0
+    assert math.isfinite(elapsed)
+    assert elapsed == 0.0
+
+
+def test_time_to_max_temperature_rejects_too_small_search_step(analyzer):
+    with pytest.raises(ValueError, match="time_step"):
+        analyzer.calculate_time_to_max_temp(
+            params=drake_thermal_params(),
+            current=0.0,
+            max_temp=80.0,
+            initial_temp=100.0,
+            time_step=0.0001,
+        )
+
+
+def test_time_to_max_temperature_reports_iteration_budget_exhaustion(
+    analyzer, monkeypatch
+):
+    monkeypatch.setattr(
+        analyzer, "_MAX_TIME_TO_MAX_ITERATIONS", 1, raising=False
+    )
+
+    with pytest.raises(ValueError, match="iteration"):
+        analyzer.calculate_time_to_max_temp(
+            params=drake_thermal_params(),
+            current=2000.0,
+            max_temp=100.0,
+            initial_temp=40.0,
+            time_step=1.0,
+        )
 
 
 def test_time_to_max_temperature_rejects_target_at_absolute_zero(analyzer):
@@ -712,6 +1083,23 @@ def test_time_to_max_temperature_rejects_target_at_absolute_zero(analyzer):
             current=0.0,
             max_temp=-273.15,
             initial_temp=20.0,
+        )
+
+
+@pytest.mark.parametrize("missing_field", ["R_low_25", "materials"])
+def test_time_to_max_temperature_requires_complete_conductor(
+    analyzer, missing_field
+):
+    params = drake_thermal_params()
+    params.pop(missing_field)
+
+    with pytest.raises(ValueError, match=missing_field):
+        analyzer.calculate_time_to_max_temp(
+            params=params,
+            current=0.0,
+            max_temp=80.0,
+            initial_temp=100.0,
+            time_step=10.0,
         )
 
 

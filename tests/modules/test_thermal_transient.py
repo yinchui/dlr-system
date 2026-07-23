@@ -197,3 +197,47 @@ def test_transient_rejects_non_numeric_or_non_vector_profiles(
             initial_temp=100.0,
             current_profile=arguments["current_profile"],
         )
+
+
+class FailingHeatTermCalculator(ThermalCalculator):
+    def __init__(self):
+        super().__init__()
+        self.heat_term_calls = 0
+
+    def _calculate_transient_heat_terms(self, params):
+        self.heat_term_calls += 1
+        raise RuntimeError("heat terms must not run before resource validation")
+
+
+@pytest.mark.parametrize(
+    "time_steps",
+    [
+        [1.0e9],
+        [5_000_000.0, 5_000_010.0],
+    ],
+)
+def test_transient_rejects_excessive_total_substeps_before_heat_terms(time_steps):
+    calculator = FailingHeatTermCalculator()
+
+    with pytest.raises(ValueError, match="substep"):
+        calculator.calculate_transient_temperature(
+            params=drake_transient_params(),
+            time_steps=time_steps,
+            initial_temp=100.0,
+            current_profile=[1200.0] * len(time_steps),
+        )
+
+    assert calculator.heat_term_calls == 0
+
+
+def test_transient_smallest_positive_step_still_validates_heat_terms():
+    params = drake_transient_params()
+    params["wind_speed"] = math.nan
+
+    with pytest.raises(ValueError, match="wind_speed"):
+        ThermalCalculator().calculate_transient_temperature(
+            params=params,
+            time_steps=[5e-324],
+            initial_temp=100.0,
+            current_profile=[1200.0],
+        )

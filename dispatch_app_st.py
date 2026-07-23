@@ -7,51 +7,22 @@ import requests
 from datetime import datetime, timedelta, date
 from thermal_functions import ThermalCalculator, EnvironmentGenerator, LineAnalyzer
 from modules.data_processor import normalize_weather_input_dataframe
+from modules import terrain as terrain_module
 import os
-import io
-import glob
-from pathlib import Path
-from math import radians, cos, atan2, degrees, sqrt
-import re
-
-# TIF文件读取（不需要rasterio）
-try:
-    from PIL import Image
-
-    HAS_PIL = True
-except:
-    HAS_PIL = False
+from math import radians
 
 
 # ==============================================================================
-# 地形数据读取与集成模块（不依赖rasterio）
+# 地形数据读取与集成模块
 # ==============================================================================
 
 def read_tif_simple(tif_path: str):
-    """
-    简化版TIF读取 - 使用numpy和struct直接解析
-    支持基本的GeoTIFF格式
-    """
+    """保留页面入口，实际读取统一由地形模块完成。"""
     try:
-        from PIL import Image
-        import struct
-
         if not os.path.exists(tif_path):
             st.warning(f"⚠️ TIF文件不存在: {tif_path}")
             return None
-
-        # 使用PIL读取TIF
-        img = Image.open(tif_path)
-
-        # 将图像转换为numpy数组
-        elevation = np.array(img, dtype=np.float32)
-
-        # 如果是多波段，取第一波段
-        if len(elevation.shape) > 2:
-            elevation = elevation[:, :, 0]
-
-        return elevation
-
+        return terrain_module.read_tif_simple(tif_path)
     except Exception as e:
         st.error(f"❌ TIF读取失败: {e}")
         return None
@@ -59,175 +30,38 @@ def read_tif_simple(tif_path: str):
 
 @st.cache_resource
 def load_dem_data(dem_path: str):
-    """
-    加载DEM数据（不需要rasterio）
-    """
+    """保留 Streamlit 缓存与既有错误提示。"""
     try:
         if not os.path.exists(dem_path):
             st.warning(f"⚠️ DEM文件不存在: {dem_path}")
             return None
-
-        # 读取TIF文件
-        elevation = read_tif_simple(dem_path)
-
-        if elevation is None:
-            return None
-
-        # 计算梯度（坡度、坡向）
-        gy, gx = np.gradient(elevation)
-
-        # 设置默认地形参数（沙戈荒地区）
-        # 由于无法从GeoTIFF标签中读取地理信息，使用经验值
-        center_lat_rad = radians(40)  # 沙戈荒平均纬度
-
-        # 像元大小（经验估计，约30米分辨率）
-        cell_size_x = 30 * 111320 * cos(center_lat_rad) / 111320
-        cell_size_y = 30
-        cell_size_avg = (cell_size_x + cell_size_y) / 2
-
-        return {
-            'elevation': elevation,
-            'gx': gx,
-            'gy': gy,
-            'cell_size': cell_size_avg,
-            'shape': elevation.shape
-        }
+        return terrain_module.load_dem_data(dem_path)
     except Exception as e:
         st.error(f"❌ DEM加载失败: {e}")
         return None
 
 
 def query_dem_at_point(dem_data, lon: float, lat: float) -> dict:
-    """
-    从DEM中查询指定经纬度的地形参数
-    """
-    if dem_data is None:
-        return {'slope': 0, 'aspect': 0, 'elevation': 1000}
-
-    elevation = dem_data['elevation']
-    gx = dem_data['gx']
-    gy = dem_data['gy']
-    cell_size = dem_data['cell_size']
-    rows, cols = dem_data['shape']
-
-    try:
-        # 根据诊断结果的正确坐标范围
-        min_lon, max_lon = 114.69, 115.04
-        max_lat, min_lat = 44.10, 44.01  # 纬度反向（北为正）
-
-        # 映射到像元坐标
-        col = int((lon - min_lon) / (max_lon - min_lon) * cols)
-        row = int((max_lat - lat) / (max_lat - min_lat) * rows)
-
-        # 边界检查
-        col = max(0, min(col, cols - 1))
-        row = max(0, min(row, rows - 1))
-
-        # 提取高程
-        z_val = float(elevation[row, col])
-
-        # 提取梯度（坡度、坡向）
-        dz_dx = float(gx[row, col])
-        dz_dy = float(gy[row, col])
-
-        # 计算坡度和坡向
-        rise = sqrt(dz_dx ** 2 + dz_dy ** 2)
-        slope_deg = degrees(atan2(rise, cell_size))
-        aspect_deg = (degrees(atan2(-dz_dx, dz_dy)) + 360) % 360
-
-        return {
-            'slope': slope_deg,
-            'aspect': aspect_deg,
-            'elevation': z_val
-        }
-
-    except Exception as e:
-        return {'slope': 0, 'aspect': 0, 'elevation': 1000}
+    return terrain_module.query_dem_at_point(dem_data, lon, lat)
 
 
 def load_tower_coordinates(tower_excel_path: str, tower_nums=None) -> dict:
-    """
-    从杆塔Excel中读取指定编号的杆塔经纬度对应关系
-
-    Args:
-        tower_excel_path: 杆塔Excel文件路径
-        tower_nums: 要读取的杆塔编号列表，如 [36, 372, 387, 406, 456]
-    """
+    """保留页面错误提示，塔表解析统一由地形模块完成。"""
     try:
         if not os.path.exists(tower_excel_path):
             st.warning(f"⚠️ 杆塔文件不存在: {tower_excel_path}")
             return {}
-
-        # 自动定位表头
-        df_temp = pd.read_excel(tower_excel_path, header=None, nrows=5)
-        header_row_idx = 0
-        for i, row in df_temp.iterrows():
-            row_str = " ".join([str(x) for x in row.values])
-            if "运行编号" in row_str or "设备名称" in row_str:
-                header_row_idx = i
-                break
-
-        df = pd.read_excel(tower_excel_path, header=header_row_idx)
-        df.columns = df.columns.str.strip()
-
-        # 查找关键列
-        name_col = next((c for c in df.columns if '运行编号' in c or '设备名称' in c), None)
-        lon_col = next((c for c in df.columns if '经度' in c or 'X坐标' in c), None)
-        lat_col = next((c for c in df.columns if '纬度' in c or 'Y坐标' in c), None)
-
-        if not all([name_col, lon_col, lat_col]):
-            st.error(f"❌ 关键列未找到！检测到的列: {df.columns.tolist()}")
-            return {}
-
-        tower_coords = {}
-        for idx, row in df.iterrows():
-            try:
-                name_val = str(row[name_col])
-                # 提取杆塔编号（从"500kV林彦一线001号"这样的格式中）
-                match = re.search(r'(\d+)号', name_val)
-                if not match:
-                    match = re.search(r'(\d+)$', name_val)
-
-                if match:
-                    tower_num = int(match.group(1))
-                    # 如果指定了杆塔列表，只读取列表中的杆塔
-                    if tower_nums is None or tower_num in tower_nums:
-                        lon = float(row[lon_col])
-                        lat = float(row[lat_col])
-                        tower_coords[tower_num] = {'lat': lat, 'lon': lon}
-            except Exception as e:
-                continue
-
-        return tower_coords
-
+        return terrain_module.load_tower_coordinates(tower_excel_path, tower_nums)
+    except terrain_module.MissingTowerColumnsError as e:
+        st.error(f"❌ {e}")
+        return {}
     except Exception as e:
         st.error(f"❌ 读取杆塔坐标失败: {e}")
         return {}
 
 
 def build_terrain_lookup(dem_data, tower_coords: dict, weather_positions: list) -> dict:
-    """
-    为每个气象位置构建地形数据查询表
-    """
-    if dem_data is None or not tower_coords:
-        return {i: {'slope': 0, 'aspect': 0, 'elevation': 1000}
-                for i in range(len(weather_positions))}
-
-    terrain_lookup = {}
-
-    for array_idx, pos_id in enumerate(weather_positions):
-        if pos_id not in tower_coords:
-            terrain_lookup[array_idx] = {'slope': 0, 'aspect': 0, 'elevation': 1000}
-            continue
-
-        coord = tower_coords[pos_id]
-        lon, lat = coord['lon'], coord['lat']
-
-        # 从DEM查询该点的地形参数
-        terrain = query_dem_at_point(dem_data, lon, lat)
-        terrain_lookup[array_idx] = terrain
-
-    return terrain_lookup
+    return terrain_module.build_terrain_lookup(dem_data, tower_coords, weather_positions)
 
 
 # ==============================================================================

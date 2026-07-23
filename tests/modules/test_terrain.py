@@ -15,6 +15,10 @@ from rasterio.transform import from_origin
 import modules.terrain as terrain
 
 
+class _StreamlitControlSignal(BaseException):
+    pass
+
+
 class _FailingTerrainState(MutableMapping):
     def __init__(
         self,
@@ -22,12 +26,16 @@ class _FailingTerrainState(MutableMapping):
         *,
         mutate_tower_before_failure=False,
         fail_dem_rollback=False,
+        tower_error=None,
+        dem_rollback_error=None,
     ):
         self.data = dict(initial)
         self._old_dem = self.data.get("dem_data")
         self._tower_write_failed = False
         self._mutate_tower_before_failure = mutate_tower_before_failure
         self._fail_dem_rollback = fail_dem_rollback
+        self._tower_error = tower_error or RuntimeError("tower write failed")
+        self._dem_rollback_error = dem_rollback_error
 
     def __getitem__(self, key):
         return self.data[key]
@@ -37,14 +45,14 @@ class _FailingTerrainState(MutableMapping):
             self._tower_write_failed = True
             if self._mutate_tower_before_failure:
                 self.data[key] = value
-            raise RuntimeError("tower write failed")
+            raise self._tower_error
         if (
             key == "dem_data"
             and self._tower_write_failed
             and self._fail_dem_rollback
             and value is self._old_dem
         ):
-            raise RuntimeError("dem rollback failed")
+            raise self._dem_rollback_error or RuntimeError("dem rollback failed")
         self.data[key] = value
 
     def __delitem__(self, key):
@@ -659,6 +667,27 @@ def test_terrain_snapshot_commit_removes_new_keys_after_second_write_failure():
     assert state.data == {}
 
 
+def test_terrain_snapshot_commit_rolls_back_before_reraising_control_signal():
+    old_dem = object()
+    old_towers = {"old": {}}
+    signal = _StreamlitControlSignal("streamlit rerun")
+    state = _FailingTerrainState(
+        {"dem_data": old_dem, "tower_coords": old_towers},
+        tower_error=signal,
+    )
+    attempt = terrain.TerrainLoadAttempt(
+        dem_data=object(),
+        tower_coords={"001": {"lon": 120.0, "lat": 49.0}},
+    )
+
+    with pytest.raises(_StreamlitControlSignal) as error:
+        terrain.commit_terrain_snapshot(state, attempt)
+
+    assert error.value is signal
+    assert state.data["dem_data"] is old_dem
+    assert state.data["tower_coords"] is old_towers
+
+
 def test_terrain_snapshot_commit_reports_rollback_failure_and_keeps_restoring():
     old_dem = object()
     old_towers = {"old": {}}
@@ -676,6 +705,30 @@ def test_terrain_snapshot_commit_reports_rollback_failure_and_keeps_restoring():
         terrain.commit_terrain_snapshot(state, attempt)
 
     assert str(error.value.__cause__) == "tower write failed"
+    assert state.data["tower_coords"] is old_towers
+
+
+def test_terrain_snapshot_commit_groups_control_signal_from_rollback():
+    old_dem = object()
+    old_towers = {"old": {}}
+    commit_error = RuntimeError("tower write failed")
+    rollback_error = _StreamlitControlSignal("rollback stop")
+    state = _FailingTerrainState(
+        {"dem_data": old_dem, "tower_coords": old_towers},
+        mutate_tower_before_failure=True,
+        fail_dem_rollback=True,
+        tower_error=commit_error,
+        dem_rollback_error=rollback_error,
+    )
+    attempt = terrain.TerrainLoadAttempt(
+        dem_data=object(),
+        tower_coords={"001": {"lon": 120.0, "lat": 49.0}},
+    )
+
+    with pytest.raises(BaseExceptionGroup) as error:
+        terrain.commit_terrain_snapshot(state, attempt)
+
+    assert error.value.exceptions == (commit_error, rollback_error)
     assert state.data["tower_coords"] is old_towers
 
 

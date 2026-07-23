@@ -513,7 +513,7 @@ def commit_terrain_snapshot(
     try:
         state["dem_data"] = attempt.dem_data
         state["tower_coords"] = attempt.tower_coords
-    except Exception as commit_error:
+    except BaseException as commit_error:
         rollback_errors = []
         for key in keys:
             try:
@@ -525,10 +525,18 @@ def commit_terrain_snapshot(
                         pass
                 else:
                     state[key] = previous_value
-            except Exception as rollback_error:
+            except BaseException as rollback_error:
                 rollback_errors.append((key, rollback_error))
 
         if rollback_errors:
+            if not isinstance(commit_error, Exception) or any(
+                not isinstance(error, Exception)
+                for _, error in rollback_errors
+            ):
+                raise BaseExceptionGroup(
+                    "Terrain snapshot commit failed; rollback incomplete",
+                    [commit_error, *(error for _, error in rollback_errors)],
+                )
             details = "; ".join(
                 f"{key}: {error}" for key, error in rollback_errors
             )

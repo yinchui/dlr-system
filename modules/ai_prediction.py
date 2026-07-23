@@ -24,6 +24,29 @@ _OPTIONAL_FEATURES = {
     "aspect": (("aspect", "terrain_aspect"), 0.0),
 }
 
+_TARGET_PHYSICAL_COLUMNS = {
+    "wind_speed": frozenset(
+        {
+            "wind_speed",
+            "wind_speed_physical",
+            "wind_speed_raw",
+            "wind_speed_local",
+            "wind_speed_corrected",
+            "wind_speed_terrain_corrected",
+        }
+    ),
+    "ambient_temp": frozenset(
+        {
+            "ambient_temp",
+            "ambient_temp_physical",
+            "ambient_temp_raw",
+            "ambient_temp_local",
+            "ambient_temp_corrected",
+            "ambient_temp_terrain_corrected",
+        }
+    ),
+}
+
 
 class FeatureBuilder:
     """Build deterministic weather features without crossing tower datasets."""
@@ -370,6 +393,12 @@ class ResidualPredictor:
     ) -> pd.DataFrame:
         if not isinstance(df, pd.DataFrame):
             raise TypeError("df must be a pandas DataFrame")
+        if target_name not in _TARGET_PHYSICAL_COLUMNS:
+            raise ValueError("target_name must be wind_speed or ambient_temp")
+        if physical_col not in _TARGET_PHYSICAL_COLUMNS[target_name]:
+            raise ValueError(
+                "physical_col does not match the requested weather target"
+            )
         output = df.copy(deep=True)
         physical = self._validated_physical(output, physical_col)
         bundle = self.bundles.get(target_name)

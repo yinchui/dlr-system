@@ -292,3 +292,27 @@ def test_predictor_rejects_invalid_timestamp_before_model_fallback():
         ResidualPredictor({"wind_speed": bundle}).predict(
             frame, target_name="wind_speed", physical_col="wind_speed_local"
         )
+
+
+@pytest.mark.parametrize(
+    ("target_name", "physical_col"),
+    [
+        ("wind_speed", "ambient_temp_local"),
+        ("ambient_temp", "wind_speed_local"),
+        ("dlr", "wind_speed_local"),
+    ],
+)
+def test_predictor_rejects_unknown_or_mismatched_target_physical_pair(
+    target_name, physical_col
+):
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2025-12-10 00:00"]),
+            physical_col: [3.0],
+        }
+    )
+
+    with pytest.raises(ValueError, match="target|physical"):
+        ResidualPredictor().predict(
+            frame, target_name=target_name, physical_col=physical_col
+        )

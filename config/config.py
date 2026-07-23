@@ -18,10 +18,10 @@ PROJECT_TIMEZONE = "Asia/Shanghai"
 
 MODEL_DIR = resolve_runtime_path("DLR_MODEL_DIR", PROJECT_ROOT / "models")
 AUDIT_LOG_DIR = resolve_runtime_path(
-    "DLR_AUDIT_LOG_DIR", PROJECT_ROOT / "runtime" / "audit"
+    "DLR_AUDIT_LOG_DIR", PROJECT_ROOT / "runtime" / "logs"
 )
 SAG_RESULT_DIR = resolve_runtime_path(
-    "DLR_SAG_RESULT_DIR", PROJECT_ROOT / "runtime" / "sag_results"
+    "DLR_SAG_RESULT_DIR", PROJECT_ROOT / "runtime" / "results" / "sag"
 )
 DEMO_DATA_DIR = Path("assets/demo_data")
 
@@ -77,18 +77,18 @@ CORRECTION_DEFAULTS = {
 SAG_VALIDATION_DEFAULTS = {
     "formula_version": "CN-patent-2025-v1",
     "gravity_m_s2": 9.80665,
-    "min_angle_deg": 0.1,
-    "max_angle_deg": 45.0,
-    "reference_temp_c": 25.0,
-    "reference_tension_n": 3.75e4,
-    "span_m": 400.0,
+    "min_angle_deg": 0.05,
+    "max_angle_deg": 89.5,
+    "reference_temp_c": 20.0,
+    "reference_tension_n": 20000.0,
+    "span_m": 300.0,
     "elastic_modulus_pa": 7.0e10,
     "area_m2": 6.75e-4,
-    "thermal_expansion_per_c": 19.6e-6,
+    "thermal_expansion_per_c": 1.9e-5,
     "base_threshold_c": 5.0,
-    "recovery_ratio": 0.8,
+    "recovery_ratio": 0.6,
     "recovery_samples": 3,
-    "recovery_alpha": 0.2,
+    "recovery_alpha": 0.25,
 }
 
 MODEL_BUNDLE_FILES = {

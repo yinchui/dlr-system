@@ -1,4 +1,5 @@
 import importlib
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -185,7 +186,8 @@ def test_resampling_preserves_fields_timezone_and_input():
 
     pd.testing.assert_frame_equal(source, original)
     assert source.attrs == original_attrs
-    assert result.attrs == original_attrs
+    assert result.attrs["origin"] == original_attrs["origin"]
+    assert result.attrs["source_file_hashes"] == ("physical-hash",)
     assert isinstance(result["timestamp"].dtype, pd.DatetimeTZDtype)
     assert str(result["timestamp"].dt.tz) == TIMEZONE
     assert result.columns.tolist() == source.columns.tolist()
@@ -220,7 +222,8 @@ def test_resampling_empty_frame_preserves_schema_timezone_and_attrs():
     assert result.empty
     assert result.columns.tolist() == source.columns.tolist()
     assert result.dtypes.equals(source.dtypes)
-    assert result.attrs == source.attrs
+    assert result.attrs["role"] == source.attrs["role"]
+    assert result.attrs["source_file_hashes"] == ()
     assert result is not source
 
 
@@ -342,6 +345,105 @@ def test_resampling_requires_dataset_role_column():
 
     with pytest.raises(ValueError, match="dataset_role"):
         weather_pipeline.resample_weather_by_tower(source)
+
+
+def test_resampling_preserves_complete_source_hash_lineage():
+    weather_pipeline = weather_pipeline_module()
+    source = make_weather_frame(
+        ["001", "001", "001"],
+        [
+            "2026-07-23 00:00",
+            "2026-07-23 00:40",
+            "2026-07-23 01:00",
+        ],
+        [0.0, 40.0, 60.0],
+        [0.0, 40.0, 60.0],
+        [0.0, 40.0, 60.0],
+    )
+    source["source_file_hash"] = ["hash-a", "hash-b", "hash-a"]
+    source.attrs["source_file_hashes"] = "legacy-hash"
+    source.attrs["project_metadata"] = {"project": "demo"}
+
+    result = weather_pipeline.resample_weather_by_tower(
+        source, interval_minutes=30
+    )
+    repeated = weather_pipeline.resample_weather_by_tower(
+        result, interval_minutes=30
+    )
+
+    assert result.loc[1, "wind_speed"] == pytest.approx(30.0)
+    assert "hash-b" not in set(result["source_file_hash"])
+    assert isinstance(result.attrs["source_file_hashes"], tuple)
+    assert set(result.attrs["source_file_hashes"]) == {
+        "hash-a",
+        "hash-b",
+        "legacy-hash",
+    }
+    assert repeated.attrs["source_file_hashes"] == result.attrs[
+        "source_file_hashes"
+    ]
+    assert result.attrs["project_metadata"] == {"project": "demo"}
+
+
+def test_truth_alignment_rejects_hash_used_by_interpolated_physical_value():
+    weather_pipeline = weather_pipeline_module()
+    physical = make_weather_frame(
+        ["001", "001", "001"],
+        [
+            "2026-07-23 00:00",
+            "2026-07-23 00:40",
+            "2026-07-23 01:00",
+        ],
+        [0.0, 40.0, 60.0],
+        [0.0, 40.0, 60.0],
+        [0.0, 40.0, 60.0],
+    )
+    physical["source_file_hash"] = ["hash-a", "hash-b", "hash-a"]
+    resampled = weather_pipeline.resample_weather_by_tower(
+        physical, interval_minutes=30
+    )
+    truth = make_weather_frame(
+        ["001"],
+        ["2026-07-23 00:30"],
+        [30.0],
+        [30.0],
+        [30.0],
+        role="truth",
+        source_hash="hash-b",
+    )
+    assert "hash-b" not in set(resampled["source_file_hash"])
+
+    with pytest.raises(ValueError, match="不能同时作为"):
+        weather_pipeline.align_physical_and_truth(
+            resampled, truth, tolerance=pd.Timedelta(0)
+        )
+
+
+def test_truth_alignment_reads_single_hash_lineage_attr():
+    weather_pipeline = weather_pipeline_module()
+    physical = make_weather_frame(
+        ["001"],
+        ["2026-07-23 00:00"],
+        [20.0],
+        [2.0],
+        [90.0],
+        source_hash="physical-column-hash",
+    )
+    physical.attrs["source_file_hashes"] = "shared-legacy-hash"
+    truth = make_weather_frame(
+        ["001"],
+        ["2026-07-23 00:00"],
+        [19.0],
+        [1.8],
+        [88.0],
+        role="truth",
+        source_hash="shared-legacy-hash",
+    )
+
+    with pytest.raises(ValueError, match="不能同时作为"):
+        weather_pipeline.align_physical_and_truth(
+            physical, truth, tolerance=pd.Timedelta(0)
+        )
 
 
 def test_truth_alignment_uses_same_tower_and_no_future_sample():
@@ -531,6 +633,76 @@ def test_truth_alignment_handles_empty_truth_and_counts_original_rows():
     assert report == weather_pipeline.AlignmentReport(2, 0, 0, 2, 0.0)
 
 
+@pytest.mark.parametrize(
+    ("physical_roles", "truth_roles"),
+    [
+        (["truth"], ["truth"]),
+        (["physical"], ["physical"]),
+        (["physical", "truth"], ["truth", "truth"]),
+        (["physical", "physical"], ["truth", None]),
+        (["unknown"], ["truth"]),
+        (["physical"], ["unknown"]),
+    ],
+)
+def test_truth_alignment_rejects_invalid_dataset_roles(
+    physical_roles, truth_roles
+):
+    weather_pipeline = weather_pipeline_module()
+
+    def frame_for_roles(roles, role, source_hash):
+        size = len(roles)
+        minute_values = [f"2026-07-23 00:{minute:02d}" for minute in range(size)]
+        frame = make_weather_frame(
+            ["001"] * size,
+            minute_values,
+            [20.0] * size,
+            [2.0] * size,
+            [90.0] * size,
+            role=role,
+            source_hash=source_hash,
+        )
+        frame["dataset_role"] = roles
+        return frame
+
+    physical = frame_for_roles(
+        physical_roles, role="physical", source_hash="physical-hash"
+    )
+    truth = frame_for_roles(
+        truth_roles, role="truth", source_hash="truth-hash"
+    )
+
+    with pytest.raises(ValueError, match="dataset_role"):
+        weather_pipeline.align_physical_and_truth(
+            physical, truth, tolerance=pd.Timedelta("10min")
+        )
+
+
+def test_truth_alignment_rejects_conflicting_empty_role_attr():
+    weather_pipeline = weather_pipeline_module()
+    physical = empty_weather_frame(role="truth")
+    truth = empty_weather_frame(role="truth")
+
+    with pytest.raises(ValueError, match="physical.*role"):
+        weather_pipeline.align_physical_and_truth(
+            physical, truth, tolerance=pd.Timedelta(0)
+        )
+
+
+def test_truth_alignment_accepts_empty_frames_without_role_attrs():
+    weather_pipeline = weather_pipeline_module()
+    physical = empty_weather_frame(role="physical")
+    truth = empty_weather_frame(role="truth")
+    physical.attrs.clear()
+    truth.attrs.clear()
+
+    aligned, report = weather_pipeline.align_physical_and_truth(
+        physical, truth, tolerance=pd.Timedelta(0)
+    )
+
+    assert aligned.empty
+    assert report == weather_pipeline.AlignmentReport(0, 0, 0, 0, 0.0)
+
+
 def test_truth_alignment_preserves_physical_order_and_both_inputs():
     weather_pipeline = weather_pipeline_module()
     physical = make_weather_frame(
@@ -662,6 +834,61 @@ def test_truth_values_are_normalized_to_physical_measurement_height():
     assert aligned.loc[0, "measurement_height_truth_original"] == 10.0
     assert aligned.loc[0, "measurement_height_common"] == 20.0
     assert bool(aligned.loc[0, "height_normalized"])
+
+
+@pytest.mark.parametrize(
+    (
+        "physical_height",
+        "truth_height",
+        "roughness_alpha",
+        "temp_lapse_rate",
+    ),
+    [
+        (1e308, 1e-308, 1e308, 0.0065),
+        (20.0, 10.0, 0.15, 1e308),
+    ],
+)
+def test_nonfinite_height_candidates_fall_back_to_raw_without_warning(
+    physical_height,
+    truth_height,
+    roughness_alpha,
+    temp_lapse_rate,
+):
+    weather_pipeline = weather_pipeline_module()
+    physical = make_weather_frame(
+        ["001"], ["2026-07-23 00:00"], [25.0], [5.0], [90.0]
+    )
+    truth = make_weather_frame(
+        ["001"],
+        ["2026-07-23 00:00"],
+        [20.0],
+        [4.0],
+        [88.0],
+        role="truth",
+        source_hash="truth-hash",
+    )
+    physical["measurement_height"] = physical_height
+    truth["measurement_height"] = truth_height
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        aligned, _ = weather_pipeline.align_physical_and_truth(
+            physical,
+            truth,
+            tolerance=pd.Timedelta(0),
+            roughness_alpha=roughness_alpha,
+            temp_lapse_rate=temp_lapse_rate,
+        )
+
+    assert caught == []
+    assert aligned.loc[0, "wind_speed_truth_raw"] == pytest.approx(4.0)
+    assert aligned.loc[0, "ambient_temp_truth_raw"] == pytest.approx(20.0)
+    assert aligned.loc[0, "wind_speed_truth"] == pytest.approx(4.0)
+    assert aligned.loc[0, "ambient_temp_truth"] == pytest.approx(20.0)
+    assert np.isfinite(aligned.loc[0, "wind_speed_truth"])
+    assert np.isfinite(aligned.loc[0, "ambient_temp_truth"])
+    assert pd.isna(aligned.loc[0, "measurement_height_common"])
+    assert not bool(aligned.loc[0, "height_normalized"])
 
 
 @pytest.mark.parametrize(

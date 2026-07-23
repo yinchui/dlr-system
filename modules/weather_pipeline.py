@@ -33,6 +33,8 @@ _GEOGRAPHY_OR_HEIGHT_MARKERS = (
     "height",
 )
 
+_SOURCE_HASH_LINEAGE_ATTR = "source_file_hashes"
+
 
 @dataclass(frozen=True)
 class AlignmentReport:
@@ -86,6 +88,65 @@ def _validate_resampling_role(source: pd.DataFrame) -> None:
             "重采样仅允许 dataset_role=physical；"
             "真实值必须通过 backward alignment 对齐"
         )
+
+
+def _validate_alignment_role(
+    frame: pd.DataFrame,
+    *,
+    label: str,
+    expected_role: str,
+) -> None:
+    attr_role = frame.attrs.get("role")
+    if attr_role not in (None, "") and attr_role != expected_role:
+        raise ValueError(
+            f"{label} attrs role 必须为 {expected_role}，实际为 {attr_role}"
+        )
+    if frame.empty:
+        return
+    roles = frame["dataset_role"]
+    if roles.isna().any() or not roles.eq(expected_role).all():
+        raise ValueError(
+            f"{label} dataset_role 必须全部为 {expected_role}"
+        )
+
+
+def _lineage_attr_values(value) -> tuple:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    try:
+        return tuple(value)
+    except TypeError:
+        return (value,)
+
+
+def _source_file_hash_lineage(frame: pd.DataFrame) -> tuple[str, ...]:
+    values = list(
+        _lineage_attr_values(frame.attrs.get(_SOURCE_HASH_LINEAGE_ATTR))
+    )
+    if "source_file_hash" in frame.columns:
+        values.extend(frame["source_file_hash"].tolist())
+
+    hashes = set()
+    for value in values:
+        if value is None:
+            continue
+        missing = pd.isna(value)
+        if isinstance(missing, (bool, np.bool_)) and missing:
+            continue
+        text = str(value).strip()
+        if text:
+            hashes.add(text)
+    return tuple(sorted(hashes))
+
+
+def _dataset_hash_projection(dataset):
+    if not isinstance(dataset, pd.DataFrame):
+        return dataset
+    return pd.DataFrame(
+        {"source_file_hash": _source_file_hash_lineage(dataset)}
+    )
 
 
 def _interpolate_numeric(series: pd.Series) -> pd.Series:
@@ -179,9 +240,11 @@ def resample_weather_by_tower(
     _validate_weather_frame(source, "source")
     _validate_resampling_role(source)
     original_attrs = source.attrs.copy()
+    source_hash_lineage = _source_file_hash_lineage(source)
     working = source.copy(deep=True)
     if working.empty:
         working.attrs = original_attrs
+        working.attrs[_SOURCE_HASH_LINEAGE_ATTR] = source_hash_lineage
         return working
 
     duplicate_mask = working.duplicated(
@@ -205,6 +268,7 @@ def resample_weather_by_tower(
         ["tower_id", "timestamp"], kind="mergesort", ignore_index=True
     )
     result.attrs = original_attrs
+    result.attrs[_SOURCE_HASH_LINEAGE_ATTR] = source_hash_lineage
     return result
 
 
@@ -335,19 +399,37 @@ def _normalize_truth_measurement_height(
         & (physical_height > 0.0)
         & (truth_height > 0.0)
     )
-    ratio = physical_height.loc[valid_height] / truth_height.loc[valid_height]
-    result.loc[valid_height, "wind_speed_truth"] = (
-        wind_truth.loc[valid_height] * np.power(ratio, roughness_alpha)
-    )
-    result.loc[valid_height, "ambient_temp_truth"] = (
-        temp_truth.loc[valid_height]
-        - temp_lapse_rate
-        * (physical_height.loc[valid_height] - truth_height.loc[valid_height])
-    )
-    result.loc[valid_height, "measurement_height_common"] = (
-        physical_height.loc[valid_height]
-    )
-    result.loc[valid_height, "height_normalized"] = True
+    candidate_index = valid_height.loc[valid_height].index
+    target_heights = physical_height.loc[candidate_index].to_numpy(dtype=float)
+    truth_heights = truth_height.loc[candidate_index].to_numpy(dtype=float)
+    raw_wind = wind_truth.loc[candidate_index].to_numpy(dtype=float)
+    raw_temp = temp_truth.loc[candidate_index].to_numpy(dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore", under="ignore"):
+        height_ratio = np.divide(target_heights, truth_heights)
+        candidate_wind = np.multiply(
+            raw_wind,
+            np.power(height_ratio, roughness_alpha),
+        )
+        candidate_temp = np.subtract(
+            raw_temp,
+            np.multiply(
+                temp_lapse_rate,
+                np.subtract(target_heights, truth_heights),
+            ),
+        )
+
+    finite_candidates = np.isfinite(candidate_wind) & np.isfinite(candidate_temp)
+    normalized_index = candidate_index[finite_candidates]
+    result.loc[normalized_index, "wind_speed_truth"] = candidate_wind[
+        finite_candidates
+    ]
+    result.loc[normalized_index, "ambient_temp_truth"] = candidate_temp[
+        finite_candidates
+    ]
+    result.loc[normalized_index, "measurement_height_common"] = target_heights[
+        finite_candidates
+    ]
+    result.loc[normalized_index, "height_normalized"] = True
     return result
 
 
@@ -359,9 +441,16 @@ def align_physical_and_truth(
     roughness_alpha: float = CORRECTION_DEFAULTS["roughness_alpha"],
     temp_lapse_rate: float = CORRECTION_DEFAULTS["temp_lapse_rate"],
 ) -> tuple[pd.DataFrame, AlignmentReport]:
-    ensure_distinct_dataset_hashes(physical, truth)
+    ensure_distinct_dataset_hashes(
+        _dataset_hash_projection(physical),
+        _dataset_hash_projection(truth),
+    )
     physical_timezone = _validate_weather_frame(physical, "physical")
     _validate_weather_frame(truth, "truth")
+    _validate_alignment_role(
+        physical, label="physical", expected_role="physical"
+    )
+    _validate_alignment_role(truth, label="truth", expected_role="truth")
     tolerance = _validated_tolerance(tolerance)
     roughness_alpha = _validated_correction_parameter(
         roughness_alpha, "roughness_alpha"

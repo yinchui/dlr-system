@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from affine import Affine
 from pyproj import Geod, Transformer
+from pyproj.exceptions import CRSError, ProjError
 import rasterio
 from rasterio.io import DatasetReaderBase, MemoryFile
 from rasterio.transform import rowcol, xy
@@ -157,8 +158,15 @@ def _has_valid_georeference(dem: DemGrid) -> bool:
     return not any(dem.transform.almost_equals(value) for value in default_transforms)
 
 
-def _to_dem_coordinates(dem: DemGrid, lon: float, lat: float) -> tuple[float, float]:
-    transformer = Transformer.from_crs(_WGS84_CRS, dem.crs, always_xy=True)
+def _to_dem_transformer(dem: DemGrid) -> Transformer:
+    return Transformer.from_crs(_WGS84_CRS, dem.crs, always_xy=True)
+
+
+def _to_dem_coordinates(
+    transformer: Transformer,
+    lon: float,
+    lat: float,
+) -> tuple[float, float]:
     x_coord, y_coord = transformer.transform(lon, lat, errcheck=True)
     if not isfinite(x_coord) or not isfinite(y_coord):
         raise ValueError("coordinate transformation returned a non-finite value")
@@ -259,11 +267,16 @@ def query_dem_at_point(dem_data, lon: float, lat: float) -> TerrainSample:
         return _default_sample("missing_georeference")
 
     try:
-        x_coord, y_coord = _to_dem_coordinates(dem_data, longitude, latitude)
+        transformer = _to_dem_transformer(dem_data)
+    except (CRSError, ProjError):
+        return _default_sample("missing_georeference")
+
+    try:
+        x_coord, y_coord = _to_dem_coordinates(transformer, longitude, latitude)
         row, col = rowcol(dem_data.transform, x_coord, y_coord, op=np.floor)
         row = int(row)
         col = int(col)
-    except (TypeError, ValueError, OverflowError):
+    except (CRSError, ProjError, TypeError, ValueError, OverflowError):
         return _default_sample("invalid_coordinate")
 
     rows, cols = dem_data.shape
@@ -277,7 +290,14 @@ def query_dem_at_point(dem_data, lon: float, lat: float) -> TerrainSample:
         return _default_sample("nodata")
     try:
         slope, aspect = _local_slope_aspect(dem_data, row, col)
-    except (TypeError, ValueError, OverflowError, np.linalg.LinAlgError):
+    except (
+        CRSError,
+        ProjError,
+        TypeError,
+        ValueError,
+        OverflowError,
+        np.linalg.LinAlgError,
+    ):
         slope, aspect = 0.0, 0.0
     return TerrainSample(
         slope=float(slope),

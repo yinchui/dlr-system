@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 from affine import Affine
 from pyproj import Transformer
+from pyproj.exceptions import ProjError
 import pytest
 import rasterio
 from rasterio.io import MemoryFile
@@ -150,6 +151,46 @@ def test_missing_crs_returns_default_without_inventing_coordinates(tmp_path):
 
     assert result["source"] == "default"
     assert result["reason"] == "missing_georeference"
+
+
+def test_local_crs_without_wgs84_transform_returns_missing_georeference(tmp_path):
+    local_crs = (
+        'LOCAL_CS["Plant grid",LOCAL_DATUM["Plant datum",32767],'
+        'UNIT["metre",1],AXIS["Easting",EAST],AXIS["Northing",NORTH]]'
+    )
+    dem = terrain.load_dem_data(
+        write_test_geotiff(
+            tmp_path,
+            crs=local_crs,
+            transform=from_origin(0.0, 20.0, 10.0, 10.0),
+        )
+    )
+
+    result = terrain.query_dem_at_point(dem, lon=0.0, lat=0.0)
+
+    assert result["elevation"] == 1000.0
+    assert result["source"] == "default"
+    assert result["reason"] == "missing_georeference"
+
+
+def test_reverse_transform_failure_keeps_measured_center_elevation(tmp_path, monkeypatch):
+    dem = terrain.load_dem_data(write_test_geotiff(tmp_path))
+    original_from_crs = terrain.Transformer.from_crs
+
+    def from_crs(crs_from, crs_to, **kwargs):
+        if crs_from is dem.crs and crs_to == "EPSG:4326":
+            raise ProjError("reverse transform unavailable")
+        return original_from_crs(crs_from, crs_to, **kwargs)
+
+    monkeypatch.setattr(terrain.Transformer, "from_crs", staticmethod(from_crs))
+
+    result = terrain.query_dem_at_point(dem, lon=120.005, lat=49.995)
+
+    assert result["elevation"] == pytest.approx(100.0)
+    assert result["slope"] == 0.0
+    assert result["aspect"] == 0.0
+    assert result["source"] == "measured"
+    assert result["reason"] is None
 
 
 @pytest.mark.filterwarnings("ignore::rasterio.errors.NotGeoreferencedWarning")

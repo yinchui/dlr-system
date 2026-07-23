@@ -98,6 +98,30 @@ def test_lag_resets_across_dataset_and_irregular_time_gap():
     assert features["lag_1"].tolist() == [1.0, 1.0, 9.0, 20.0, 20.0]
 
 
+def test_lag_resets_when_truth_source_hash_changes():
+    frame = pd.DataFrame(
+        {
+            "tower_id": ["001"] * 3,
+            "timestamp": pd.to_datetime(
+                [
+                    "2025-01-01 00:00",
+                    "2025-01-01 00:30",
+                    "2025-01-01 01:00",
+                ]
+            ),
+            "source_file_hash": ["physical-a"] * 3,
+            "source_file_hash_truth": ["truth-a", "truth-a", "truth-b"],
+            "wind_speed_local": [1.0, 2.0, 3.0],
+        }
+    )
+
+    features = FeatureBuilder().transform(
+        frame, physical_col="wind_speed_local"
+    )
+
+    assert features["lag_1"].tolist() == [1.0, 1.0, 3.0]
+
+
 def test_feature_columns_are_deterministic_and_cycles_are_finite():
     frame = make_interleaved_two_tower_training_frame()
     frame["wind_direction"] = [0.0, 90.0, 180.0, 270.0]

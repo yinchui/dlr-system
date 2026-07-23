@@ -68,6 +68,7 @@ class FeatureBuilder:
     _DATASET_COLUMNS = (
         "source_file_hash",
         "source_file_hash_physical",
+        "source_file_hash_truth",
         "dataset_id",
         "dataset_role",
     )

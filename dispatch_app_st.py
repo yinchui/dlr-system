@@ -1,4 +1,5 @@
 import streamlit as st
+import copy
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -8,8 +9,8 @@ from datetime import datetime, timedelta, date
 from thermal_functions import ThermalCalculator, EnvironmentGenerator, LineAnalyzer
 from modules.data_processor import normalize_weather_input_dataframe
 from modules import terrain as terrain_module
+from modules.weather_correction import CorrectionOptions, WeatherCorrectionService
 import os
-from math import radians
 
 
 # ==============================================================================
@@ -68,147 +69,76 @@ def build_terrain_lookup(dem_data, tower_coords: dict, weather_positions: list) 
 # 气象参数修正模块
 # ==============================================================================
 
-def vertical_wind_correction(wind_speed, anemometer_h=10.0, conductor_h=20.0, alpha=0.15):
-    """垂直风速修正 - 幂律模型将测风高度风速折算到导线高度"""
-    if anemometer_h <= 0 or conductor_h <= 0:
-        return wind_speed
-    return wind_speed * (conductor_h / anemometer_h) ** alpha
-
-
-def terrain_wind_correction(wind_speed, wind_dir, slope, aspect, elevation):
-    """地形修正 - 根据坡度坡向修正风速
-    迎风坡加速，背风坡减速，同时考虑海拔对空气密度的影响
-    """
-    # 风向与坡向的夹角
-    angle_diff = abs(wind_dir - aspect) % 360
-    if angle_diff > 180:
-        angle_diff = 360 - angle_diff
-
-    # 迎风/背风系数: 迎风(angle_diff<90)加速, 背风减速
-    slope_rad = radians(slope)
-    if angle_diff < 90:
-        # 迎风坡：风速增强
-        terrain_factor = 1.0 + 0.3 * np.sin(slope_rad) * np.cos(radians(angle_diff))
-    else:
-        # 背风坡：风速减弱
-        terrain_factor = 1.0 - 0.2 * np.sin(slope_rad) * np.cos(radians(180 - angle_diff))
-
-    # 海拔空气密度修正 (标准大气模型)
-    rho_ratio = np.exp(-elevation / 8500.0)  # 密度比
-    # 等效风冷效果 = 风速 × 密度比^0.5
-    density_factor = rho_ratio ** 0.5
-
-    return wind_speed * terrain_factor * density_factor
-
-
-def desert_radiation_correction(solar_radiation, ambient_temp, albedo=0.35, ground_temp_offset=15.0):
-    """沙漠环境修正 - 地表反射辐射增强 + 地面高温辐射
-    沙漠地表反照率高(0.3-0.4)，导线接收额外反射辐射
-    地表温度远高于气温，产生额外长波辐射
-    """
-    # 反射辐射增量 (W/m²)
-    reflected_extra = solar_radiation * albedo * 0.3  # 导线接收约30%的反射辐射
-
-    # 地面长波辐射增量 (Stefan-Boltzmann)
-    ground_temp_K = ambient_temp + ground_temp_offset + 273.15
-    air_temp_K = ambient_temp + 273.15
-    sigma = 5.67e-8
-    longwave_extra = sigma * (ground_temp_K ** 4 - air_temp_K ** 4) * 0.15  # 导线视角因子约0.15
-
-    total_solar_corrected = solar_radiation + reflected_extra + longwave_extra
-    return total_solar_corrected
-
-
-def wind_direction_correction(wind_speed, wind_dir, line_azimuth):
-    """风向修正 - 计算有效横风分量
-    只有垂直于导线的风分量才对散热有效
-    """
-    # 风向与线路方位角的夹角
-    phi = radians(abs(wind_dir - line_azimuth) % 180)
-    # IEEE 738 风向修正系数
-    K_angle = 1.194 - np.cos(phi) + 0.194 * np.cos(2 * phi) + 0.368 * np.sin(2 * phi)
-    K_angle = np.clip(K_angle, 0.388, 1.0)  # 最小值约0.388 (平行风)
-    return wind_speed * K_angle
-
-
 def apply_weather_corrections(line_data, correction_config, conductor_params):
-    """对分析数据应用所有启用的气象修正，返回修正后的数据和修正详情"""
-    positions = line_data['positions']
+    """将旧矩阵格式适配到服务层，且不修改调用方提供的数据。"""
+    if line_data.get('correction_stage') not in (None, 'original'):
+        raise ValueError('气象数据已经修正，不能重复应用局地修正')
+
+    corrected_data = copy.deepcopy(line_data)
+    positions = list(corrected_data['positions'])
     n_pos = len(positions)
-    n_times = len(line_data['times'])
+    n_times = len(corrected_data['times'])
+    winds = np.asarray(corrected_data['winds'], dtype=float).copy()
+    temps = np.asarray(corrected_data['temps'], dtype=float).copy()
+    directions = np.asarray(corrected_data['angles'], dtype=float).copy()
+    solar = np.asarray(corrected_data['solar'], dtype=float).copy()
+    if winds.shape != (n_pos, n_times) or temps.shape != (n_pos, n_times) or directions.shape != (n_pos, n_times):
+        raise ValueError('旧气象矩阵维度与杆塔或时间轴不一致')
+    if solar.shape != (n_times,):
+        raise ValueError('旧太阳辐射数组维度与时间轴不一致')
 
-    # 保存原始数据用于对比
-    winds_orig = line_data['winds'].copy()
-    solar_orig = line_data['solar'].copy()
-    temps_orig = line_data['temps'].copy()
+    terrain_lookup = {}
+    terrain_data = corrected_data.get('terrain_data') or {}
+    for index, position in enumerate(positions):
+        for key in (position, str(position), index, str(index)):
+            terrain = terrain_data.get(key) if hasattr(terrain_data, 'get') else None
+            if terrain is not None:
+                terrain_lookup[position] = terrain
+                break
 
-    winds_corrected = line_data['winds'].copy()
-    solar_corrected = line_data['solar'].copy()
+    source_frame = pd.DataFrame({
+        'position': np.repeat(positions, n_times),
+        'ambient_temp': temps.reshape(-1),
+        'wind_speed': winds.reshape(-1),
+        'wind_direction': directions.reshape(-1),
+        'solar_radiation': np.tile(solar, n_pos),
+    })
+    options = CorrectionOptions(
+        enable_vertical=bool(correction_config.get('vertical', False)),
+        enable_terrain=bool(correction_config.get('terrain', False)),
+        enable_desert=bool(correction_config.get('desert', False)),
+        enable_wind_direction=bool(correction_config.get('wind_dir', False)),
+        ref_height_m=correction_config.get('anemometer_height', 10.0),
+        line_height_m=correction_config.get('conductor_height', 20.0),
+        roughness_alpha=correction_config.get('roughness_alpha', 0.15),
+        ground_albedo=correction_config.get('desert_albedo', 0.35),
+        ground_temp_offset=correction_config.get('ground_temp_offset', 15.0),
+        line_azimuth_deg=conductor_params.get('line_azimuth', 90.0),
+    )
+    local = WeatherCorrectionService().apply(source_frame, terrain_lookup, options)
 
-    correction_details = {
-        'winds_orig': winds_orig,
-        'solar_orig': solar_orig,
-        'temps_orig': temps_orig,
-        'vertical_factors': np.ones((n_pos, n_times)),
-        'terrain_factors': np.ones((n_pos, n_times)),
-        'desert_solar_delta': np.zeros(n_times),
+    local_winds = local['wind_speed_local'].to_numpy(dtype=float).reshape(n_pos, n_times)
+    local_temps = local['ambient_temp_local'].to_numpy(dtype=float).reshape(n_pos, n_times)
+    local_solar_matrix = local['solar_radiation_local'].to_numpy(dtype=float).reshape(n_pos, n_times)
+    local_angles = local['wind_angle_deg'].to_numpy(dtype=float).reshape(n_pos, n_times)
+    vertical_factors = local['vertical_wind_factor'].to_numpy(dtype=float).reshape(n_pos, n_times)
+    terrain_factors = local['terrain_wind_factor'].to_numpy(dtype=float).reshape(n_pos, n_times)
+
+    corrected_data['winds'] = local_winds
+    corrected_data['temps'] = local_temps
+    corrected_data['solar'] = local_solar_matrix.mean(axis=0)
+    corrected_data['angles'] = local_angles
+    corrected_data['correction_stage'] = 'terrain_corrected'
+    corrected_data['correction_details'] = {
+        'winds_orig': winds.copy(),
+        'solar_orig': solar.copy(),
+        'temps_orig': temps.copy(),
+        'vertical_factors': vertical_factors,
+        'terrain_factors': terrain_factors,
+        'desert_solar_delta': corrected_data['solar'] - solar,
         'wind_dir_factors': np.ones((n_pos, n_times)),
     }
-
-    # 1. 垂直修正
-    if correction_config.get('vertical', False):
-        h_c = correction_config['conductor_height']
-        h_a = correction_config['anemometer_height']
-        alpha = correction_config['roughness_alpha']
-        factor = (h_c / h_a) ** alpha
-        winds_corrected = winds_corrected * factor
-        correction_details['vertical_factors'] *= factor
-
-    # 2. 地形修正
-    if correction_config.get('terrain', False):
-        terrain_data = line_data.get('terrain_data', {})
-        for i in range(n_pos):
-            if i in terrain_data:
-                terr = terrain_data[i]
-                slope = terr.get('slope', 0)
-                aspect = terr.get('aspect', 0)
-                elev = terr.get('elevation', 1000)
-                for t in range(n_times):
-                    w_orig = winds_corrected[i, t]
-                    w_dir = line_data['angles'][i, t]
-                    w_new = terrain_wind_correction(w_orig, w_dir, slope, aspect, elev)
-                    correction_details['terrain_factors'][i, t] = w_new / w_orig if w_orig > 0 else 1.0
-                    winds_corrected[i, t] = w_new
-
-    # 3. 沙漠环境修正
-    if correction_config.get('desert', False):
-        albedo = correction_config['desert_albedo']
-        gt_offset = correction_config['ground_temp_offset']
-        mean_temp = np.mean(line_data['temps'])
-        solar_new = np.array([
-            desert_radiation_correction(s, mean_temp, albedo, gt_offset)
-            for s in solar_corrected
-        ])
-        correction_details['desert_solar_delta'] = solar_new - solar_corrected
-        solar_corrected = solar_new
-
-    # 4. 风向修正
-    if correction_config.get('wind_dir', False):
-        azimuth = conductor_params.get('line_azimuth', 90.0)
-        for i in range(n_pos):
-            for t in range(n_times):
-                w_orig = winds_corrected[i, t]
-                w_dir = line_data['angles'][i, t]
-                w_new = wind_direction_correction(w_orig, w_dir, azimuth)
-                correction_details['wind_dir_factors'][i, t] = w_new / w_orig if w_orig > 0 else 1.0
-                winds_corrected[i, t] = w_new
-
-    # 更新 line_data
-    line_data['winds'] = winds_corrected
-    line_data['solar'] = solar_corrected
-    line_data['correction_details'] = correction_details
-
-    return line_data
+    return corrected_data
 
 
 # ==============================================================================
@@ -686,15 +616,17 @@ with tab_line:
 
                         # 应用气象修正
                         corr_cfg = st.session_state.get('correction_config', {})
+                        line_data = apply_weather_corrections(
+                            line_data, corr_cfg, st.session_state.conductor_params
+                        )
                         if any(corr_cfg.get(k) for k in ['vertical', 'terrain', 'desert', 'wind_dir']):
-                            line_data = apply_weather_corrections(
-                                line_data, corr_cfg, st.session_state.conductor_params
-                            )
                             enabled = [n for k, n in [
                                 ('vertical', '垂直'), ('terrain', '地形'),
                                 ('desert', '沙漠'), ('wind_dir', '风向')
                             ] if corr_cfg.get(k)]
                             st.success(f"✓ 已应用气象修正: {', '.join(enabled)}")
+                        else:
+                            line_data.pop('correction_details', None)
 
                         progress_bar.progress(70)
                         status_text.text("正在进行热平衡计算...")
@@ -708,7 +640,7 @@ with tab_line:
                             line_data['solar'],
                             line_data['times'],  # 物理计算使用浮点小时
                             st.session_state.conductor_params['max_allow_temp'],
-                            terrain_data=line_data.get('terrain_data')
+                            terrain_data=None
                         )
 
                         line_data['max_currents'] = calc_results['max_currents']

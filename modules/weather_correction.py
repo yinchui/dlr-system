@@ -135,10 +135,10 @@ class WeatherCorrectionService:
             vertical_factor = 1.0
             lapse = 0.0
 
-        for index, row in corrected.iterrows():
-            wind = self._finite(wind_physical.loc[index], minimum=0.0)
-            temp = self._finite(temp_physical.loc[index])
-            solar = self._finite(solar_physical.loc[index], minimum=0.0)
+        for row_position, (index, row) in enumerate(corrected.iterrows()):
+            wind = self._finite(wind_physical.iloc[row_position], minimum=0.0)
+            temp = self._finite(temp_physical.iloc[row_position])
+            solar = self._finite(solar_physical.iloc[row_position], minimum=0.0)
             wind_direction = self._finite(row.get("wind_direction", 0.0)) % 360.0
 
             current_vertical_factor = vertical_factor if options.enable_vertical else 1.0

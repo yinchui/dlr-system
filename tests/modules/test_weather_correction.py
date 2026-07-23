@@ -117,6 +117,51 @@ def test_disabled_wind_direction_uses_crosswind_angle_without_changing_wind():
     assert corrected.loc[0, "wind_angle_deg"] == pytest.approx(90.0)
 
 
+@pytest.mark.parametrize(
+    ("source_index", "winds", "temps", "solar"),
+    [
+        ([0, 0], [4.0, 7.0], [20.0, 30.0], [600.0, 700.0]),
+        ([1, 0, 1], [4.0, 7.0, 9.0], [20.0, 30.0, 40.0], [600.0, 700.0, 800.0]),
+    ],
+)
+def test_duplicate_input_indexes_keep_each_rows_physical_values(
+    source_index, winds, temps, solar
+):
+    source = pd.DataFrame(
+        {
+            "tower_id": [f"00{index + 1}" for index in range(len(source_index))],
+            "position": list(range(36, 36 + len(source_index))),
+            "ambient_temp": temps,
+            "wind_speed": winds,
+            "wind_direction": [0.0] * len(source_index),
+            "solar_radiation": solar,
+        },
+        index=source_index,
+    )
+    source.attrs["source"] = {"role": "physical"}
+    snapshot = copy.deepcopy(source)
+    source_attrs = copy.deepcopy(source.attrs)
+
+    corrected = WeatherCorrectionService().apply(
+        source,
+        terrain_lookup={},
+        options=CorrectionOptions(
+            enable_vertical=False,
+            enable_terrain=False,
+            enable_desert=False,
+            enable_wind_direction=False,
+        ),
+    )
+
+    pd.testing.assert_frame_equal(source, snapshot)
+    assert source.attrs == source_attrs
+    assert corrected.index.equals(source.index)
+    np.testing.assert_allclose(corrected["wind_speed_local"].to_numpy(), winds)
+    np.testing.assert_allclose(corrected["ambient_temp_local"].to_numpy(), temps)
+    np.testing.assert_allclose(corrected["solar_radiation_local"].to_numpy(), solar)
+    np.testing.assert_allclose(corrected["wind_angle_deg"].to_numpy(), 90.0)
+
+
 def test_desert_correction_changes_only_solar_radiation():
     corrected = WeatherCorrectionService().apply(
         weather_frame(),

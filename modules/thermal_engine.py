@@ -1,20 +1,29 @@
 import math
+from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 
 
 # ==============================================================================
-# 核心物理计算类 - 集成地形修正和沙漠环境优化
+# 核心物理计算类
 # ==============================================================================
 
+
+@dataclass(frozen=True)
+class HeatBalanceResult:
+    q_convection_natural: float
+    q_convection_low_re: float
+    q_convection_high_re: float
+    q_convection: float
+    q_radiation: float
+    q_solar: float
+    resistance: float
+    current_a: float
+
+
 class ThermalCalculator:
-    """
-    基于IEEE Std 738-2023的裸导线电流-温度关系计算器
-    集成：
-    1. 地形微气候修正 (slope, aspect based wind correction)
-    2. 沙漠环境优化 (ShaGeHuangCalculator)
-    """
+    """基于 IEEE Std 738-2023 的裸导线电流-温度关系计算器。"""
 
     def __init__(self):
         # --- 基础材料参数 ---
@@ -34,11 +43,6 @@ class ThermalCalculator:
             'SI': {'A': 1, 'B': 1.148e-4, 'C': -1.108e-8},
             'US': {'A': 1, 'B': 3.500e-5, 'C': -1.000e-9}
         }
-
-        # --- 沙漠/戈壁环境修正参数 ---
-        self.SAND_WIND_COEFF = 1  # 风沙对流散热修正
-        self.HUMIDITY_CORRECTION = 0.95  # 湿度对流物性修正
-        self.GROUND_ALBEDO = 0.35  # 沙地反照率
 
         # --- 地形微气候修正参数 ---
         self.ALPHA_ROUGHNESS = 0.15  # 地表粗糙度指数
@@ -75,37 +79,33 @@ class ThermalCalculator:
         v_final = v_vertical_corrected * topo_factor
         return v_final, topo_factor
 
+    def calculate_heat_balance(self, params: Dict) -> HeatBalanceResult:
+        """一次计算 IEEE 738 稳态热平衡的全部分项。"""
+        local_params = dict(params)
+        q_cn, q_c1, q_c2, q_c = self._calculate_convection_components(local_params)
+        q_r = self._calculate_radiation(local_params)
+        q_s = self._calculate_solar_gain(local_params)
+        resistance = self._calculate_resistance(local_params)
+        current = math.sqrt(max(q_c + q_r - q_s, 0.0) / resistance)
+        return HeatBalanceResult(
+            q_convection_natural=q_cn,
+            q_convection_low_re=q_c1,
+            q_convection_high_re=q_c2,
+            q_convection=q_c,
+            q_radiation=q_r,
+            q_solar=q_s,
+            resistance=resistance,
+            current_a=current,
+        )
+
     def calculate_steady_state_current(self, params: Dict) -> float:
-        """计算稳态电流"""
-        # 应用地形修正 (如果提供了地形参数)
-        if 'slope' in params and 'aspect' in params:
-            v_grid = params.get('wind_speed_original', params['wind_speed'])
-            wind_dir = params.get('wind_direction_original', 90)
-            v_corrected, _ = self.apply_micro_climate_corrections(
-                v_grid, wind_dir, params['slope'], params['aspect']
-            )
-            # 注意：此处修改了传入的字典引用
-            params['wind_speed'] = v_corrected
-
-        q_c = self.calculate_convection(params)
-        q_r = self.calculate_radiation(params)
-        q_s = self.calculate_solar_gain(params)
-        r = self.calculate_resistance(params)
-
-        if (q_c + q_r - q_s) <= 0:
-            return 0.0
-        return math.sqrt((q_c + q_r - q_s) / r)
+        """计算稳态电流。"""
+        return self.calculate_heat_balance(params).current_a
 
     def calculate_steady_state_temperature(self, params: Dict, current: float,
                                            max_iter: int = 100, tol: float = 1e-3) -> float:
         """已知电流推导温度"""
-        if 'slope' in params and 'aspect' in params:
-            v_grid = params.get('wind_speed_original', params['wind_speed'])
-            wind_dir = params.get('wind_direction_original', 90)
-            v_corrected, _ = self.apply_micro_climate_corrections(
-                v_grid, wind_dir, params['slope'], params['aspect']
-            )
-            params['wind_speed'] = v_corrected
+        params = dict(params)
 
         Ta = params['T_a']
         low = Ta
@@ -135,13 +135,7 @@ class ThermalCalculator:
     def calculate_transient_temperature(self, params: Dict, time_steps: List[float],
                                         initial_temp: float, current_profile: List[float]) -> List[float]:
         """计算暂态温度变化"""
-        if 'slope' in params and 'aspect' in params:
-            v_grid = params.get('wind_speed_original', params['wind_speed'])
-            wind_dir = params.get('wind_direction_original', 90)
-            v_corrected, _ = self.apply_micro_climate_corrections(
-                v_grid, wind_dir, params['slope'], params['aspect']
-            )
-            params['wind_speed'] = v_corrected
+        params = dict(params)
 
         temps = [initial_temp]
         current_temp = initial_temp
@@ -167,105 +161,203 @@ class ThermalCalculator:
         return temps
 
     # --------------------------------------------------------------------------
-    # 分项计算方法 (沙漠/戈壁优化版)
+    # IEEE 738 分项计算方法
     # --------------------------------------------------------------------------
 
     def calculate_convection(self, params: Dict) -> float:
-        """
-        计算对流散热 (ShaGeHuang沙漠优化版)
-        包含：湿度修正、风沙系数修正、IEEE738简化Nu计算
-        """
-        D0 = params['D0']
-        T_avg = params['T_avg']
-        T_a = params['T_a']
-        wind_speed = params['wind_speed']  # 已是修正后的本地风速
-        angle = params.get('wind_angle', 90)
-        elevation = params.get('elevation', 0)
-
-        # 1. 物理参数计算 (含湿度修正)
-        p_air = (1.293 - 1.525e-4 * elevation + 6.379e-9 * elevation ** 2) / (1 + 0.00367 * T_avg)
-
-        # 粘度和导热系数应用湿度修正
-        mu_air = ((1.458e-6 * (T_avg + 273.15) ** 1.5) / (T_avg + 383.4)) * self.HUMIDITY_CORRECTION
-        k_air = (2.424e-2 + 7.477e-5 * T_avg - 4.407e-9 * T_avg ** 2) * self.HUMIDITY_CORRECTION
-
-        # 2. 有效风速修正 (含沙风修正)
-        effective_wind = wind_speed * self.SAND_WIND_COEFF
-
-        if effective_wind < 0.1:
-            return 0.0
-
-        # 3. 雷诺数与努塞尔数计算
-        Re = (D0 * effective_wind * p_air) / mu_air
-
-        # IEEE 738 简化逻辑
-        Nu_low = 0.324 * Re ** 0.55
-        Nu_high = 0.052 * Re ** 0.8
-        Nu_forced = max(Nu_low, Nu_high)
-
-        # 风向修正
-        phi = math.radians(angle)
-        K_angle = 1.194 - math.cos(phi) + 0.194 * math.cos(2 * phi) + 0.368 * math.sin(2 * phi)
-
-        q_c = Nu_forced * K_angle * k_air * (T_avg - T_a)
-        return max(q_c, 0.0)
+        """兼容入口：计算取自然与强制对流最大值后的散热。"""
+        return self._calculate_convection_components(dict(params))[3]
 
     def calculate_radiation(self, params: Dict) -> float:
-        """计算辐射散热"""
-        D0 = params['D0']
-        epsilon = params['emissivity']
-        Ts = params['T_s']
-        Ta = params['T_a']
-
-        Ts_k = Ts + 273
-        Ta_k = Ta + 273
-        return 17.8 * D0 * epsilon * (((Ts_k / 100) ** 4) - ((Ta_k / 100) ** 4))
+        """兼容入口：计算辐射散热。"""
+        return self._calculate_radiation(dict(params))
 
     def calculate_solar_gain(self, params: Dict) -> float:
-        """
-        计算太阳热增益 (数据驱动版 + 地面反射增强)
-        """
-        alpha = params['absorptivity']
-        D0 = params['D0']
-
-        # 如果提供了实测太阳辐射数据
-        if 'solar_radiation' in params:
-            global_radiation = params['solar_radiation']
-
-            # 直接吸收部分
-            direct_gain = alpha * global_radiation * D0
-
-            # 地面反射增强 (沙漠特有)
-            ground_gain = alpha * global_radiation * self.GROUND_ALBEDO * 0.5 * D0
-
-            return direct_gain + ground_gain
-
-        # 否则使用晴空模型计算理论值
-        Hc = self.calculate_solar_altitude(params)
-        if Hc > 0:
-            Zc = self.calculate_solar_azimuth(params)
-            Zl = params.get('line_azimuth', 0)
-            theta = math.acos(math.cos(math.radians(Hc)) * math.cos(math.radians(Zc - Zl)))
-            Qs_theory = self.calculate_solar_radiation(params, Hc)
-            Qse_theory = self.calculate_elevation_corrected_radiation(params, Qs_theory)
-            return alpha * Qse_theory * math.sin(theta) * D0
-        else:
-            return 0.0
+        """兼容入口：计算太阳热增益。"""
+        return self._calculate_solar_gain(dict(params))
 
     def calculate_resistance(self, params: Dict) -> float:
-        """计算电阻 (线性插值)"""
-        T_avg = params['T_avg']
+        """兼容入口：计算导线交流电阻。"""
+        return self._calculate_resistance(dict(params))
 
-        if T_avg > 100:
-            T_low, T_high = 25, 200
-            R_low = params.get('R_low_25', 7.283e-5)
-            R_high = params.get('R_high_200', 1.220e-4)
+    @staticmethod
+    def _finite_number(params: Dict, key: str, default=None) -> float:
+        if key in params:
+            value = params[key]
+        elif default is not None:
+            value = default
         else:
-            T_low, T_high = 25, 75
-            R_low = params.get('R_low_25', 7.283e-5)
-            R_high = params.get('R_high_75', 8.688e-5)
+            raise ValueError(f"{key} is required")
+        if isinstance(value, bool):
+            raise ValueError(f"{key} must be a finite number")
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} must be a finite number") from exc
+        if not math.isfinite(number):
+            raise ValueError(f"{key} must be a finite number")
+        return number
 
-        return ((R_high - R_low) / (T_high - T_low)) * (T_avg - T_low) + R_low
+    @classmethod
+    def _positive_number(cls, params: Dict, key: str, default=None) -> float:
+        value = cls._finite_number(params, key, default)
+        if value <= 0.0:
+            raise ValueError(f"{key} must be greater than zero")
+        return value
+
+    @classmethod
+    def _fraction(cls, params: Dict, key: str) -> float:
+        value = cls._finite_number(params, key)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{key} must be between zero and one")
+        return value
+
+    @classmethod
+    def _temperatures(cls, params: Dict) -> Tuple[float, float]:
+        conductor = cls._finite_number(params, 'T_s')
+        ambient = cls._finite_number(params, 'T_a')
+        if conductor <= -273.15:
+            raise ValueError("T_s must be above absolute zero")
+        if ambient <= -273.15:
+            raise ValueError("T_a must be above absolute zero")
+        if conductor < ambient:
+            raise ValueError("T_s must be greater than or equal to T_a")
+        return conductor, ambient
+
+    def _calculate_convection_components(self, params: Dict) -> Tuple[float, float, float, float]:
+        diameter = self._positive_number(params, 'D0')
+        conductor_temp, ambient_temp = self._temperatures(params)
+        wind_speed = self._finite_number(params, 'wind_speed')
+        if wind_speed < 0.0:
+            raise ValueError("wind_speed must be nonnegative")
+        wind_angle = self._finite_number(params, 'wind_angle', 90.0)
+        elevation = self._finite_number(params, 'elevation', 0.0)
+
+        film_temp = (conductor_temp + ambient_temp) / 2.0
+        temperature_difference = conductor_temp - ambient_temp
+        density = (
+            1.293 - 1.525e-4 * elevation + 6.379e-9 * elevation ** 2
+        ) / (1.0 + 0.00367 * film_temp)
+        viscosity = (
+            1.458e-6 * (film_temp + 273.15) ** 1.5 / (film_temp + 383.4)
+        )
+        conductivity = (
+            2.424e-2 + 7.477e-5 * film_temp - 4.407e-9 * film_temp ** 2
+        )
+        if not all(
+            math.isfinite(value) and value > 0.0
+            for value in (density, viscosity, conductivity)
+        ):
+            raise ValueError("T_s and T_a produce invalid air properties")
+
+        q_natural = (
+            3.645
+            * density ** 0.5
+            * diameter ** 0.75
+            * temperature_difference ** 1.25
+        )
+        if wind_speed == 0.0:
+            return q_natural, 0.0, 0.0, q_natural
+
+        reynolds = diameter * density * wind_speed / viscosity
+        effective_angle = wind_angle % 180.0
+        if effective_angle > 90.0:
+            effective_angle = 180.0 - effective_angle
+        phi = math.radians(effective_angle)
+        angle_factor = (
+            1.194
+            - math.cos(phi)
+            + 0.194 * math.cos(2.0 * phi)
+            + 0.368 * math.sin(2.0 * phi)
+        )
+        q_low_re = (
+            angle_factor
+            * (1.01 + 1.35 * reynolds ** 0.52)
+            * conductivity
+            * temperature_difference
+        )
+        q_high_re = (
+            angle_factor
+            * 0.754
+            * reynolds ** 0.60
+            * conductivity
+            * temperature_difference
+        )
+        return q_natural, q_low_re, q_high_re, max(q_natural, q_low_re, q_high_re)
+
+    def _calculate_radiation(self, params: Dict) -> float:
+        diameter = self._positive_number(params, 'D0')
+        emissivity = self._fraction(params, 'emissivity')
+        conductor_temp, ambient_temp = self._temperatures(params)
+        return 17.8 * diameter * emissivity * (
+            ((conductor_temp + 273.0) / 100.0) ** 4
+            - ((ambient_temp + 273.0) / 100.0) ** 4
+        )
+
+    def _calculate_solar_gain(self, params: Dict) -> float:
+        absorptivity = self._fraction(params, 'absorptivity')
+        diameter = self._positive_number(params, 'D0')
+        if 'solar_radiation' in params:
+            radiation = self._finite_number(params, 'solar_radiation')
+            if radiation < 0.0:
+                raise ValueError("solar_radiation must be nonnegative")
+            return absorptivity * radiation * diameter
+
+        latitude = self._finite_number(params, 'latitude')
+        if not -90.0 <= latitude <= 90.0:
+            raise ValueError("latitude must be between -90 and 90")
+        day = self._finite_number(params, 'day_of_year')
+        if not 1.0 <= day <= 366.0:
+            raise ValueError("day_of_year must be between 1 and 366")
+        solar_time = self._finite_number(params, 'time')
+        if not 0.0 <= solar_time <= 24.0:
+            raise ValueError("time must be between 0 and 24")
+        line_azimuth = self._finite_number(params, 'line_azimuth', 0.0)
+        self._finite_number(params, 'elevation', 0.0)
+
+        solar_altitude = self.calculate_solar_altitude(params)
+        if solar_altitude <= 0.0:
+            return 0.0
+        solar_azimuth = self.calculate_solar_azimuth(params)
+        incidence_cosine = (
+            math.cos(math.radians(solar_altitude))
+            * math.cos(math.radians(solar_azimuth - line_azimuth))
+        )
+        incidence_angle = math.acos(max(-1.0, min(1.0, incidence_cosine)))
+        clear_sky_radiation = self.calculate_solar_radiation(params, solar_altitude)
+        corrected_radiation = self.calculate_elevation_corrected_radiation(
+            params, clear_sky_radiation
+        )
+        if not math.isfinite(corrected_radiation) or corrected_radiation < 0.0:
+            raise ValueError("elevation produces invalid solar radiation")
+        return absorptivity * corrected_radiation * math.sin(incidence_angle) * diameter
+
+    def _calculate_resistance(self, params: Dict) -> float:
+        if 'T_avg' in params:
+            average_temp = self._finite_number(params, 'T_avg')
+        else:
+            average_temp = self._finite_number(params, 'T_s')
+        if average_temp <= -273.15:
+            raise ValueError("T_avg must be above absolute zero")
+
+        resistance_25 = self._positive_number(params, 'R_low_25', 7.283e-5)
+        resistance_75 = self._positive_number(params, 'R_high_75', 8.688e-5)
+        resistance_200 = self._positive_number(params, 'R_high_200', 1.220e-4)
+        resistance_100 = resistance_25 + (
+            (resistance_75 - resistance_25) / (75.0 - 25.0)
+        ) * (100.0 - 25.0)
+
+        if average_temp <= 100.0:
+            resistance = resistance_25 + (
+                (resistance_75 - resistance_25) / (75.0 - 25.0)
+            ) * (average_temp - 25.0)
+        else:
+            resistance = resistance_100 + (
+                (resistance_200 - resistance_100) / (200.0 - 100.0)
+            ) * (average_temp - 100.0)
+        if not math.isfinite(resistance) or resistance <= 0.0:
+            raise ValueError("T_avg produces nonpositive resistance")
+        return resistance
 
     def calculate_heat_capacity(self, params: Dict) -> float:
         """计算热容量"""

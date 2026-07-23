@@ -3,9 +3,12 @@ from dataclasses import dataclass
 from datetime import datetime
 import re
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import numpy as np
 import pandas as pd
+
+from config.config import PHYSICAL_BOUNDS, PROJECT_TIMEZONE
 
 
 @dataclass
@@ -19,6 +22,21 @@ class WeatherDataset:
     wind_dirs: dict
     solar: np.ndarray
     humidity: dict
+
+
+@dataclass(frozen=True)
+class DataQualityReport:
+    input_rows: int
+    valid_rows: int
+    dropped_rows: int
+    duplicate_rows: int
+    reasons: dict[str, int]
+
+
+@dataclass(frozen=True)
+class CanonicalWeatherResult:
+    frame: pd.DataFrame
+    report: DataQualityReport
 
 
 COLUMN_ALIASES = {
@@ -41,6 +59,19 @@ _WEATHER_REQUIRED_COLUMNS = (
     "ambient_temp",
     "wind_speed",
     "wind_direction",
+)
+
+CANONICAL_WEATHER_COLUMNS = (
+    "tower_id",
+    "timestamp",
+    "ambient_temp",
+    "wind_speed",
+    "wind_direction",
+    "solar_radiation",
+    "humidity",
+    "elevation",
+    "dataset_role",
+    "source_file_hash",
 )
 
 
@@ -70,6 +101,14 @@ def _tower_number(value):
         return int(numeric)
     match = re.search(r"(\d+)", str(value))
     return int(match.group(1)) if match else np.nan
+
+
+def normalize_tower_id(value) -> str:
+    text = str(value).strip()
+    match = re.search(r"(\d+)(?=\s*号|$)", text)
+    if match:
+        return match.group(1)
+    raise ValueError("无法解析杆塔编号")
 
 
 def _normalize_tower_time_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -171,6 +210,289 @@ def normalize_weather_input_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             "；检测到的原始列: " + ", ".join(map(str, source.columns))
         )
     return normalized
+
+
+def _combine_date_and_time(date_value, time_value):
+    if pd.isna(date_value) or pd.isna(time_value):
+        return pd.NaT
+    try:
+        date_part = pd.Timestamp(date_value).normalize()
+    except (TypeError, ValueError):
+        return pd.NaT
+
+    if hasattr(time_value, "hour"):
+        hours = time_value.hour
+        minutes = time_value.minute
+        seconds = time_value.second
+        microseconds = getattr(time_value, "microsecond", 0)
+        return date_part + pd.Timedelta(
+            hours=hours,
+            minutes=minutes,
+            seconds=seconds,
+            microseconds=microseconds,
+        )
+
+    try:
+        return date_part + pd.to_timedelta(str(time_value).strip())
+    except (TypeError, ValueError):
+        try:
+            parsed_time = pd.Timestamp(time_value)
+        except (TypeError, ValueError):
+            return pd.NaT
+        return date_part + pd.Timedelta(
+            hours=parsed_time.hour,
+            minutes=parsed_time.minute,
+            seconds=parsed_time.second,
+            microseconds=parsed_time.microsecond,
+        )
+
+
+def _canonical_source_frame(df: pd.DataFrame) -> pd.DataFrame:
+    source = df.copy(deep=True)
+    source.columns = [str(column).strip() for column in source.columns]
+
+    if {"tower_id", "timestamp"}.issubset(source.columns):
+        missing = [
+            column
+            for column in ("ambient_temp", "wind_speed", "wind_direction")
+            if column not in source.columns
+        ]
+        if missing:
+            raise ValueError("缺少必需字段: " + ", ".join(missing))
+        prepared = pd.DataFrame(index=source.index)
+        prepared["tower_id_raw"] = source["tower_id"]
+        prepared["timestamp_raw"] = source["timestamp"]
+        for column in (
+            "ambient_temp",
+            "wind_speed",
+            "wind_direction",
+            "solar_radiation",
+            "humidity",
+            "elevation",
+            "longitude",
+            "latitude",
+        ):
+            if column in source.columns:
+                prepared[column] = source[column]
+        for column, default in (
+            ("solar_radiation", 0.0),
+            ("humidity", 50.0),
+            ("elevation", 1000.0),
+        ):
+            if column not in prepared:
+                prepared[column] = default
+        return prepared
+
+    normalized = normalize_weather_input_dataframe(source)
+    columns = list(source.columns)
+    if normalized.attrs.get("input_format") == "tower_time":
+        tower_column = _find_column(columns, lambda c: "杆塔" in c)
+        time_column = _find_column(columns, lambda c: c == "时间")
+        timestamp_raw = source[time_column]
+    else:
+        tower_column = _find_column(
+            columns,
+            lambda c: c in {"position", "tower_id"} or "位置" in c or "杆塔" in c,
+        )
+        timestamp_raw = pd.Series(
+            (
+                _combine_date_and_time(date_value, time_value)
+                for date_value, time_value in zip(
+                    normalized["date"], normalized["time_str"]
+                )
+            ),
+            index=source.index,
+        )
+
+    prepared = pd.DataFrame(index=source.index)
+    prepared["tower_id_raw"] = source[tower_column]
+    prepared["timestamp_raw"] = timestamp_raw
+    for column in (
+        "ambient_temp",
+        "wind_speed",
+        "wind_direction",
+        "solar_radiation",
+        "humidity",
+        "elevation",
+    ):
+        prepared[column] = normalized[column]
+
+    for canonical_name, chinese_name in (
+        ("longitude", "经度"),
+        ("latitude", "纬度"),
+    ):
+        if canonical_name in normalized.columns:
+            prepared[canonical_name] = normalized[canonical_name]
+            continue
+        source_column = _find_column(
+            columns,
+            lambda c, name=chinese_name: c == name or name in c,
+        )
+        if source_column is not None:
+            prepared[canonical_name] = source[source_column]
+    return prepared
+
+
+def _parse_timestamp(value, target_timezone: ZoneInfo):
+    if pd.isna(value):
+        return pd.NaT
+    try:
+        timestamp = pd.Timestamp(value)
+        if timestamp.tzinfo is None:
+            return timestamp.tz_localize(
+                target_timezone,
+                ambiguous="raise",
+                nonexistent="raise",
+            )
+        return timestamp.tz_convert(target_timezone)
+    except (TypeError, ValueError):
+        return pd.NaT
+
+
+def canonicalize_weather_frame(
+    df: pd.DataFrame,
+    role: str,
+    timezone: str = PROJECT_TIMEZONE,
+    source_hash: str = "",
+) -> CanonicalWeatherResult:
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("气象数据必须是 pandas DataFrame")
+    if role not in {"physical", "truth"}:
+        raise ValueError("role 仅允许 physical 或 truth")
+    try:
+        target_timezone = ZoneInfo(timezone)
+    except (TypeError, ZoneInfoNotFoundError) as exc:
+        raise ValueError(f"无效时区: {timezone}") from exc
+
+    prepared = _canonical_source_frame(df)
+    canonical = pd.DataFrame(index=prepared.index)
+
+    def parse_tower(value):
+        try:
+            return normalize_tower_id(value)
+        except ValueError:
+            return None
+
+    canonical["tower_id"] = prepared["tower_id_raw"].map(parse_tower)
+    timestamps = [
+        _parse_timestamp(value, target_timezone)
+        for value in prepared["timestamp_raw"]
+    ]
+    canonical["timestamp"] = pd.array(
+        timestamps,
+        dtype=pd.DatetimeTZDtype(tz=target_timezone),
+    )
+    for column in (
+        "ambient_temp",
+        "wind_speed",
+        "wind_direction",
+        "solar_radiation",
+        "humidity",
+        "elevation",
+        "longitude",
+        "latitude",
+    ):
+        if column in prepared.columns:
+            canonical[column] = pd.to_numeric(prepared[column], errors="coerce")
+
+    canonical["solar_radiation"] = canonical["solar_radiation"].fillna(0.0)
+    canonical["humidity"] = canonical["humidity"].fillna(50.0)
+    canonical["elevation"] = canonical["elevation"].fillna(1000.0)
+    canonical["dataset_role"] = role
+    canonical["source_file_hash"] = "" if source_hash is None else str(source_hash)
+
+    invalid = pd.Series(False, index=canonical.index)
+    reasons: dict[str, int] = {}
+
+    def mark_invalid(reason: str, mask):
+        nonlocal invalid
+        mask = pd.Series(mask, index=canonical.index).fillna(False).astype(bool)
+        count = int(mask.sum())
+        if count:
+            reasons[reason] = count
+            invalid = invalid | mask
+
+    mark_invalid("invalid_tower_id", canonical["tower_id"].isna())
+    mark_invalid("invalid_timestamp", canonical["timestamp"].isna())
+
+    for column in ("ambient_temp", "wind_speed", "wind_direction"):
+        mark_invalid(f"missing_{column}", canonical[column].isna())
+
+    wind_min, wind_max = PHYSICAL_BOUNDS["wind_speed"]
+    wind_present = canonical["wind_speed"].notna()
+    mark_invalid(
+        "wind_speed_out_of_range",
+        wind_present
+        & (
+            ~np.isfinite(canonical["wind_speed"])
+            | (canonical["wind_speed"] < wind_min)
+            | (canonical["wind_speed"] > wind_max)
+        ),
+    )
+
+    temp_min, temp_max = PHYSICAL_BOUNDS["ambient_temp"]
+    temp_present = canonical["ambient_temp"].notna()
+    mark_invalid(
+        "ambient_temp_out_of_range",
+        temp_present
+        & (
+            ~np.isfinite(canonical["ambient_temp"])
+            | (canonical["ambient_temp"] < temp_min)
+            | (canonical["ambient_temp"] > temp_max)
+        ),
+    )
+
+    direction_present = canonical["wind_direction"].notna()
+    mark_invalid(
+        "wind_direction_out_of_range",
+        direction_present
+        & (
+            ~np.isfinite(canonical["wind_direction"])
+            | (canonical["wind_direction"] < 0.0)
+            | (canonical["wind_direction"] > 360.0)
+        ),
+    )
+    canonical.loc[canonical["wind_direction"] == 360.0, "wind_direction"] = 0.0
+
+    mark_invalid(
+        "humidity_out_of_range",
+        ~np.isfinite(canonical["humidity"])
+        | (canonical["humidity"] < 0.0)
+        | (canonical["humidity"] > 100.0),
+    )
+    mark_invalid(
+        "solar_radiation_out_of_range",
+        ~np.isfinite(canonical["solar_radiation"])
+        | (canonical["solar_radiation"] < 0.0),
+    )
+    mark_invalid("elevation_not_finite", ~np.isfinite(canonical["elevation"]))
+    for column in ("longitude", "latitude"):
+        if column in canonical.columns:
+            mark_invalid(f"{column}_not_finite", ~np.isfinite(canonical[column]))
+
+    valid = canonical.loc[~invalid].copy()
+    duplicate_mask = valid.duplicated(subset=["tower_id", "timestamp"], keep="first")
+    duplicate_rows = int(duplicate_mask.sum())
+    if duplicate_rows:
+        reasons["duplicate_tower_timestamp"] = duplicate_rows
+        valid = valid.loc[~duplicate_mask].copy()
+
+    optional_location_columns = [
+        column for column in ("longitude", "latitude") if column in valid.columns
+    ]
+    output_columns = list(CANONICAL_WEATHER_COLUMNS[:-2])
+    output_columns.extend(optional_location_columns)
+    output_columns.extend(CANONICAL_WEATHER_COLUMNS[-2:])
+    frame = valid.loc[:, output_columns].reset_index(drop=True)
+    input_rows = len(df)
+    report = DataQualityReport(
+        input_rows=input_rows,
+        valid_rows=len(frame),
+        dropped_rows=input_rows - len(frame),
+        duplicate_rows=duplicate_rows,
+        reasons=reasons,
+    )
+    return CanonicalWeatherResult(frame=frame, report=report)
 
 
 def normalize_weather_dataframe(df: pd.DataFrame) -> pd.DataFrame:

@@ -273,7 +273,12 @@ def test_trained_bundle_clips_residual_and_weather_per_tower():
     lower, upper = result.bundle.residual_bounds
     assert -2.0 <= lower <= upper <= 2.0
     assert predicted.loc[predicted.index[0], "wind_speed_residual"] <= upper
-    assert predicted.loc[predicted.index[0], "wind_speed_final"] == 75.0
+    assert predicted.loc[predicted.index[0], "wind_speed_residual"] == 0.0
+    assert predicted.loc[predicted.index[0], "wind_speed_final"] == 74.5
+    assert predicted.loc[predicted.index[0], "used_ai"] == False
+    assert predicted.loc[predicted.index[0], "fallback_reason"] == (
+        "physical_bounds_exceeded"
+    )
 
 
 def test_train_target_rejects_mixed_lines_or_towers():

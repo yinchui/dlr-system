@@ -469,14 +469,19 @@ class ResidualPredictor:
             corrected = physical + residual
         finite_corrected = np.isfinite(corrected)
         valid_ai = finite_prediction & finite_corrected
+        lower, upper = PHYSICAL_BOUNDS[target_name]
+        bounds_exceeded = valid_ai & (
+            (corrected < lower) | (corrected > upper)
+        )
+        valid_ai &= ~bounds_exceeded
         corrected[~valid_ai] = physical[~valid_ai]
         residual[~valid_ai] = 0.0
-        if target_name in PHYSICAL_BOUNDS:
-            lower, upper = PHYSICAL_BOUNDS[target_name]
-            corrected = np.clip(corrected, lower, upper)
 
         reasons = np.full(len(output), "", dtype=object)
-        reasons[~valid_ai] = "non_finite_prediction"
+        reasons[~(finite_prediction & finite_corrected)] = (
+            "non_finite_prediction"
+        )
+        reasons[bounds_exceeded] = "physical_bounds_exceeded"
         output[f"{target_name}_residual"] = residual
         output[f"{target_name}_final"] = corrected
         output["used_ai"] = valid_ai

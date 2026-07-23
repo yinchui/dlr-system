@@ -272,7 +272,7 @@ def test_predictor_returns_physical_plus_residual_prediction():
     assert predicted["wind_speed_final"].tolist() == [3.5, 4.5]
 
 
-def test_predictor_clips_residual_then_applies_physical_bounds():
+def test_predictor_clips_residual_then_rejects_out_of_bounds_candidates():
     df = pd.DataFrame(
         {
             "timestamp": pd.to_datetime(
@@ -292,9 +292,37 @@ def test_predictor_clips_residual_then_applies_physical_bounds():
         df, target_name="wind_speed", physical_col="wind_speed_physical"
     )
 
-    assert predicted["wind_speed_residual"].tolist() == [5.0, -5.0]
-    assert predicted["wind_speed_final"].tolist() == [75.0, 0.0]
-    assert predicted["used_ai"].tolist() == [True, True]
+    assert predicted["wind_speed_residual"].tolist() == [0.0, 0.0]
+    assert predicted["wind_speed_final"].tolist() == [74.0, 1.0]
+    assert predicted["used_ai"].tolist() == [False, False]
+    assert predicted["fallback_reason"].tolist() == [
+        "physical_bounds_exceeded",
+        "physical_bounds_exceeded",
+    ]
+
+
+def test_predictor_falls_back_when_final_candidate_exceeds_physical_bounds():
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2025-12-10 00:00"]),
+            "wind_speed_local": [74.0],
+        }
+    )
+    bundle = ModelBundle(
+        target_name="wind_speed",
+        feature_columns=["wind_speed_local"],
+        model=SequenceModel([10.0]),
+        residual_bounds=(-5.0, 5.0),
+    )
+
+    predicted = ResidualPredictor({"wind_speed": bundle}).predict(
+        frame, target_name="wind_speed", physical_col="wind_speed_local"
+    )
+
+    assert predicted.loc[0, "wind_speed_final"] == 74.0
+    assert predicted.loc[0, "wind_speed_residual"] == 0.0
+    assert predicted.loc[0, "used_ai"] == False
+    assert predicted.loc[0, "fallback_reason"] == "physical_bounds_exceeded"
 
 
 def test_predictor_falls_back_to_physical_for_non_finite_prediction():
@@ -348,11 +376,11 @@ def test_predictor_model_exception_falls_back_without_propagating():
     assert predicted.loc[0, "fallback_reason"] == "prediction_failed:OSError"
 
 
-def test_predictor_applies_physical_bounds_after_prediction_fallback():
+def test_predictor_returns_valid_physical_value_after_prediction_fallback():
     frame = pd.DataFrame(
         {
             "timestamp": pd.to_datetime(["2025-12-10 00:00"]),
-            "wind_speed_local": [80.0],
+            "wind_speed_local": [70.0],
         }
     )
     bundle = ModelBundle(
@@ -365,7 +393,7 @@ def test_predictor_applies_physical_bounds_after_prediction_fallback():
         frame, target_name="wind_speed", physical_col="wind_speed_local"
     )
 
-    assert predicted.loc[0, "wind_speed_final"] == 75.0
+    assert predicted.loc[0, "wind_speed_final"] == 70.0
 
 
 def test_predictor_rejects_invalid_timestamp_before_model_fallback():

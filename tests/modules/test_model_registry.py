@@ -96,12 +96,12 @@ class MeanResidualModel:
         return np.full(len(features), self.value, dtype=float)
 
 
-def model_candidate(key, **metadata_options):
+def model_candidate(key, *, model_value=0.5, **metadata_options):
     metadata = model_metadata(key, **metadata_options)
     bundle = ModelBundle(
         target_name=key.target,
         feature_columns=list(metadata.feature_columns),
-        model=ConstantResidualModel(),
+        model=ConstantResidualModel(model_value),
         cadence_minutes=metadata.cadence_minutes,
         residual_bounds=metadata.residual_bounds,
         line_id=key.line_id,
@@ -282,6 +282,94 @@ def test_first_full_fit_candidate_is_saved_as_provisional_and_reloads(tmp_path):
     assert loaded.metadata.full_fit_metrics == WEATHER_METRICS
     assert loaded.bundle.cadence_minutes == 30.0
     assert loaded.bundle.model.predict(np.zeros((2, 2))).tolist() == [0.5, 0.5]
+
+
+@pytest.mark.parametrize(
+    "evaluation_mode", ["temporal_holdout", "rolling_validation"]
+)
+def test_independent_candidate_promotes_from_full_fit_provisional(
+    tmp_path, evaluation_mode
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path, min_mae_improvement=0.2)
+    registry.promote(
+        model_candidate(
+            key,
+            model_version="version-1",
+            evaluation_mode="full_fit",
+            corrected_mae=1.0,
+        )
+    )
+
+    decision = registry.promote(
+        model_candidate(
+            key,
+            model_version="version-2",
+            evaluation_mode=evaluation_mode,
+            corrected_mae=1.7,
+            evaluation_set_hash="frozen-evaluation-a",
+            model_value=0.9,
+        )
+    )
+
+    assert decision.promoted is True
+    assert decision.reason == "promoted_from_provisional"
+    assert decision.metadata.status == "active"
+    loaded = registry.load(
+        key, expected_compatibility=compatible_hashes()
+    )
+    assert loaded.fallback_reason == ""
+    assert loaded.metadata.model_version == "version-2"
+    assert loaded.metadata.status == "active"
+    assert loaded.bundle.model.predict(np.zeros((1, 2))).tolist() == [0.9]
+
+
+def test_provisional_replacement_must_beat_physical_by_threshold(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path, min_mae_improvement=0.5)
+    registry.promote(
+        model_candidate(
+            key,
+            model_version="version-1",
+            evaluation_mode="full_fit",
+        )
+    )
+
+    decision = registry.promote(
+        model_candidate(
+            key,
+            model_version="version-2",
+            corrected_mae=1.5,
+            evaluation_set_hash="frozen-evaluation-a",
+        )
+    )
+
+    assert decision.promoted is False
+    assert decision.reason == "insufficient_mae_improvement"
+
+
+def test_provisional_replacement_rejects_model_version_conflict(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(
+        model_candidate(
+            key,
+            model_version="version-1",
+            evaluation_mode="full_fit",
+        )
+    )
+
+    decision = registry.promote(
+        model_candidate(
+            key,
+            model_version="version-1",
+            corrected_mae=0.5,
+            evaluation_set_hash="frozen-evaluation-a",
+        )
+    )
+
+    assert decision.promoted is False
+    assert decision.reason == "model_version_conflict"
 
 
 def test_persisted_metadata_contains_required_scope_hashes_and_checksum(tmp_path):
@@ -556,6 +644,57 @@ def test_training_result_hashes_are_stable_across_input_row_order():
         first.metadata["evaluation_set_hash"]
         == second.metadata["evaluation_set_hash"]
     )
+
+
+def test_input_hash_is_stable_for_reversed_same_time_lineage_rows():
+    physical = np.array([2.0, 3.0, 12.0, 13.0])
+    frame = pd.DataFrame(
+        {
+            "line_id": ["line-a"] * 4,
+            "tower_id": ["001"] * 4,
+            "timestamp": pd.to_datetime(
+                [
+                    "2025-01-01 00:00",
+                    "2025-01-01 00:30",
+                    "2025-01-01 00:00",
+                    "2025-01-01 00:30",
+                ],
+                utc=True,
+            ),
+            "source_file_hash_physical": [
+                "physical-a",
+                "physical-a",
+                "physical-b",
+                "physical-b",
+            ],
+            "source_file_hash_truth": [
+                "truth-a",
+                "truth-a",
+                "truth-b",
+                "truth-b",
+            ],
+            "wind_speed_local": physical,
+            "wind_speed_truth": physical + np.array([0.0, 1.0, 2.0, 3.0]),
+        }
+    )
+    trainer = ResidualTrainer(estimator_factory=MeanResidualModel)
+
+    forward = trainer.train_target(frame, target="wind_speed")
+    reversed_rows = trainer.train_target(
+        frame.iloc[::-1], target="wind_speed"
+    )
+
+    assert forward.metadata["input_data_hash"] == reversed_rows.metadata[
+        "input_data_hash"
+    ]
+    changed_lineage = frame.copy(deep=True)
+    changed_lineage.loc[changed_lineage.index[0], "source_file_hash_truth"] = (
+        "truth-changed"
+    )
+    changed = trainer.train_target(changed_lineage, target="wind_speed")
+    assert forward.metadata["input_data_hash"] != changed.metadata[
+        "input_data_hash"
+    ]
 
 
 def test_training_hash_changes_when_truth_weather_changes():

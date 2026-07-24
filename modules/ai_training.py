@@ -121,18 +121,13 @@ def _stable_training_data_hash(
 ) -> str:
     selected_columns = list(dict.fromkeys(columns))
     canonical = frame.loc[:, selected_columns].copy(deep=True)
-    sort_columns = [
-        column
-        for column in ("line_id", "tower_id", "timestamp")
-        if column in canonical.columns
-    ]
-    if sort_columns:
-        canonical = canonical.sort_values(sort_columns, kind="mergesort")
-    row_hashes = pd.util.hash_pandas_object(
-        canonical,
-        index=False,
-        categorize=True,
-    ).to_numpy(dtype=np.uint64)
+    row_hashes = np.sort(
+        pd.util.hash_pandas_object(
+            canonical,
+            index=False,
+            categorize=False,
+        ).to_numpy(dtype=np.uint64)
+    )
     digest = hashlib.sha256()
     digest.update(
         json.dumps(

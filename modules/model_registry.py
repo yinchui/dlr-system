@@ -751,6 +751,36 @@ class ModelRegistry:
                         champion,
                     )
                 if (
+                    champion.status == "active_provisional"
+                    and champion.evaluation_mode == "full_fit"
+                ):
+                    if (
+                        candidate.metadata.model_version
+                        == champion.model_version
+                    ):
+                        return PromotionDecision(
+                            False, "model_version_conflict", champion
+                        )
+                    physical_improvement = (
+                        candidate.metadata.metrics["baseline_mae"]
+                        - candidate.metadata.metrics["corrected_mae"]
+                    )
+                    if (
+                        physical_improvement
+                        <= self.min_mae_improvement + 1e-12
+                    ):
+                        return PromotionDecision(
+                            False,
+                            "insufficient_mae_improvement",
+                            champion,
+                        )
+                    return self._publish_decision(
+                        candidate,
+                        status="active",
+                        reason="promoted_from_provisional",
+                        champion=champion,
+                    )
+                if (
                     champion.evaluation_mode == "full_fit"
                     or champion.evaluation_set_hash is None
                 ):

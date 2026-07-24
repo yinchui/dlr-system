@@ -56,6 +56,7 @@ def model_metadata(
     evaluation_mode="temporal_holdout",
     corrected_mae=1.0,
     evaluation_set_hash="evaluation-a",
+    input_data_hash="input-a",
     compatibility=None,
 ):
     metrics = dict(WEATHER_METRICS, corrected_mae=corrected_mae)
@@ -82,7 +83,7 @@ def model_metadata(
         metrics=metrics,
         full_fit_metrics=full_fit_metrics,
         residual_bounds=(-2.0, 2.0),
-        input_data_hash="input-a",
+        input_data_hash=input_data_hash,
         evaluation_set_hash=evaluation_set_hash,
         compatibility=compatibility or compatible_hashes(),
         dependency_versions={"python": "3.11", "joblib": "1.5.3"},
@@ -120,6 +121,26 @@ def model_candidate(key, *, model_value=0.5, **metadata_options):
         metadata={"training_contract": "task-9"},
     )
     return ModelCandidate(key=key, bundle=bundle, metadata=metadata)
+
+
+def model_attempt(
+    registry,
+    key,
+    *,
+    input_data_hash="a" * 64,
+    evaluation_set_hash="e" * 64,
+    training_contract_hash="c" * 64,
+    feature_version="features-a",
+    champion=None,
+):
+    return registry.build_attempt(
+        key,
+        input_data_hash=input_data_hash,
+        evaluation_set_hash=evaluation_set_hash,
+        training_contract_hash=training_contract_hash,
+        feature_version=feature_version,
+        champion=champion,
+    )
 
 
 def training_frame():
@@ -1156,6 +1177,242 @@ def test_first_candidate_must_improve_over_physical_baseline(tmp_path):
     assert decision.promoted is False
     assert decision.reason == "candidate_not_better_than_physical"
     assert not registry.path_for(key).exists()
+
+
+def test_first_rejection_is_recorded_without_publishing_a_model(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    input_hash = "a" * 64
+    evaluation_hash = "e" * 64
+    candidate = model_candidate(
+        key,
+        corrected_mae=WEATHER_METRICS["baseline_mae"],
+        input_data_hash=input_hash,
+        evaluation_set_hash=evaluation_hash,
+    )
+    attempt = model_attempt(
+        registry,
+        key,
+        input_data_hash=input_hash,
+        evaluation_set_hash=evaluation_hash,
+    )
+
+    assert registry.was_rejected(attempt) is False
+    first = registry.promote(candidate, attempt=attempt)
+    second = registry.promote(candidate, attempt=attempt)
+
+    assert first.promoted is False
+    assert first.reason == "candidate_not_better_than_physical"
+    assert second.reason == first.reason
+    assert registry.was_rejected(attempt) is True
+    payload = json.loads(registry.attempt_path_for(key).read_text("utf-8"))
+    assert len(payload["entries"]) == 1
+    assert payload["entries"][0]["fingerprint"] == attempt.fingerprint
+    assert payload["entries"][0]["reason"] == first.reason
+    assert not registry.path_for(key).exists()
+    generation_root = registry.path_for(key).parent.parent / ".wind_speed.generations"
+    assert not generation_root.exists()
+
+
+def test_attempt_fingerprint_includes_threshold_contract_and_feature_version(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    low_threshold = ModelRegistry(tmp_path, min_mae_improvement=0.0)
+    recorded = model_attempt(low_threshold, key)
+    candidate = model_candidate(
+        key,
+        corrected_mae=WEATHER_METRICS["baseline_mae"],
+        input_data_hash=recorded.input_data_hash,
+        evaluation_set_hash=recorded.evaluation_set_hash,
+    )
+    low_threshold.promote(candidate, attempt=recorded)
+
+    changed_threshold = model_attempt(
+        ModelRegistry(tmp_path, min_mae_improvement=0.5),
+        key,
+    )
+    changed_contract = model_attempt(
+        low_threshold,
+        key,
+        training_contract_hash="d" * 64,
+    )
+    changed_features = model_attempt(
+        low_threshold,
+        key,
+        feature_version="features-b",
+    )
+
+    assert len(
+        {
+            recorded.fingerprint,
+            changed_threshold.fingerprint,
+            changed_contract.fingerprint,
+            changed_features.fingerprint,
+        }
+    ) == 4
+    assert ModelRegistry(tmp_path, min_mae_improvement=0.5).was_rejected(
+        changed_threshold
+    ) is False
+    assert low_threshold.was_rejected(changed_contract) is False
+    assert low_threshold.was_rejected(changed_features) is False
+
+
+def test_rejection_sidecar_preserves_active_and_historical_generations(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(
+        model_candidate(key, model_version="version-1", corrected_mae=1.0)
+    )
+    registry.promote(
+        model_candidate(key, model_version="version-2", corrected_mae=0.5)
+    )
+    loaded = registry.load(key, expected_compatibility=compatible_hashes())
+    target_dir = registry.path_for(key).parent
+    generation_root = target_dir.parent / ".wind_speed.generations"
+    generations_before = {path.name for path in generation_root.iterdir()}
+    active_pointer_before = os.readlink(target_dir)
+    artifacts_before = {
+        name: (target_dir / name).read_bytes()
+        for name in ("model.joblib", "metadata.json", "manifest.json")
+    }
+
+    for index in range(3):
+        input_hash = f"{index + 10:064x}"
+        evaluation_hash = f"{index + 20:064x}"
+        candidate = model_candidate(
+            key,
+            model_version=f"rejected-{index}",
+            corrected_mae=WEATHER_METRICS["baseline_mae"],
+            input_data_hash=input_hash,
+            evaluation_set_hash=evaluation_hash,
+        )
+        attempt = model_attempt(
+            registry,
+            key,
+            input_data_hash=input_hash,
+            evaluation_set_hash=evaluation_hash,
+            champion=loaded.metadata,
+        )
+        decision = registry.promote(candidate, attempt=attempt)
+        assert decision.reason == "candidate_not_better_than_physical"
+
+    reloaded = registry.load(key, expected_compatibility=compatible_hashes())
+    assert {path.name for path in generation_root.iterdir()} == generations_before
+    assert os.readlink(target_dir) == active_pointer_before
+    assert {
+        name: (target_dir / name).read_bytes()
+        for name in ("model.joblib", "metadata.json", "manifest.json")
+    } == artifacts_before
+    assert reloaded.metadata == loaded.metadata
+    assert reloaded.bundle.model.predict(np.zeros((1, 2))).tolist() == [0.5]
+
+
+def test_attempt_ledger_is_bounded_and_serialized_across_threads(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path, max_attempt_records=3)
+
+    def reject(index):
+        input_hash = f"{index + 100:064x}"
+        evaluation_hash = f"{index + 200:064x}"
+        attempt = model_attempt(
+            registry,
+            key,
+            input_data_hash=input_hash,
+            evaluation_set_hash=evaluation_hash,
+        )
+        candidate = model_candidate(
+            key,
+            model_version=f"rejected-{index}",
+            corrected_mae=WEATHER_METRICS["baseline_mae"],
+            input_data_hash=input_hash,
+            evaluation_set_hash=evaluation_hash,
+        )
+        return registry.promote(candidate, attempt=attempt)
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        decisions = list(executor.map(reject, range(8)))
+
+    payload = json.loads(registry.attempt_path_for(key).read_text("utf-8"))
+    assert all(not decision.promoted for decision in decisions)
+    assert len(payload["entries"]) == 3
+    assert len({entry["fingerprint"] for entry in payload["entries"]}) == 3
+    assert not [path for path in tmp_path.rglob("*") if path.name.endswith(".tmp")]
+
+
+def test_operational_rejection_and_attempt_write_failure_remain_retryable(
+    tmp_path,
+    monkeypatch,
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(
+        model_candidate(key, model_version="version-1", corrected_mae=1.0)
+    )
+    champion = registry.load(key, expected_compatibility=compatible_hashes()).metadata
+    conflict = model_candidate(
+        key,
+        model_version="version-1",
+        corrected_mae=0.5,
+        input_data_hash="b" * 64,
+        evaluation_set_hash=champion.evaluation_set_hash,
+    )
+    conflict_attempt = model_attempt(
+        registry,
+        key,
+        input_data_hash="b" * 64,
+        evaluation_set_hash=champion.evaluation_set_hash,
+        champion=champion,
+    )
+
+    conflict_decision = registry.promote(conflict, attempt=conflict_attempt)
+
+    assert conflict_decision.reason == "model_version_conflict"
+    assert registry.was_rejected(conflict_attempt) is False
+
+    poor = model_candidate(
+        key,
+        model_version="rejected",
+        corrected_mae=WEATHER_METRICS["baseline_mae"],
+        input_data_hash="c" * 64,
+        evaluation_set_hash="d" * 64,
+    )
+    poor_attempt = model_attempt(
+        registry,
+        key,
+        input_data_hash="c" * 64,
+        evaluation_set_hash="d" * 64,
+        champion=champion,
+    )
+
+    def fail_attempt_write(*args, **kwargs):
+        raise OSError("attempt ledger unavailable")
+
+    monkeypatch.setattr(registry, "_write_attempt_ledger_locked", fail_attempt_write)
+    failed = registry.promote(poor, attempt=poor_attempt)
+
+    assert failed.reason == "attempt_record_failed:OSError"
+    assert registry.was_rejected(poor_attempt) is False
+
+
+def test_corrupt_attempt_sidecar_does_not_affect_champion_loading(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(model_candidate(key, evaluation_mode="full_fit"))
+    attempt = model_attempt(
+        registry,
+        key,
+        evaluation_set_hash=None,
+        champion=registry.load(
+            key, expected_compatibility=compatible_hashes()
+        ).metadata,
+    )
+    attempt_path = registry.attempt_path_for(key)
+    attempt_path.write_bytes(b"not-json")
+
+    loaded = registry.load(key, expected_compatibility=compatible_hashes())
+
+    assert loaded.bundle is not None
+    assert loaded.fallback_reason == ""
+    assert registry.was_rejected(attempt) is False
 
 
 @pytest.mark.parametrize(

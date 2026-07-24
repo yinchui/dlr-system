@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -186,6 +188,95 @@ def test_training_preparation_reports_full_fit_for_one_continuous_block():
 
     assert preparation.evaluation_mode == "full_fit"
     assert preparation.evaluation_set_hash is None
+
+
+def _temporal_preparation():
+    trainer = ResidualTrainer(estimator_factory=constant_factory)
+    frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
+    return trainer, frame, trainer.prepare_target(frame, target="wind_speed")
+
+
+@pytest.mark.parametrize(
+    ("frame_attribute", "column"),
+    [
+        ("working", "wind_speed_truth"),
+        ("feature_frame", "timestamp"),
+    ],
+)
+def test_train_prepared_rejects_mutated_preparation_frames(
+    frame_attribute,
+    column,
+):
+    trainer, _, preparation = _temporal_preparation()
+    frame = getattr(preparation, frame_attribute)
+    if column == "timestamp":
+        frame.loc[frame.index[0], column] += pd.Timedelta(days=30)
+    else:
+        frame.loc[frame.index[0], column] += 100.0
+
+    with pytest.raises(ValueError, match="preparation|snapshot|integrity"):
+        trainer.train_prepared(preparation)
+
+
+def test_train_prepared_rejects_mutated_residual():
+    trainer, _, preparation = _temporal_preparation()
+    preparation.residual[0] += 100.0
+
+    with pytest.raises(ValueError, match="preparation|snapshot|integrity"):
+        trainer.train_prepared(preparation)
+
+
+def test_train_prepared_rejects_mutated_model_features():
+    trainer, _, preparation = _temporal_preparation()
+    preparation.model_features.iloc[0, 0] += 100.0
+
+    with pytest.raises(ValueError, match="preparation|snapshot|integrity"):
+        trainer.train_prepared(preparation)
+
+
+@pytest.mark.parametrize(
+    "split",
+    [
+        (np.array([-1, 0]), np.array([1, 2, 3])),
+        (np.array([0, 1]), np.array([1, 2, 3])),
+        (np.array([0]), np.array([2, 3])),
+    ],
+    ids=("out_of_bounds", "overlap", "incomplete"),
+)
+def test_train_prepared_rejects_invalid_split_indices(split):
+    trainer, _, preparation = _temporal_preparation()
+    tampered = replace(preparation, split=split)
+
+    with pytest.raises(ValueError, match="split|preparation|integrity"):
+        trainer.train_prepared(tampered)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("input_data_hash", "0" * 64),
+        ("evaluation_set_hash", "1" * 64),
+    ],
+)
+def test_train_prepared_rejects_forged_preparation_hashes(field, value):
+    trainer, _, preparation = _temporal_preparation()
+    tampered = replace(preparation, **{field: value})
+
+    with pytest.raises(ValueError, match="hash|preparation|integrity"):
+        trainer.train_prepared(tampered)
+
+
+def test_training_preparation_isolated_from_later_source_frame_changes():
+    trainer, source, preparation = _temporal_preparation()
+    expected_working = preparation.working.copy(deep=True)
+    expected_hash = preparation.input_data_hash
+    source.loc[:, "wind_speed_truth"] += 1000.0
+    source.loc[:, "timestamp"] += pd.Timedelta(days=60)
+
+    result = trainer.train_prepared(preparation)
+
+    pd.testing.assert_frame_equal(preparation.working, expected_working)
+    assert result.metadata["input_data_hash"] == expected_hash
 
 
 def test_single_sample_is_trained_without_rejection():

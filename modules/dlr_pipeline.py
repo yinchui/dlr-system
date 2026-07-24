@@ -240,6 +240,25 @@ class ModelRunReport:
         return len(set(self.used_targets))
 
 
+def _authoritative_fallbacks(
+    fallbacks: list[ModelFallback],
+) -> tuple[ModelFallback, ...]:
+    result = []
+    keyed = set()
+    global_reasons = set()
+    for fallback in fallbacks:
+        if fallback.key is None:
+            if fallback.reason in global_reasons:
+                continue
+            global_reasons.add(fallback.reason)
+        else:
+            if fallback.key in keyed:
+                continue
+            keyed.add(fallback.key)
+        result.append(fallback)
+    return tuple(result)
+
+
 def _dataframe_snapshot(frame: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(frame, pd.DataFrame):
         raise TypeError("weather stages must be pandas DataFrames")
@@ -1239,24 +1258,42 @@ class DlrPipeline:
                     )
                     tower_training = tower_training.loc[finite]
                     if tower_training.empty:
-                        fallbacks.append(ModelFallback(key, "no_aligned_truth"))
+                        if load_result is None or load_result.bundle is None:
+                            fallbacks.append(ModelFallback(key, "no_aligned_truth"))
                         continue
                     try:
                         if trainer is None:
                             trainer = self._trainer_for_interval(interval_minutes)
-                        if loaded_provisional:
+                        attempt = None
+                        if model_persistence_allowed:
                             preparation = trainer.prepare_target(
                                 tower_training,
                                 key.target,
                                 physical_col=physical_column,
                                 truth_col=truth_column,
                             )
-                            if (
+                            attempt = registry.build_attempt(
+                                key,
+                                input_data_hash=preparation.input_data_hash,
+                                evaluation_set_hash=(
+                                    preparation.evaluation_set_hash
+                                ),
+                                training_contract_hash=(
+                                    preparation.training_contract_hash
+                                ),
+                                feature_version=compatibility.feature_version,
+                                champion=(
+                                    load_result.metadata
+                                    if load_result is not None
+                                    and load_result.bundle is not None
+                                    else None
+                                ),
+                            )
+                            if registry.was_rejected(attempt):
+                                continue
+                            if loaded_provisional and (
                                 preparation.input_data_hash
-                                in {
-                                    load_result.metadata.input_data_hash,
-                                    load_result.metadata.last_attempted_input_data_hash,
-                                }
+                                == load_result.metadata.input_data_hash
                                 or preparation.evaluation_mode
                                 != "temporal_holdout"
                             ):
@@ -1302,7 +1339,10 @@ class DlrPipeline:
                                 ),
                                 compatibility=compatibility,
                             )
-                            decision = registry.promote(candidate)
+                            decision = registry.promote(
+                                candidate,
+                                attempt=attempt,
+                            )
                             promotion_decisions.append(
                                 ModelPromotionDecision(
                                     key=key,
@@ -1315,17 +1355,14 @@ class DlrPipeline:
                                 loaded[key] = registry.load(
                                     key, expected_compatibility=compatibility
                                 )
-                            elif (
-                                loaded.get(key) is None
-                                or loaded[key].bundle is None
-                            ):
-                                fallbacks.append(
-                                    ModelFallback(key, decision.reason)
-                                )
                     except Exception as exc:
-                        fallbacks.append(
-                            ModelFallback(key, f"training_failed:{type(exc).__name__}")
-                        )
+                        if load_result is None or load_result.bundle is None:
+                            fallbacks.append(
+                                ModelFallback(
+                                    key,
+                                    f"training_failed:{type(exc).__name__}",
+                                )
+                            )
 
         prediction = terrain_corrected.copy(deep=True)
         for target in _TARGETS:
@@ -1344,7 +1381,7 @@ class DlrPipeline:
                         load_result.fallback_reason
                         if load_result is not None
                         else "model_unavailable"
-                    )
+                    ) or "model_unavailable"
                     fallbacks.append(ModelFallback(key, reason))
                     continue
                 row_mask = prediction["tower_id"].astype(str) == key.tower_id
@@ -1472,7 +1509,7 @@ class DlrPipeline:
             trained_targets=tuple(trained_targets),
             loaded_targets=tuple(loaded_targets),
             used_targets=tuple(used_targets),
-            fallbacks=tuple(fallbacks),
+            fallbacks=_authoritative_fallbacks(fallbacks),
             promotion_decisions=tuple(promotion_decisions),
             alignment=alignment_report,
         )

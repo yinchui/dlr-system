@@ -55,6 +55,35 @@ _MANIFEST_FIELDS = frozenset(
 _GENERATION_ARTIFACTS = ("model.joblib", "metadata.json", "manifest.json")
 _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
+_ATTEMPT_POLICY_VERSION = "weather-promotion-v1"
+_ATTEMPT_LEDGER_FIELDS = frozenset(
+    {"schema_version", *_KEY_FIELDS, "entries"}
+)
+_ATTEMPT_ENTRY_FIELDS = frozenset(
+    {
+        *_KEY_FIELDS,
+        "input_data_hash",
+        "evaluation_set_hash",
+        "policy_version",
+        "min_mae_improvement",
+        "training_contract_hash",
+        "feature_version",
+        "champion_context_hash",
+        "fingerprint",
+        "reason",
+    }
+)
+_DETERMINISTIC_REJECTION_REASONS = frozenset(
+    {
+        "missing_evaluation_set_hash",
+        "candidate_not_better_than_physical",
+        "full_fit_cannot_replace_champion",
+        "insufficient_mae_improvement",
+        "champion_has_no_independent_evaluation",
+        "evaluation_set_mismatch",
+    }
+)
+_MAX_ATTEMPT_RECORD_LIMIT = 256
 
 
 def _validate_identifier(value: str, name: str) -> None:
@@ -380,6 +409,67 @@ class ModelLoadResult:
     fallback_reason: str = ""
 
 
+@dataclass(frozen=True)
+class ModelAttempt:
+    key: ModelKey
+    input_data_hash: str
+    evaluation_set_hash: Optional[str]
+    policy_version: str
+    min_mae_improvement: float
+    training_contract_hash: str
+    feature_version: str
+    champion_context_hash: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, ModelKey):
+            raise TypeError("key must be a ModelKey")
+        for name in (
+            "input_data_hash",
+            "policy_version",
+            "training_contract_hash",
+            "feature_version",
+        ):
+            _require_nonempty_string(getattr(self, name), name)
+        for name in ("evaluation_set_hash", "champion_context_hash"):
+            value = getattr(self, name)
+            if value is not None:
+                _require_nonempty_string(value, name)
+        if (
+            isinstance(self.min_mae_improvement, bool)
+            or not isinstance(self.min_mae_improvement, (int, float))
+            or not math.isfinite(float(self.min_mae_improvement))
+            or float(self.min_mae_improvement) < 0.0
+        ):
+            raise ValueError("min_mae_improvement must be finite and non-negative")
+        object.__setattr__(
+            self,
+            "min_mae_improvement",
+            float(self.min_mae_improvement),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **{name: getattr(self.key, name) for name in _KEY_FIELDS},
+            "input_data_hash": self.input_data_hash,
+            "evaluation_set_hash": self.evaluation_set_hash,
+            "policy_version": self.policy_version,
+            "min_mae_improvement": self.min_mae_improvement,
+            "training_contract_hash": self.training_contract_hash,
+            "feature_version": self.feature_version,
+            "champion_context_hash": self.champion_context_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ModelAttempt":
+        values = dict(payload)
+        key = ModelKey(**{name: values.pop(name) for name in _KEY_FIELDS})
+        return cls(key=key, **values)
+
+    @property
+    def fingerprint(self) -> str:
+        return hashlib.sha256(_json_bytes(self.to_dict())).hexdigest()
+
+
 def candidate_admission_reason(
     *,
     evaluation_mode: str,
@@ -519,6 +609,7 @@ class ModelRegistry:
         *,
         min_mae_improvement: float = 0.0,
         max_generations: int = 2,
+        max_attempt_records: int = 64,
     ):
         if (
             isinstance(max_generations, bool)
@@ -526,6 +617,15 @@ class ModelRegistry:
             or max_generations < 1
         ):
             raise ValueError("max_generations must be a positive integer")
+        if (
+            isinstance(max_attempt_records, bool)
+            or not isinstance(max_attempt_records, int)
+            or not 1 <= max_attempt_records <= _MAX_ATTEMPT_RECORD_LIMIT
+        ):
+            raise ValueError(
+                "max_attempt_records must be an integer between 1 and "
+                f"{_MAX_ATTEMPT_RECORD_LIMIT}"
+            )
         configured_root = Path(model_dir).expanduser()
         try:
             canonical_root = configured_root.resolve(strict=False)
@@ -555,6 +655,7 @@ class ModelRegistry:
             raise ValueError("min_mae_improvement must be finite and non-negative")
         self.min_mae_improvement = float(min_mae_improvement)
         self.max_generations = max_generations
+        self.max_attempt_records = max_attempt_records
 
     def _safe_directory(self, path: Path, *, create: bool) -> bool:
         try:
@@ -622,6 +723,10 @@ class ModelRegistry:
     def manifest_path_for(self, key: ModelKey) -> Path:
         return self._target_dir(key) / "manifest.json"
 
+    def attempt_path_for(self, key: ModelKey) -> Path:
+        target_dir = self._target_dir(key)
+        return target_dir.parent / f".{key.target}.attempts.json"
+
     def _generation_root(self, key: ModelKey) -> Path:
         target_dir = self._target_dir(key)
         return target_dir.parent / f".{key.target}.generations"
@@ -638,6 +743,172 @@ class ModelRegistry:
         self._safe_directory(lock_path.parent, create=True)
         _ensure_private_regular_file(lock_path)
         return FileLock(lock_path, mode=_PRIVATE_FILE_MODE)
+
+    @staticmethod
+    def _champion_context_hash(
+        champion: Optional[ModelMetadata],
+    ) -> Optional[str]:
+        if champion is None:
+            return None
+        if not isinstance(champion, ModelMetadata):
+            raise TypeError("champion must be ModelMetadata or None")
+        payload = {
+            "model_version": champion.model_version,
+            "checksum": champion.checksum,
+            "status": champion.status,
+            "evaluation_mode": champion.evaluation_mode,
+            "metrics": champion.metrics,
+            "full_fit_metrics": champion.full_fit_metrics,
+            "input_data_hash": champion.input_data_hash,
+            "evaluation_set_hash": champion.evaluation_set_hash,
+            "compatibility": champion.compatibility.to_dict(),
+        }
+        return hashlib.sha256(_json_bytes(payload)).hexdigest()
+
+    def build_attempt(
+        self,
+        key: ModelKey,
+        *,
+        input_data_hash: str,
+        evaluation_set_hash: Optional[str],
+        training_contract_hash: str,
+        feature_version: str,
+        champion: Optional[ModelMetadata] = None,
+    ) -> ModelAttempt:
+        if not isinstance(key, ModelKey):
+            raise TypeError("key must be a ModelKey")
+        if champion is not None and champion.key != key:
+            raise ValueError("champion scope does not match attempt key")
+        return ModelAttempt(
+            key=key,
+            input_data_hash=input_data_hash,
+            evaluation_set_hash=evaluation_set_hash,
+            policy_version=_ATTEMPT_POLICY_VERSION,
+            min_mae_improvement=self.min_mae_improvement,
+            training_contract_hash=training_contract_hash,
+            feature_version=feature_version,
+            champion_context_hash=self._champion_context_hash(champion),
+        )
+
+    def _read_attempt_ledger_locked(self, key: ModelKey) -> list[dict[str, Any]]:
+        path = self.attempt_path_for(key)
+        if not self._safe_directory(path.parent, create=False):
+            return []
+        try:
+            self._validate_artifact_path(path)
+            if not path.exists():
+                return []
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or set(payload) != _ATTEMPT_LEDGER_FIELDS:
+                raise ValueError("invalid attempt ledger schema")
+            if payload["schema_version"] != 1:
+                raise ValueError("unsupported attempt ledger schema")
+            if tuple(payload[name] for name in _KEY_FIELDS) != tuple(
+                getattr(key, name) for name in _KEY_FIELDS
+            ):
+                raise ValueError("attempt ledger scope mismatch")
+            entries = payload["entries"]
+            if (
+                not isinstance(entries, list)
+                or len(entries) > _MAX_ATTEMPT_RECORD_LIMIT
+            ):
+                raise ValueError("invalid attempt ledger entries")
+            normalized = []
+            fingerprints = set()
+            for raw_entry in entries:
+                if not isinstance(raw_entry, dict) or set(raw_entry) != (
+                    _ATTEMPT_ENTRY_FIELDS
+                ):
+                    raise ValueError("invalid attempt ledger entry")
+                entry = dict(raw_entry)
+                reason = entry.pop("reason")
+                fingerprint = entry.pop("fingerprint")
+                attempt = ModelAttempt.from_dict(entry)
+                if (
+                    attempt.key != key
+                    or fingerprint != attempt.fingerprint
+                    or fingerprint in fingerprints
+                    or reason not in _DETERMINISTIC_REJECTION_REASONS
+                ):
+                    raise ValueError("invalid attempt ledger entry contract")
+                fingerprints.add(fingerprint)
+                normalized.append(raw_entry)
+            return normalized
+        except (
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            UnsafeModelPathError,
+        ):
+            return []
+
+    def _write_attempt_ledger_locked(
+        self,
+        key: ModelKey,
+        entries: list[dict[str, Any]],
+    ) -> None:
+        path = self.attempt_path_for(key)
+        self._safe_directory(path.parent, create=True)
+        self._validate_artifact_path(path)
+        token = uuid.uuid4().hex
+        temp_path = path.parent / f".{key.target}.attempts.{token}.tmp"
+        payload = {
+            "schema_version": 1,
+            **{name: getattr(key, name) for name in _KEY_FIELDS},
+            "entries": entries[-self.max_attempt_records :],
+        }
+        committed = False
+        try:
+            _write_bytes(temp_path, _json_bytes(payload))
+            os.replace(temp_path, path)
+            committed = True
+            _enforce_private_mode(path, _PRIVATE_FILE_MODE)
+            try:
+                _fsync_directory(path.parent)
+            except Exception:
+                pass
+        finally:
+            if not committed:
+                try:
+                    if temp_path.exists() or temp_path.is_symlink():
+                        temp_path.unlink()
+                except Exception:
+                    pass
+
+    def _record_attempt_rejection_locked(
+        self,
+        attempt: ModelAttempt,
+        reason: str,
+    ) -> None:
+        entries = self._read_attempt_ledger_locked(attempt.key)
+        entries = [
+            entry
+            for entry in entries
+            if entry["fingerprint"] != attempt.fingerprint
+        ]
+        entries.append(
+            {
+                **attempt.to_dict(),
+                "fingerprint": attempt.fingerprint,
+                "reason": reason,
+            }
+        )
+        self._write_attempt_ledger_locked(attempt.key, entries)
+
+    def was_rejected(self, attempt: ModelAttempt) -> bool:
+        if not isinstance(attempt, ModelAttempt):
+            raise TypeError("attempt must be a ModelAttempt")
+        try:
+            with self._lock_for(attempt.key):
+                return any(
+                    entry["fingerprint"] == attempt.fingerprint
+                    for entry in self._read_attempt_ledger_locked(attempt.key)
+                )
+        except Exception:
+            return False
 
     @staticmethod
     def _fallback(reason: str) -> ModelLoadResult:
@@ -1020,36 +1291,59 @@ class ModelRegistry:
         current: ModelLoadResult,
         candidate: ModelCandidate,
         reason: str,
+        attempt: Optional[ModelAttempt],
     ) -> PromotionDecision:
         champion = current.metadata
-        if current.bundle is None or champion is None:
+        if (
+            attempt is None
+            or reason not in _DETERMINISTIC_REJECTION_REASONS
+        ):
             return PromotionDecision(False, reason, champion)
-        attempted_metadata = replace(
-            champion,
-            last_attempted_input_data_hash=candidate.metadata.input_data_hash,
+        current_attempt = self.build_attempt(
+            candidate.key,
+            input_data_hash=attempt.input_data_hash,
+            evaluation_set_hash=attempt.evaluation_set_hash,
+            training_contract_hash=attempt.training_contract_hash,
+            feature_version=attempt.feature_version,
+            champion=champion if current.bundle is not None else None,
         )
         try:
-            recorded = self._publish_locked(
-                ModelCandidate(
-                    key=candidate.key,
-                    bundle=current.bundle,
-                    metadata=attempted_metadata,
-                ),
-                status=champion.status,
-            )
-        except UnsafeModelPathError:
-            return PromotionDecision(False, "unsafe_model_path", champion)
+            self._record_attempt_rejection_locked(current_attempt, reason)
         except Exception as exc:
             return PromotionDecision(
                 False,
                 f"attempt_record_failed:{type(exc).__name__}",
                 champion,
             )
-        return PromotionDecision(False, reason, recorded)
+        return PromotionDecision(False, reason, champion)
 
-    def promote(self, candidate: ModelCandidate) -> PromotionDecision:
+    def promote(
+        self,
+        candidate: ModelCandidate,
+        *,
+        attempt: Optional[ModelAttempt] = None,
+    ) -> PromotionDecision:
         if not isinstance(candidate, ModelCandidate):
             raise TypeError("candidate must be a ModelCandidate")
+        if attempt is not None:
+            if not isinstance(attempt, ModelAttempt):
+                raise TypeError("attempt must be a ModelAttempt or None")
+            if (
+                attempt.key != candidate.key
+                or attempt.input_data_hash != candidate.metadata.input_data_hash
+                or attempt.evaluation_set_hash
+                != candidate.metadata.evaluation_set_hash
+                or attempt.feature_version
+                != candidate.metadata.compatibility.feature_version
+                or attempt.policy_version != _ATTEMPT_POLICY_VERSION
+                or not math.isclose(
+                    attempt.min_mae_improvement,
+                    self.min_mae_improvement,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise ValueError("attempt contract does not match candidate or registry")
         admission_reason = candidate_admission_reason(
             evaluation_mode=candidate.metadata.evaluation_mode,
             evaluation_set_hash=candidate.metadata.evaluation_set_hash,
@@ -1075,6 +1369,7 @@ class ModelRegistry:
                     current,
                     candidate,
                     admission_reason,
+                    attempt,
                 )
             if current.bundle is not None:
                 champion = current.metadata
@@ -1083,6 +1378,7 @@ class ModelRegistry:
                         current,
                         candidate,
                         "full_fit_cannot_replace_champion",
+                        attempt,
                     )
                 if (
                     champion.status == "active_provisional"
@@ -1096,6 +1392,7 @@ class ModelRegistry:
                             current,
                             candidate,
                             "model_version_conflict",
+                            attempt,
                         )
                     physical_improvement = (
                         candidate.metadata.metrics["baseline_mae"]
@@ -1109,6 +1406,7 @@ class ModelRegistry:
                             current,
                             candidate,
                             "insufficient_mae_improvement",
+                            attempt,
                         )
                     return self._publish_decision(
                         candidate,
@@ -1124,6 +1422,7 @@ class ModelRegistry:
                         current,
                         candidate,
                         "champion_has_no_independent_evaluation",
+                        attempt,
                     )
                 if (
                     candidate.metadata.evaluation_set_hash
@@ -1133,12 +1432,14 @@ class ModelRegistry:
                         current,
                         candidate,
                         "evaluation_set_mismatch",
+                        attempt,
                     )
                 if candidate.metadata.model_version == champion.model_version:
                     return self._record_rejection_locked(
                         current,
                         candidate,
                         "model_version_conflict",
+                        attempt,
                     )
                 improvement = (
                     champion.metrics["corrected_mae"]
@@ -1149,6 +1450,7 @@ class ModelRegistry:
                         current,
                         candidate,
                         "insufficient_mae_improvement",
+                        attempt,
                     )
                 return self._publish_decision(
                     candidate,

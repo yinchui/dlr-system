@@ -32,6 +32,7 @@ _TARGET_COLUMNS = {
         "truth": ("ambient_temp_truth", "truth_ambient_temp"),
     },
 }
+_TRAINING_CONTRACT_VERSION = "residual-training-v1"
 
 
 class ConstantResidualEstimator:
@@ -74,6 +75,7 @@ class TrainingPreparation:
     evaluation_mode: str
     evaluation_set_hash: Optional[str]
     cadence_minutes: float
+    training_contract_hash: str
 
 
 def _load_xgb_regressor():
@@ -160,6 +162,33 @@ def _stable_training_data_hash(
     )
     digest.update(row_hashes.tobytes())
     return digest.hexdigest()
+
+
+def _training_contract_hash(
+    *,
+    target: str,
+    physical_col: str,
+    truth_col: str,
+    feature_columns: Sequence[str],
+    cadence_minutes: float,
+) -> str:
+    payload = {
+        "version": _TRAINING_CONTRACT_VERSION,
+        "target": target,
+        "physical_col": physical_col,
+        "truth_col": truth_col,
+        "feature_columns": list(feature_columns),
+        "cadence_minutes": float(cadence_minutes),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _json_safe_training_value(value):
@@ -433,23 +462,25 @@ class ResidualTrainer:
         physical_col, truth_col = self._target_columns(
             working, target, physical_col, truth_col
         )
-        physical = self._finite_values(working, physical_col)
-        truth = self._finite_values(working, truth_col)
-        residual = truth - physical
+        physical = self._finite_values(working, physical_col).copy()
+        truth = self._finite_values(working, truth_col).copy()
+        residual = (truth - physical).copy()
         if not np.isfinite(residual).all():
             raise ValueError("weather residual must contain finite values")
 
         feature_frame = self.feature_builder.transform(
             working, physical_col=physical_col
-        )
+        ).copy(deep=True)
         feature_columns = tuple(
             self.feature_builder.feature_columns(physical_col)
         )
-        model_features = feature_frame.loc[:, list(feature_columns)]
+        model_features = feature_frame.loc[:, list(feature_columns)].copy(deep=True)
         if not np.isfinite(model_features.to_numpy(dtype=float)).all():
             raise ValueError("model features must contain finite values")
         segments = self.feature_builder.continuous_segments(working)
         split = self._time_split(feature_frame, segments)
+        if split is not None:
+            split = tuple(np.array(indices, dtype=np.int64, copy=True) for indices in split)
         lineage_columns = [
             column
             for column in (
@@ -483,6 +514,13 @@ class ResidualTrainer:
                 hash_columns,
                 target=target,
             )
+        training_contract_hash = _training_contract_hash(
+            target=target,
+            physical_col=physical_col,
+            truth_col=truth_col,
+            feature_columns=feature_columns,
+            cadence_minutes=self.feature_builder.cadence_minutes,
+        )
         return TrainingPreparation(
             target=target,
             line_id=line_id,
@@ -501,19 +539,137 @@ class ResidualTrainer:
             evaluation_mode=evaluation_mode,
             evaluation_set_hash=evaluation_set_hash,
             cadence_minutes=self.feature_builder.cadence_minutes,
+            training_contract_hash=training_contract_hash,
         )
+
+    @staticmethod
+    def _validate_preparation_split(
+        split: Optional[tuple[np.ndarray, np.ndarray]],
+        row_count: int,
+    ) -> None:
+        if split is None:
+            return
+        if not isinstance(split, tuple) or len(split) != 2:
+            raise ValueError("preparation split must contain train and holdout indices")
+        normalized = []
+        for name, positions in zip(("train", "holdout"), split):
+            values = np.asarray(positions)
+            if values.ndim != 1 or values.dtype.kind not in "iu":
+                raise ValueError(f"preparation {name} split indices must be integers")
+            if values.size == 0:
+                raise ValueError(f"preparation {name} split cannot be empty")
+            if (values < 0).any() or (values >= row_count).any():
+                raise ValueError(f"preparation {name} split indices are out of bounds")
+            if np.unique(values).size != values.size:
+                raise ValueError(f"preparation {name} split indices must be unique")
+            normalized.append(values.astype(np.int64, copy=False))
+        train_positions, holdout_positions = normalized
+        if np.intersect1d(train_positions, holdout_positions).size:
+            raise ValueError("preparation split indices must be mutually exclusive")
+
+    @staticmethod
+    def _assert_preparation_frame(
+        actual: pd.DataFrame,
+        expected: pd.DataFrame,
+        name: str,
+    ) -> None:
+        if not isinstance(actual, pd.DataFrame):
+            raise ValueError(f"preparation {name} must be a DataFrame")
+        try:
+            pd.testing.assert_frame_equal(
+                actual,
+                expected,
+                check_dtype=True,
+                check_exact=True,
+                check_like=False,
+            )
+        except AssertionError as exc:
+            raise ValueError(f"preparation {name} failed integrity validation") from exc
+
+    @staticmethod
+    def _assert_preparation_array(
+        actual: np.ndarray,
+        expected: np.ndarray,
+        name: str,
+    ) -> None:
+        if not isinstance(actual, np.ndarray):
+            raise ValueError(f"preparation {name} must be an ndarray")
+        if actual.dtype != expected.dtype or not np.array_equal(actual, expected):
+            raise ValueError(f"preparation {name} failed integrity validation")
+
+    def _validated_preparation(
+        self,
+        preparation: TrainingPreparation,
+    ) -> TrainingPreparation:
+        if not isinstance(preparation, TrainingPreparation):
+            raise TypeError("preparation must be a TrainingPreparation")
+        self._validate_preparation_split(preparation.split, len(preparation.working))
+        if not np.isclose(
+            preparation.cadence_minutes,
+            self.feature_builder.cadence_minutes,
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError("preparation cadence does not match trainer")
+
+        trusted = self.prepare_target(
+            preparation.working,
+            preparation.target,
+            physical_col=preparation.physical_col,
+            truth_col=preparation.truth_col,
+        )
+        scalar_fields = (
+            "target",
+            "line_id",
+            "tower_id",
+            "physical_col",
+            "truth_col",
+            "feature_columns",
+            "input_data_hash",
+            "evaluation_mode",
+            "evaluation_set_hash",
+            "cadence_minutes",
+            "training_contract_hash",
+        )
+        for field in scalar_fields:
+            if getattr(preparation, field) != getattr(trusted, field):
+                raise ValueError(f"preparation {field} failed integrity validation")
+
+        self._assert_preparation_frame(
+            preparation.working,
+            trusted.working,
+            "working",
+        )
+        self._assert_preparation_frame(
+            preparation.feature_frame,
+            trusted.feature_frame,
+            "feature_frame",
+        )
+        self._assert_preparation_frame(
+            preparation.model_features,
+            trusted.model_features,
+            "model_features",
+        )
+        for field in ("physical", "truth", "residual"):
+            self._assert_preparation_array(
+                getattr(preparation, field),
+                getattr(trusted, field),
+                field,
+            )
+
+        if (preparation.split is None) != (trusted.split is None):
+            raise ValueError("preparation split failed integrity validation")
+        if preparation.split is not None and trusted.split is not None:
+            for actual, expected in zip(preparation.split, trusted.split):
+                if not np.array_equal(actual, expected):
+                    raise ValueError("preparation split failed integrity validation")
+        return trusted
 
     def train_prepared(
         self,
         preparation: TrainingPreparation,
     ) -> TrainingResult:
-        if not isinstance(preparation, TrainingPreparation):
-            raise TypeError("preparation must be a TrainingPreparation")
-        if not np.isclose(
-            preparation.cadence_minutes,
-            self.feature_builder.cadence_minutes,
-        ):
-            raise ValueError("preparation cadence does not match trainer")
+        preparation = self._validated_preparation(preparation)
 
         target = preparation.target
         line_id = preparation.line_id
@@ -599,6 +755,7 @@ class ResidualTrainer:
             "evaluation_set_hash": evaluation_set_hash,
             "feature_columns": list(feature_columns),
             "cadence_minutes": self.feature_builder.cadence_minutes,
+            "training_contract_hash": preparation.training_contract_hash,
             "random_state": 42,
             "training_params": _estimator_training_params(final_estimator),
             "dependency_versions": _dependency_versions(),

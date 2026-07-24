@@ -55,6 +55,27 @@ class TrainingResult:
     metadata: dict
 
 
+@dataclass(frozen=True)
+class TrainingPreparation:
+    target: str
+    line_id: str
+    tower_id: str
+    physical_col: str
+    truth_col: str
+    working: pd.DataFrame
+    physical: np.ndarray
+    truth: np.ndarray
+    residual: np.ndarray
+    feature_frame: pd.DataFrame
+    feature_columns: tuple[str, ...]
+    model_features: pd.DataFrame
+    split: Optional[tuple[np.ndarray, np.ndarray]]
+    input_data_hash: str
+    evaluation_mode: str
+    evaluation_set_hash: Optional[str]
+    cadence_minutes: float
+
+
 def _load_xgb_regressor():
     from xgboost import XGBRegressor
 
@@ -400,14 +421,14 @@ class ResidualTrainer:
             return None
         return np.flatnonzero(train_mask), np.flatnonzero(holdout_mask)
 
-    def train_target(
+    def prepare_target(
         self,
         frame: pd.DataFrame,
         target: str,
         *,
         physical_col: Optional[str] = None,
         truth_col: Optional[str] = None,
-    ) -> TrainingResult:
+    ) -> TrainingPreparation:
         working, line_id, tower_id = self._validated_scope(frame)
         physical_col, truth_col = self._target_columns(
             working, target, physical_col, truth_col
@@ -421,8 +442,10 @@ class ResidualTrainer:
         feature_frame = self.feature_builder.transform(
             working, physical_col=physical_col
         )
-        feature_columns = self.feature_builder.feature_columns(physical_col)
-        model_features = feature_frame.loc[:, feature_columns]
+        feature_columns = tuple(
+            self.feature_builder.feature_columns(physical_col)
+        )
+        model_features = feature_frame.loc[:, list(feature_columns)]
         if not np.isfinite(model_features.to_numpy(dtype=float)).all():
             raise ValueError("model features must contain finite values")
         segments = self.feature_builder.continuous_segments(working)
@@ -438,22 +461,77 @@ class ResidualTrainer:
             )
             if column in feature_frame.columns
         ]
-        hash_columns = [
+        hash_columns = (
             "line_id",
             "tower_id",
             "timestamp",
             *lineage_columns,
             *feature_columns,
             truth_col,
-        ]
+        )
         input_data_hash = _stable_training_data_hash(
             feature_frame,
             hash_columns,
             target=target,
         )
+        evaluation_mode = "full_fit" if split is None else "temporal_holdout"
+        evaluation_set_hash = None
+        if split is not None:
+            _, holdout_positions = split
+            evaluation_set_hash = _stable_training_data_hash(
+                feature_frame.iloc[holdout_positions],
+                hash_columns,
+                target=target,
+            )
+        return TrainingPreparation(
+            target=target,
+            line_id=line_id,
+            tower_id=tower_id,
+            physical_col=physical_col,
+            truth_col=truth_col,
+            working=working,
+            physical=physical,
+            truth=truth,
+            residual=residual,
+            feature_frame=feature_frame,
+            feature_columns=feature_columns,
+            model_features=model_features,
+            split=split,
+            input_data_hash=input_data_hash,
+            evaluation_mode=evaluation_mode,
+            evaluation_set_hash=evaluation_set_hash,
+            cadence_minutes=self.feature_builder.cadence_minutes,
+        )
+
+    def train_prepared(
+        self,
+        preparation: TrainingPreparation,
+    ) -> TrainingResult:
+        if not isinstance(preparation, TrainingPreparation):
+            raise TypeError("preparation must be a TrainingPreparation")
+        if not np.isclose(
+            preparation.cadence_minutes,
+            self.feature_builder.cadence_minutes,
+        ):
+            raise ValueError("preparation cadence does not match trainer")
+
+        target = preparation.target
+        line_id = preparation.line_id
+        tower_id = preparation.tower_id
+        physical_col = preparation.physical_col
+        truth_col = preparation.truth_col
+        working = preparation.working
+        physical = preparation.physical
+        truth = preparation.truth
+        residual = preparation.residual
+        feature_frame = preparation.feature_frame
+        feature_columns = preparation.feature_columns
+        model_features = preparation.model_features
+        split = preparation.split
+        input_data_hash = preparation.input_data_hash
 
         if split is None:
-            evaluation_mode = "full_fit"
+            evaluation_mode = preparation.evaluation_mode
             independent_evaluation = False
             final_estimator, final_reason = self._fit_estimator(
                 model_features, residual
@@ -470,10 +548,10 @@ class ResidualTrainer:
                 final_reason = prediction_reason
             full_fit_metrics = _metric_values(physical, truth, corrected)
             metrics = {}
-            evaluation_set_hash = None
+            evaluation_set_hash = preparation.evaluation_set_hash
             evaluation_reason = final_reason
         else:
-            evaluation_mode = "temporal_holdout"
+            evaluation_mode = preparation.evaluation_mode
             independent_evaluation = True
             train_positions, holdout_positions = split
             evaluation_estimator, evaluation_reason = self._fit_estimator(
@@ -496,11 +574,7 @@ class ResidualTrainer:
                 truth[holdout_positions],
                 corrected,
             )
-            evaluation_set_hash = _stable_training_data_hash(
-                feature_frame.iloc[holdout_positions],
-                hash_columns,
-                target=target,
-            )
+            evaluation_set_hash = preparation.evaluation_set_hash
             final_estimator, final_reason = self._fit_estimator(
                 model_features, residual
             )
@@ -523,7 +597,7 @@ class ResidualTrainer:
             "metric_domain": "weather_vs_truth",
             "input_data_hash": input_data_hash,
             "evaluation_set_hash": evaluation_set_hash,
-            "feature_columns": feature_columns.copy(),
+            "feature_columns": list(feature_columns),
             "cadence_minutes": self.feature_builder.cadence_minutes,
             "random_state": 42,
             "training_params": _estimator_training_params(final_estimator),
@@ -537,7 +611,7 @@ class ResidualTrainer:
 
         bundle = ModelBundle(
             target_name=target,
-            feature_columns=feature_columns.copy(),
+            feature_columns=list(feature_columns),
             model=final_estimator,
             cadence_minutes=self.feature_builder.cadence_minutes,
             residual_bounds=final_bounds,
@@ -553,6 +627,22 @@ class ResidualTrainer:
             metrics=metrics,
             metadata=metadata,
         )
+
+    def train_target(
+        self,
+        frame: pd.DataFrame,
+        target: str,
+        *,
+        physical_col: Optional[str] = None,
+        truth_col: Optional[str] = None,
+    ) -> TrainingResult:
+        preparation = self.prepare_target(
+            frame,
+            target,
+            physical_col=physical_col,
+            truth_col=truth_col,
+        )
+        return self.train_prepared(preparation)
 
     def train_many(
         self,

@@ -7,7 +7,7 @@ from plotly.subplots import make_subplots
 from datetime import datetime
 from thermal_functions import ThermalCalculator, EnvironmentGenerator, LineAnalyzer
 from modules.data_processor import normalize_weather_input_dataframe
-from modules.dlr_pipeline import DlrPipeline, derive_line_id
+from modules.dlr_pipeline import DlrPipeline, derive_line_identity
 from modules import terrain as terrain_module
 from modules.weather_correction import CorrectionOptions, WeatherCorrectionService
 from modules.weather_upload import (
@@ -705,7 +705,7 @@ with tab_line:
             progress_bar.progress(60)
             status_text.text("正在修正气象并进行热平衡计算...")
             pipeline = DlrPipeline()
-            line_id = derive_line_id(
+            line_identity = derive_line_identity(
                 physical_snapshot,
                 tower_coords=st.session_state.tower_coords,
             )
@@ -713,7 +713,8 @@ with tab_line:
                 physical=physical_snapshot,
                 truth=truth_snapshot,
                 project_id="shagehuang-dlr",
-                line_id=line_id,
+                line_id=line_identity.line_id,
+                model_persistence_allowed=line_identity.persistence_allowed,
                 interval_minutes=int(time_res),
                 terrain_lookup=terrain_data,
                 dem_context=st.session_state.dem_data,

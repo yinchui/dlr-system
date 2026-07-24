@@ -19,7 +19,9 @@ from modules.ai_training import ResidualTrainer
 from modules.model_registry import (
     ModelCompatibility,
     ModelKey,
+    ModelLoadResult,
     ModelRegistry,
+    candidate_admission_reason,
     candidate_from_training_result,
 )
 from modules.thermal_engine import LineAnalyzer, ThermalCalculator
@@ -218,11 +220,19 @@ class ModelFallback:
 
 
 @dataclass(frozen=True)
+class ModelPromotionDecision:
+    key: ModelKey
+    promoted: bool
+    reason: str
+
+
+@dataclass(frozen=True)
 class ModelRunReport:
     trained_targets: tuple[ModelKey, ...] = ()
     loaded_targets: tuple[ModelKey, ...] = ()
     used_targets: tuple[ModelKey, ...] = ()
     fallbacks: tuple[ModelFallback, ...] = ()
+    promotion_decisions: tuple[ModelPromotionDecision, ...] = ()
     alignment: Optional[AlignmentReport] = None
 
     @property
@@ -700,6 +710,19 @@ def _finite_coordinate(value: Any) -> Optional[float]:
     return 0.0 if coordinate == 0.0 else coordinate
 
 
+def _valid_coordinate_pair(
+    longitude: Any,
+    latitude: Any,
+) -> Optional[tuple[float, float]]:
+    lon = _finite_coordinate(longitude)
+    lat = _finite_coordinate(latitude)
+    if lon is None or lat is None:
+        return None
+    if not -180.0 <= lon <= 180.0 or not -90.0 <= lat <= 90.0:
+        return None
+    return lon, lat
+
+
 def _nonempty_text_values(values: Any) -> tuple[str, ...]:
     if values is None:
         return ()
@@ -742,12 +765,19 @@ def _line_source_lineage(
     return ()
 
 
-def derive_line_id(
+@dataclass(frozen=True)
+class DerivedLineIdentity:
+    line_id: str
+    persistence_allowed: bool
+    reason: str
+
+
+def derive_line_identity(
     weather: Any,
     *,
     tower_coords: Optional[Mapping[Any, Any]] = None,
-) -> str:
-    """Derive a stable model namespace from tower topology and coordinates."""
+) -> DerivedLineIdentity:
+    """Derive a persistent identity only from a complete coordinate topology."""
     frame = weather.frame if isinstance(weather, WeatherUploadResult) else weather
     if not isinstance(frame, pd.DataFrame):
         raise TypeError("weather must be a DataFrame or WeatherUploadResult")
@@ -757,11 +787,17 @@ def derive_line_id(
     if not tower_ids:
         raise ValueError("weather must contain at least one tower")
 
-    coordinates_by_id = {
-        str(key): value
-        for key, value in (tower_coords or {}).items()
-        if isinstance(value, Mapping)
-    }
+    explicit_coordinates: dict[str, set[tuple[float, float]]] = {}
+    for key, value in (tower_coords or {}).items():
+        if not isinstance(value, Mapping):
+            continue
+        pair = _valid_coordinate_pair(
+            value.get("lon", value.get("longitude")),
+            value.get("lat", value.get("latitude")),
+        )
+        if pair is not None:
+            explicit_coordinates.setdefault(str(key), set()).add(pair)
+
     weather_coordinates: dict[str, set[tuple[float, float]]] = {}
     if {"longitude", "latitude"} <= set(frame.columns):
         projection = frame.loc[
@@ -769,47 +805,62 @@ def derive_line_id(
         ].copy()
         projection["tower_id"] = projection["tower_id"].astype(str)
         for row in projection.itertuples(index=False):
-            longitude = _finite_coordinate(row.longitude)
-            latitude = _finite_coordinate(row.latitude)
-            if longitude is not None and latitude is not None:
-                weather_coordinates.setdefault(str(row.tower_id), set()).add(
-                    (longitude, latitude)
-                )
+            pair = _valid_coordinate_pair(row.longitude, row.latitude)
+            if pair is not None:
+                weather_coordinates.setdefault(str(row.tower_id), set()).add(pair)
 
-    selected_coordinates = []
+    coordinate_candidates = {}
     for tower_id in tower_ids:
-        coordinates = coordinates_by_id.get(tower_id, {})
-        longitude = _finite_coordinate(
-            coordinates.get("lon", coordinates.get("longitude"))
+        candidates = explicit_coordinates.get(tower_id)
+        if not candidates:
+            candidates = weather_coordinates.get(tower_id, set())
+        coordinate_candidates[tower_id] = tuple(sorted(candidates))
+
+    ambiguous = any(
+        len(candidates) > 1 for candidates in coordinate_candidates.values()
+    )
+    missing = any(
+        len(candidates) == 0 for candidates in coordinate_candidates.values()
+    )
+    if not ambiguous and not missing:
+        selected_coordinates = tuple(
+            (tower_id, *coordinate_candidates[tower_id][0])
+            for tower_id in tower_ids
         )
-        latitude = _finite_coordinate(
-            coordinates.get("lat", coordinates.get("latitude"))
-        )
-        if longitude is not None and latitude is not None:
-            selected_coordinates.append((tower_id, longitude, latitude))
-            continue
-        selected_coordinates.extend(
-            (tower_id, weather_lon, weather_lat)
-            for weather_lon, weather_lat in sorted(
-                weather_coordinates.get(tower_id, set())
-            )
+        payload = {
+            "version": "line-identity-v4",
+            "tower_ids": tower_ids,
+            "coordinates": selected_coordinates,
+        }
+        return DerivedLineIdentity(
+            line_id=f"line-coordinates-{_stable_hash(payload)[:24]}",
+            persistence_allowed=True,
+            reason="complete_coordinates",
         )
 
-    payload = {"version": "line-identity-v3", "tower_ids": tower_ids}
-    if selected_coordinates:
-        mode = "coordinates"
-        payload["coordinates"] = selected_coordinates
-    else:
-        source_lineage = _line_source_lineage(weather, frame)
-        if source_lineage:
-            mode = "lineage"
-            payload["source_file_hashes"] = source_lineage
-        else:
-            mode = "weather"
-            payload["weather_content_hash"] = _stable_hash(
-                _canonical_weather_content(frame).to_dict(orient="records")
-            )
-    return f"line-{mode}-{_stable_hash(payload)[:24]}"
+    payload = {
+        "version": "line-runtime-v1",
+        "tower_ids": tower_ids,
+        "coordinate_candidates": coordinate_candidates,
+        "source_file_hashes": _line_source_lineage(weather, frame),
+        "weather_content_hash": _stable_hash(
+            _canonical_weather_content(frame).to_dict(orient="records")
+        ),
+    }
+    return DerivedLineIdentity(
+        line_id=f"line-runtime-{_stable_hash(payload)[:24]}",
+        persistence_allowed=False,
+        reason="ambiguous_coordinates" if ambiguous else "missing_coordinates",
+    )
+
+
+def derive_line_id(
+    weather: Any,
+    *,
+    tower_coords: Optional[Mapping[Any, Any]] = None,
+) -> str:
+    """Compatibility wrapper returning only the derived namespace string."""
+    return derive_line_identity(weather, tower_coords=tower_coords).line_id
 
 
 class DlrPipeline:
@@ -1057,6 +1108,7 @@ class DlrPipeline:
         conductor: Mapping[str, Any],
         truth_tolerance: Any = "30min",
         model_compatibility: Optional[ModelCompatibility] = None,
+        model_persistence_allowed: bool = True,
         transient_request: Optional[Mapping[str, Any]] = None,
     ) -> DlrPipelineResult:
         options = correction_options or CorrectionOptions()
@@ -1082,39 +1134,57 @@ class DlrPipeline:
         trained_targets = []
         used_targets = []
         fallbacks: list[ModelFallback] = []
+        promotion_decisions: list[ModelPromotionDecision] = []
         aligned = None
         alignment_report = None
+        model_ready = False
 
         if ai_enabled:
-            registry = self._registry_for_ai()
-            compatibility = (
-                model_compatibility
-                if model_compatibility is not None
-                else self._compatibility(
-                    terrain_corrected,
-                    conductor=conductor,
-                    correction_options=options,
-                    interval_minutes=interval_minutes,
-                    dem_context=dem_context,
-                    coordinate_context=coordinate_context,
+            try:
+                keys = [
+                    ModelKey(str(project_id), str(line_id), str(tower_id), target)
+                    for tower_id in sorted(
+                        terrain_corrected["tower_id"].astype(str).unique()
+                    )
+                    for target in _TARGETS
+                ]
+                if model_persistence_allowed:
+                    registry = self._registry_for_ai()
+                    compatibility = (
+                        model_compatibility
+                        if model_compatibility is not None
+                        else self._compatibility(
+                            terrain_corrected,
+                            conductor=conductor,
+                            correction_options=options,
+                            interval_minutes=interval_minutes,
+                            dem_context=dem_context,
+                            coordinate_context=coordinate_context,
+                        )
+                    )
+                    loaded = registry.load_many(
+                        keys,
+                        expected_compatibility={
+                            key: compatibility for key in keys
+                        },
+                    )
+                    loaded_targets = [
+                        key for key in keys if loaded[key].bundle is not None
+                    ]
+                model_ready = True
+            except Exception as exc:
+                keys = []
+                loaded = {}
+                registry = None
+                compatibility = None
+                fallbacks.append(
+                    ModelFallback(
+                        None,
+                        f"model_preparation_failed:{type(exc).__name__}",
+                    )
                 )
-            )
-            keys = [
-                ModelKey(str(project_id), str(line_id), str(tower_id), target)
-                for tower_id in sorted(
-                    terrain_corrected["tower_id"].astype(str).unique()
-                )
-                for target in _TARGETS
-            ]
-            loaded = registry.load_many(
-                keys,
-                expected_compatibility={key: compatibility for key in keys},
-            )
-            loaded_targets = [
-                key for key in keys if loaded[key].bundle is not None
-            ]
 
-        if ai_enabled and truth is not None:
+        if model_ready and truth is not None:
             try:
                 truth_frame = self._weather_frame(truth, role="truth")
                 if _weather_content_overlaps(physical_input, truth_frame):
@@ -1145,7 +1215,18 @@ class DlrPipeline:
                 matched = aligned.loc[aligned["truth_timestamp"].notna()].copy()
                 for key in keys:
                     load_result = loaded.get(key)
-                    if load_result is not None and load_result.bundle is not None:
+                    loaded_provisional = (
+                        load_result is not None
+                        and load_result.bundle is not None
+                        and load_result.metadata is not None
+                        and load_result.metadata.status == "active_provisional"
+                        and load_result.metadata.evaluation_mode == "full_fit"
+                    )
+                    if (
+                        load_result is not None
+                        and load_result.bundle is not None
+                        and not loaded_provisional
+                    ):
                         continue
                     tower_training = matched.loc[
                         matched["tower_id"].astype(str) == key.tower_id
@@ -1163,26 +1244,84 @@ class DlrPipeline:
                     try:
                         if trainer is None:
                             trainer = self._trainer_for_interval(interval_minutes)
-                        training = trainer.train_target(
-                            tower_training,
-                            key.target,
-                            physical_col=physical_column,
-                            truth_col=truth_column,
-                        )
-                        candidate = candidate_from_training_result(
-                            training,
-                            project_id=str(project_id),
-                            model_version=f"train-{training.metadata['input_data_hash'][:24]}",
-                            compatibility=compatibility,
-                        )
-                        decision = registry.promote(candidate)
-                        if decision.promoted:
-                            trained_targets.append(key)
-                            loaded[key] = registry.load(
-                                key, expected_compatibility=compatibility
+                        if loaded_provisional:
+                            preparation = trainer.prepare_target(
+                                tower_training,
+                                key.target,
+                                physical_col=physical_column,
+                                truth_col=truth_column,
                             )
-                        elif loaded.get(key) is None or loaded[key].bundle is None:
-                            fallbacks.append(ModelFallback(key, decision.reason))
+                            if (
+                                preparation.input_data_hash
+                                in {
+                                    load_result.metadata.input_data_hash,
+                                    load_result.metadata.last_attempted_input_data_hash,
+                                }
+                                or preparation.evaluation_mode
+                                != "temporal_holdout"
+                            ):
+                                continue
+                            training = trainer.train_prepared(preparation)
+                        else:
+                            training = trainer.train_target(
+                                tower_training,
+                                key.target,
+                                physical_col=physical_column,
+                                truth_col=truth_column,
+                            )
+                        if not model_persistence_allowed:
+                            admission_reason = candidate_admission_reason(
+                                evaluation_mode=training.metadata[
+                                    "evaluation_mode"
+                                ],
+                                evaluation_set_hash=training.metadata.get(
+                                    "evaluation_set_hash"
+                                ),
+                                metrics=training.metrics,
+                                full_fit_metrics=training.metadata.get(
+                                    "full_fit_metrics"
+                                ),
+                            )
+                            if admission_reason:
+                                fallbacks.append(
+                                    ModelFallback(key, admission_reason)
+                                )
+                                continue
+                            trained_targets.append(key)
+                            loaded[key] = ModelLoadResult(
+                                bundle=training.bundle,
+                                metadata=None,
+                            )
+                        else:
+                            candidate = candidate_from_training_result(
+                                training,
+                                project_id=str(project_id),
+                                model_version=(
+                                    "train-"
+                                    f"{training.metadata['input_data_hash'][:24]}"
+                                ),
+                                compatibility=compatibility,
+                            )
+                            decision = registry.promote(candidate)
+                            promotion_decisions.append(
+                                ModelPromotionDecision(
+                                    key=key,
+                                    promoted=decision.promoted,
+                                    reason=decision.reason,
+                                )
+                            )
+                            if decision.promoted:
+                                trained_targets.append(key)
+                                loaded[key] = registry.load(
+                                    key, expected_compatibility=compatibility
+                                )
+                            elif (
+                                loaded.get(key) is None
+                                or loaded[key].bundle is None
+                            ):
+                                fallbacks.append(
+                                    ModelFallback(key, decision.reason)
+                                )
                     except Exception as exc:
                         fallbacks.append(
                             ModelFallback(key, f"training_failed:{type(exc).__name__}")
@@ -1197,7 +1336,7 @@ class DlrPipeline:
                 "model_unavailable" if ai_enabled else "ai_disabled"
             )
 
-        if ai_enabled:
+        if model_ready:
             for key in keys:
                 load_result = loaded.get(key)
                 if load_result is None or load_result.bundle is None:
@@ -1334,6 +1473,7 @@ class DlrPipeline:
             loaded_targets=tuple(loaded_targets),
             used_targets=tuple(used_targets),
             fallbacks=tuple(fallbacks),
+            promotion_decisions=tuple(promotion_decisions),
             alignment=alignment_report,
         )
         return DlrPipelineResult(

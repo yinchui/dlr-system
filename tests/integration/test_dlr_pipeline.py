@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import joblib
@@ -9,6 +10,7 @@ from affine import Affine
 from pyproj import CRS
 from rasterio.coords import BoundingBox
 
+from modules import dlr_pipeline as dlr_pipeline_module
 from modules.ai_prediction import FeatureBuilder, ModelBundle, ResidualPredictor
 from modules.ai_training import ResidualTrainer
 from modules.dlr_pipeline import (
@@ -18,7 +20,7 @@ from modules.dlr_pipeline import (
     ModelRunReport,
     derive_line_id,
 )
-from modules.model_registry import ModelKey, ModelLoadResult
+from modules.model_registry import ModelKey, ModelLoadResult, ModelRegistry
 from modules.terrain import DemGrid
 from modules.weather_correction import CorrectionOptions
 
@@ -150,32 +152,207 @@ def test_derived_line_id_without_coordinates_or_lineage_uses_weather_content():
     )
 
 
-def test_derived_line_id_reuses_models_for_the_same_reordered_upload(tmp_path):
+def test_partial_coordinates_make_derived_line_identity_nonpersistent():
     physical = _weather("physical")
-    reordered = physical.iloc[::-1].reset_index(drop=True)
-    line_id = derive_line_id(physical, tower_coords={})
-    pipeline = DlrPipeline(model_root=tmp_path)
 
-    first = pipeline.run(
+    identity = dlr_pipeline_module.derive_line_identity(
+        physical,
+        tower_coords={"001": {"lon": 120.1, "lat": 40.1}},
+    )
+
+    assert identity.persistence_allowed is False
+    assert identity.reason == "missing_coordinates"
+
+
+def test_ambiguous_or_invalid_coordinates_are_not_persistent():
+    physical = _weather("physical").assign(
+        longitude=[120.1, 120.2, 121.0, 121.0],
+        latitude=[40.1, 40.2, 41.0, 41.0],
+    )
+
+    ambiguous = dlr_pipeline_module.derive_line_identity(
+        physical,
+        tower_coords={},
+    )
+    invalid = dlr_pipeline_module.derive_line_identity(
+        _weather("physical"),
+        tower_coords={
+            "001": {"lon": 999.0, "lat": 40.1},
+            "002": {"lon": 121.0, "lat": 41.0},
+        },
+    )
+    authoritative = dlr_pipeline_module.derive_line_identity(
+        physical,
+        tower_coords={
+            "001": {"lon": 120.1, "lat": 40.1},
+            "002": {"lon": 121.0, "lat": 41.0},
+        },
+    )
+
+    assert ambiguous.persistence_allowed is False
+    assert ambiguous.reason == "ambiguous_coordinates"
+    assert invalid.persistence_allowed is False
+    assert authoritative.persistence_allowed is True
+
+
+def test_complete_coordinate_identity_is_stable_across_new_weather_batches():
+    coordinates = {
+        "001": {"lon": 120.1, "lat": 40.1},
+        "002": {"lon": 121.0, "lat": 41.0},
+    }
+    first = _weather("physical")
+    later = first.iloc[::-1].reset_index(drop=True)
+    later["timestamp"] += pd.Timedelta(days=7)
+    later["ambient_temp"] += 8.0
+    later["source_file_hash"] = "new-export"
+
+    first_identity = dlr_pipeline_module.derive_line_identity(
+        first, tower_coords=coordinates
+    )
+    later_identity = dlr_pipeline_module.derive_line_identity(
+        later, tower_coords=coordinates
+    )
+    other_line = dlr_pipeline_module.derive_line_identity(
+        later,
+        tower_coords=coordinates
+        | {"002": {"lon": 121.001, "lat": 41.0}},
+    )
+
+    assert first_identity.persistence_allowed is True
+    assert later_identity.persistence_allowed is True
+    assert first_identity.line_id == later_identity.line_id
+    assert other_line.line_id != first_identity.line_id
+
+
+def test_nonpersistent_identity_uses_models_only_within_the_current_run(
+    tmp_path,
+):
+    trainer = _CountingTrainer()
+    pipeline = DlrPipeline(model_root=tmp_path, trainer=trainer)
+    identity = dlr_pipeline_module.derive_line_identity(
+        _weather("physical"),
+        tower_coords={"001": {"lon": 120.1, "lat": 40.1}},
+    )
+    run_kwargs = {
+        "physical": _weather("physical"),
+        "project_id": "project-a",
+        "line_id": identity.line_id,
+        "model_persistence_allowed": identity.persistence_allowed,
+        "terrain_lookup": {},
+        "ai_enabled": True,
+        "conductor": _conductor(),
+    }
+
+    trained = pipeline.run(
+        **run_kwargs,
+        truth=_weather("truth", truth_offset=True),
+    )
+    later = pipeline.run(**run_kwargs, truth=None)
+
+    assert len(trained.model_report.trained_targets) == 4
+    assert len(trained.model_report.used_targets) == 4
+    assert trained.model_report.loaded_targets == ()
+    assert trained.comparison_weather[
+        ["wind_speed_used_ai", "ambient_temp_used_ai"]
+    ].to_numpy().all()
+    assert later.model_report.loaded_targets == ()
+    assert later.model_report.trained_targets == ()
+    assert later.model_report.used_targets == ()
+    assert len(trainer.calls) == 4
+    assert pipeline.registry is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_nonpersistent_identity_rejects_model_not_better_than_physical(
+    tmp_path,
+):
+    class ZeroResidualEstimator:
+        def fit(self, features, target):
+            return self
+
+        def predict(self, features):
+            return np.zeros(len(features), dtype=float)
+
+    physical = _weather("physical")
+    truth = _weather("truth", truth_offset=True)
+    truth["wind_speed"] = physical["wind_speed"] + [-1.0, 1.0, -1.0, 1.0]
+    truth["ambient_temp"] = physical["ambient_temp"] + [-1.0, 1.0, -1.0, 1.0]
+    identity = dlr_pipeline_module.derive_line_identity(
+        physical,
+        tower_coords={"001": {"lon": 120.1, "lat": 40.1}},
+    )
+    result = DlrPipeline(
+        model_root=tmp_path,
+        trainer=ResidualTrainer(estimator_factory=ZeroResidualEstimator),
+    ).run(
+        physical=physical,
+        truth=truth,
+        project_id="project-a",
+        line_id=identity.line_id,
+        model_persistence_allowed=identity.persistence_allowed,
+        terrain_lookup={},
+        correction_options=CorrectionOptions(
+            enable_vertical=False,
+            enable_terrain=False,
+            enable_desert=False,
+            enable_wind_direction=False,
+        ),
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    assert result.model_report.trained_targets == ()
+    assert result.model_report.used_targets == ()
+    assert sum(
+        fallback.reason == "candidate_not_better_than_physical"
+        for fallback in result.model_report.fallbacks
+    ) == 4
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_complete_coordinate_identity_reuses_models_for_new_weather_batch(
+    tmp_path,
+):
+    coordinates = {
+        "001": {"lon": 120.1, "lat": 40.1},
+        "002": {"lon": 121.0, "lat": 41.0},
+    }
+    physical = _weather("physical")
+    first_identity = dlr_pipeline_module.derive_line_identity(
+        physical, tower_coords=coordinates
+    )
+    first = DlrPipeline(model_root=tmp_path).run(
         physical=physical,
         truth=_weather("truth", truth_offset=True),
         project_id="project-a",
-        line_id=line_id,
+        line_id=first_identity.line_id,
+        model_persistence_allowed=first_identity.persistence_allowed,
         terrain_lookup={},
+        coordinate_context=coordinates,
         ai_enabled=True,
         conductor=_conductor(),
     )
-    second = pipeline.run(
-        physical=reordered,
+    later_physical = physical.copy(deep=True)
+    later_physical["timestamp"] += pd.Timedelta(days=7)
+    later_physical["source_file_hash"] = "new-export"
+    later_identity = dlr_pipeline_module.derive_line_identity(
+        later_physical, tower_coords=coordinates
+    )
+
+    later = DlrPipeline(model_root=tmp_path).run(
+        physical=later_physical,
         project_id="project-a",
-        line_id=derive_line_id(reordered, tower_coords={}),
+        line_id=later_identity.line_id,
+        model_persistence_allowed=later_identity.persistence_allowed,
         terrain_lookup={},
+        coordinate_context=coordinates,
         ai_enabled=True,
         conductor=_conductor(),
     )
 
-    assert first.model_report.trained_targets
-    assert second.model_report.loaded_targets == first.model_report.trained_targets
+    assert later_identity.line_id == first_identity.line_id
+    assert later.model_report.loaded_targets == first.model_report.trained_targets
+    assert later.model_report.used_targets == first.model_report.trained_targets
 
 
 def _dem_context(values, *, crs="EPSG:4326") -> DemGrid:
@@ -371,6 +548,22 @@ class _CountingTrainer:
         self.calls.append((str(frame["tower_id"].iloc[0]), target))
         return self.delegate.train_target(frame, target, **kwargs)
 
+    def prepare_target(self, frame, target, **kwargs):
+        return self.delegate.prepare_target(frame, target, **kwargs)
+
+    def train_prepared(self, preparation):
+        self.calls.append((preparation.tower_id, preparation.target))
+        return self.delegate.train_prepared(preparation)
+
+
+class _PoorTemporalTrainer(_CountingTrainer):
+    def train_prepared(self, preparation):
+        result = super().train_prepared(preparation)
+        metrics = dict(result.metrics)
+        metrics["corrected_mae"] = metrics["baseline_mae"]
+        metrics["corrected_rmse"] = metrics["baseline_rmse"]
+        return replace(result, metrics=metrics)
+
 
 def test_pipeline_does_not_retrain_loaded_models_when_truth_is_reuploaded(
     tmp_path,
@@ -395,6 +588,211 @@ def test_pipeline_does_not_retrain_loaded_models_when_truth_is_reuploaded(
     assert second.model_report.loaded_targets == first.model_report.trained_targets
     assert second.model_report.used_targets == first.model_report.trained_targets
     assert second.model_report.trained_targets == ()
+
+
+def _weather_with_additional_segment(
+    role: str,
+    *,
+    truth_offset: bool = False,
+    segment_count: int = 2,
+) -> pd.DataFrame:
+    segments = []
+    for index in range(segment_count):
+        segment = _weather(role, truth_offset=truth_offset)
+        segment["timestamp"] += pd.Timedelta(days=2 * index)
+        segment["source_file_hash"] = f"{role}-source-{index}"
+        segments.append(segment)
+    return pd.concat(segments, ignore_index=True).sort_values(
+        ["tower_id", "timestamp"],
+        kind="mergesort",
+        ignore_index=True,
+    )
+
+
+def test_provisional_models_train_on_new_holdout_then_active_models_stop(
+    tmp_path,
+):
+    trainer = _CountingTrainer()
+    pipeline = DlrPipeline(model_root=tmp_path, trainer=trainer)
+    run_kwargs = {
+        "project_id": "project-a",
+        "line_id": "line-a",
+        "terrain_lookup": {},
+        "ai_enabled": True,
+        "conductor": _conductor(),
+        "truth_tolerance": "5min",
+    }
+
+    first = pipeline.run(
+        **run_kwargs,
+        physical=_weather("physical"),
+        truth=_weather("truth", truth_offset=True),
+    )
+    keys = first.model_report.trained_targets
+    first_metadata = {
+        key: json.loads(
+            pipeline.registry.metadata_path_for(key).read_text(encoding="utf-8")
+        )
+        for key in keys
+    }
+
+    expanded_physical = _weather_with_additional_segment("physical")
+    expanded_truth = _weather_with_additional_segment(
+        "truth", truth_offset=True
+    )
+    promoted = pipeline.run(
+        **run_kwargs,
+        physical=expanded_physical,
+        truth=expanded_truth,
+    )
+    promoted_metadata = {
+        key: json.loads(
+            pipeline.registry.metadata_path_for(key).read_text(encoding="utf-8")
+        )
+        for key in keys
+    }
+
+    assert len(trainer.calls) == 8
+    assert promoted.model_report.trained_targets == keys
+    assert all(value["status"] == "active_provisional" for value in first_metadata.values())
+    assert all(value["evaluation_mode"] == "full_fit" for value in first_metadata.values())
+    assert all(value["status"] == "active" for value in promoted_metadata.values())
+    assert all(
+        value["evaluation_mode"] == "temporal_holdout"
+        for value in promoted_metadata.values()
+    )
+    assert all(
+        promoted_metadata[key]["input_data_hash"]
+        != first_metadata[key]["input_data_hash"]
+        for key in keys
+    )
+
+    repeated = pipeline.run(
+        **run_kwargs,
+        physical=expanded_physical,
+        truth=expanded_truth,
+    )
+    newer = pipeline.run(
+        **run_kwargs,
+        physical=_weather_with_additional_segment(
+            "physical", segment_count=3
+        ),
+        truth=_weather_with_additional_segment(
+            "truth", truth_offset=True, segment_count=3
+        ),
+    )
+
+    assert len(trainer.calls) == 8
+    assert repeated.model_report.trained_targets == ()
+    assert newer.model_report.trained_targets == ()
+
+
+def test_rejected_temporal_candidate_is_reported_and_not_retrained(tmp_path):
+    trainer = _CountingTrainer()
+    registry = ModelRegistry(tmp_path, min_mae_improvement=999.0)
+    pipeline = DlrPipeline(registry=registry, trainer=trainer)
+    run_kwargs = {
+        "project_id": "project-a",
+        "line_id": "line-a",
+        "terrain_lookup": {},
+        "ai_enabled": True,
+        "conductor": _conductor(),
+        "truth_tolerance": "5min",
+    }
+
+    first = pipeline.run(
+        **run_kwargs,
+        physical=_weather("physical"),
+        truth=_weather("truth", truth_offset=True),
+    )
+    champion_metadata = {
+        key: json.loads(registry.metadata_path_for(key).read_text("utf-8"))
+        for key in first.model_report.trained_targets
+    }
+    expanded_physical = _weather_with_additional_segment("physical")
+    expanded_truth = _weather_with_additional_segment(
+        "truth", truth_offset=True
+    )
+    rejected = pipeline.run(
+        **run_kwargs,
+        physical=expanded_physical,
+        truth=expanded_truth,
+    )
+    calls_after_rejection = len(trainer.calls)
+    repeated = pipeline.run(
+        **run_kwargs,
+        physical=expanded_physical,
+        truth=expanded_truth,
+    )
+
+    assert len(first.model_report.trained_targets) == 4
+    assert calls_after_rejection == 8
+    assert rejected.model_report.trained_targets == ()
+    assert len(trainer.calls) == 8
+    assert [
+        (decision.key, decision.promoted, decision.reason)
+        for decision in rejected.model_report.promotion_decisions
+    ] == [
+        (key, False, "insufficient_mae_improvement")
+        for key in first.model_report.trained_targets
+    ]
+    assert rejected.model_report.fallbacks == ()
+    assert repeated.model_report.trained_targets == ()
+    assert repeated.model_report.promotion_decisions == ()
+    for key, original in champion_metadata.items():
+        persisted = json.loads(registry.metadata_path_for(key).read_text("utf-8"))
+        assert persisted["model_version"] == original["model_version"]
+        assert persisted["status"] == original["status"]
+        assert persisted["input_data_hash"] == original["input_data_hash"]
+        assert persisted["full_fit_metrics"] == original["full_fit_metrics"]
+        assert persisted["last_attempted_input_data_hash"] != original["input_data_hash"]
+
+
+def test_poor_temporal_candidate_is_not_refit_for_the_same_input(tmp_path):
+    trainer = _PoorTemporalTrainer()
+    registry = ModelRegistry(tmp_path)
+    pipeline = DlrPipeline(registry=registry, trainer=trainer)
+    run_kwargs = {
+        "project_id": "project-a",
+        "line_id": "line-a",
+        "terrain_lookup": {},
+        "ai_enabled": True,
+        "conductor": _conductor(),
+        "truth_tolerance": "5min",
+    }
+
+    first = pipeline.run(
+        **run_kwargs,
+        physical=_weather("physical"),
+        truth=_weather("truth", truth_offset=True),
+    )
+    expanded_physical = _weather_with_additional_segment("physical")
+    expanded_truth = _weather_with_additional_segment(
+        "truth", truth_offset=True
+    )
+    rejected = pipeline.run(
+        **run_kwargs,
+        physical=expanded_physical,
+        truth=expanded_truth,
+    )
+    repeated = pipeline.run(
+        **run_kwargs,
+        physical=expanded_physical,
+        truth=expanded_truth,
+    )
+
+    assert len(first.model_report.trained_targets) == 4
+    assert len(trainer.calls) == 8
+    assert rejected.model_report.trained_targets == ()
+    assert [
+        (decision.key, decision.promoted, decision.reason)
+        for decision in rejected.model_report.promotion_decisions
+    ] == [
+        (key, False, "candidate_not_better_than_physical")
+        for key in first.model_report.trained_targets
+    ]
+    assert rejected.model_report.fallbacks == ()
+    assert repeated.model_report.promotion_decisions == ()
 
 
 def test_pipeline_retrains_only_the_corrupt_model_when_truth_is_available(
@@ -625,6 +1023,118 @@ class _SpyThermalAdapter:
             "corrected_winds": np.ones((tower_count, time_count)),
             "local_temps": np.full((tower_count, time_count), 25.0),
         }
+
+
+def _assert_model_preparation_fallback(result, exception_name):
+    assert result.max_currents.shape == (2, 2)
+    assert result.model_report.loaded_targets == ()
+    assert result.model_report.trained_targets == ()
+    assert result.model_report.used_targets == ()
+    assert any(
+        fallback.key is None
+        and fallback.reason
+        == f"model_preparation_failed:{exception_name}"
+        for fallback in result.model_report.fallbacks
+    )
+
+
+def test_ai_model_root_failure_falls_back_to_physical_dlr():
+    spy = _SpyThermalAdapter()
+
+    result = DlrPipeline(
+        model_root="/dev/null/models",
+        thermal_adapter=spy,
+    ).run(
+        physical=_weather("physical"),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    _assert_model_preparation_fallback(result, "ValueError")
+    assert spy.last_conductor == _conductor()
+
+
+def test_ai_compatibility_failure_falls_back_to_physical_dlr(tmp_path):
+    class CompatibilityFailurePipeline(DlrPipeline):
+        @staticmethod
+        def _compatibility(*args, **kwargs):
+            raise RuntimeError("compatibility fingerprint failed")
+
+    spy = _SpyThermalAdapter()
+    result = CompatibilityFailurePipeline(
+        model_root=tmp_path,
+        thermal_adapter=spy,
+    ).run(
+        physical=_weather("physical"),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    _assert_model_preparation_fallback(result, "RuntimeError")
+    assert spy.last_conductor == _conductor()
+
+
+def test_ai_initial_registry_load_failure_falls_back_to_physical_dlr(tmp_path):
+    class LoadFailureRegistry:
+        def load_many(self, *args, **kwargs):
+            raise OSError("registry unavailable")
+
+    spy = _SpyThermalAdapter()
+    result = DlrPipeline(
+        model_root=tmp_path,
+        registry=LoadFailureRegistry(),
+        thermal_adapter=spy,
+    ).run(
+        physical=_weather("physical"),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    _assert_model_preparation_fallback(result, "OSError")
+    assert spy.last_conductor == _conductor()
+
+
+def test_invalid_model_key_falls_back_to_physical_dlr(tmp_path):
+    spy = _SpyThermalAdapter()
+    result = DlrPipeline(model_root=tmp_path, thermal_adapter=spy).run(
+        physical=_weather("physical"),
+        project_id="../invalid-project",
+        line_id="invalid/model/line",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    _assert_model_preparation_fallback(result, "ValueError")
+    assert spy.last_conductor == _conductor()
+
+
+def test_model_preparation_boundary_does_not_swallow_thermal_failure():
+    class FailingThermalAdapter:
+        def calculate_from_long_frame(self, weather, *, base_params):
+            raise RuntimeError("thermal calculation failed")
+
+    with pytest.raises(RuntimeError, match="thermal calculation failed"):
+        DlrPipeline(
+            model_root="/dev/null/models",
+            thermal_adapter=FailingThermalAdapter(),
+        ).run(
+            physical=_weather("physical"),
+            project_id="project-a",
+            line_id="line-a",
+            terrain_lookup={},
+            ai_enabled=True,
+            conductor=_conductor(),
+        )
 
 
 def test_pipeline_passes_selected_conductor_and_never_truth_to_dlr(tmp_path):
@@ -1489,8 +1999,12 @@ def test_page_derives_line_namespace_and_passes_runtime_contexts():
     button_end = source.index("# 结果展示", button_start)
     button_block = source[button_start:button_end]
 
-    assert "derive_line_id(" in button_block
-    assert "derive_line_id(\n                physical_snapshot," in button_block
+    assert "derive_line_identity(" in button_block
+    assert "line_id=line_identity.line_id" in button_block
+    assert (
+        "model_persistence_allowed=line_identity.persistence_allowed"
+        in button_block
+    )
     assert 'line_id="main-line"' not in button_block
     assert "tower_coords=st.session_state.tower_coords" in button_block
     assert "dem_context=st.session_state.dem_data" in button_block

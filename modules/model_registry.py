@@ -158,6 +158,7 @@ class ModelMetadata:
     checksum: str = ""
     status: str = "candidate"
     metric_domain: str = "weather_vs_truth"
+    last_attempted_input_data_hash: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, ModelKey):
@@ -231,6 +232,11 @@ class ModelMetadata:
         object.__setattr__(self, "residual_bounds", (float(lower), float(upper)))
 
         _require_nonempty_string(self.input_data_hash, "input_data_hash")
+        if self.last_attempted_input_data_hash is not None:
+            _require_nonempty_string(
+                self.last_attempted_input_data_hash,
+                "last_attempted_input_data_hash",
+            )
         if self.evaluation_set_hash is not None:
             _require_nonempty_string(
                 self.evaluation_set_hash, "evaluation_set_hash"
@@ -290,6 +296,7 @@ class ModelMetadata:
         values.setdefault("checksum", "")
         values.setdefault("status", "candidate")
         values.setdefault("metric_domain", "weather_vs_truth")
+        values.setdefault("last_attempted_input_data_hash", None)
         return cls(key=key, compatibility=compatibility, **values)
 
 
@@ -371,6 +378,23 @@ class ModelLoadResult:
     bundle: Optional[ModelBundle]
     metadata: Optional[ModelMetadata]
     fallback_reason: str = ""
+
+
+def candidate_admission_reason(
+    *,
+    evaluation_mode: str,
+    evaluation_set_hash: Optional[str],
+    metrics: Mapping[str, float],
+    full_fit_metrics: Optional[Mapping[str, float]],
+) -> str:
+    if evaluation_mode != "full_fit" and evaluation_set_hash is None:
+        return "missing_evaluation_set_hash"
+    candidate_metrics = (
+        full_fit_metrics if evaluation_mode == "full_fit" else metrics
+    ) or {}
+    if candidate_metrics["corrected_mae"] >= candidate_metrics["baseline_mae"]:
+        return "candidate_not_better_than_physical"
+    return ""
 
 
 def _validate_bundle(
@@ -882,12 +906,6 @@ class ModelRegistry:
                 )
         return loaded
 
-    @staticmethod
-    def _candidate_metrics(metadata: ModelMetadata) -> Mapping[str, float]:
-        if metadata.evaluation_mode == "full_fit":
-            return metadata.full_fit_metrics or {}
-        return metadata.metrics
-
     def _publish_locked(
         self,
         candidate: ModelCandidate,
@@ -997,19 +1015,47 @@ class ModelRegistry:
             )
         return PromotionDecision(True, reason, metadata)
 
+    def _record_rejection_locked(
+        self,
+        current: ModelLoadResult,
+        candidate: ModelCandidate,
+        reason: str,
+    ) -> PromotionDecision:
+        champion = current.metadata
+        if current.bundle is None or champion is None:
+            return PromotionDecision(False, reason, champion)
+        attempted_metadata = replace(
+            champion,
+            last_attempted_input_data_hash=candidate.metadata.input_data_hash,
+        )
+        try:
+            recorded = self._publish_locked(
+                ModelCandidate(
+                    key=candidate.key,
+                    bundle=current.bundle,
+                    metadata=attempted_metadata,
+                ),
+                status=champion.status,
+            )
+        except UnsafeModelPathError:
+            return PromotionDecision(False, "unsafe_model_path", champion)
+        except Exception as exc:
+            return PromotionDecision(
+                False,
+                f"attempt_record_failed:{type(exc).__name__}",
+                champion,
+            )
+        return PromotionDecision(False, reason, recorded)
+
     def promote(self, candidate: ModelCandidate) -> PromotionDecision:
         if not isinstance(candidate, ModelCandidate):
             raise TypeError("candidate must be a ModelCandidate")
-        if (
-            candidate.metadata.evaluation_mode != "full_fit"
-            and candidate.metadata.evaluation_set_hash is None
-        ):
-            return PromotionDecision(False, "missing_evaluation_set_hash")
-        metrics = self._candidate_metrics(candidate.metadata)
-        if metrics["corrected_mae"] >= metrics["baseline_mae"]:
-            return PromotionDecision(
-                False, "candidate_not_better_than_physical"
-            )
+        admission_reason = candidate_admission_reason(
+            evaluation_mode=candidate.metadata.evaluation_mode,
+            evaluation_set_hash=candidate.metadata.evaluation_set_hash,
+            metrics=candidate.metadata.metrics,
+            full_fit_metrics=candidate.metadata.full_fit_metrics,
+        )
         try:
             self._safe_directory(
                 self._target_dir(candidate.key).parent, create=False
@@ -1024,13 +1070,19 @@ class ModelRegistry:
                 )
             except UnsafeModelPathError:
                 return PromotionDecision(False, "unsafe_model_path")
+            if admission_reason:
+                return self._record_rejection_locked(
+                    current,
+                    candidate,
+                    admission_reason,
+                )
             if current.bundle is not None:
                 champion = current.metadata
                 if candidate.metadata.evaluation_mode == "full_fit":
-                    return PromotionDecision(
-                        False,
+                    return self._record_rejection_locked(
+                        current,
+                        candidate,
                         "full_fit_cannot_replace_champion",
-                        champion,
                     )
                 if (
                     champion.status == "active_provisional"
@@ -1040,8 +1092,10 @@ class ModelRegistry:
                         candidate.metadata.model_version
                         == champion.model_version
                     ):
-                        return PromotionDecision(
-                            False, "model_version_conflict", champion
+                        return self._record_rejection_locked(
+                            current,
+                            candidate,
+                            "model_version_conflict",
                         )
                     physical_improvement = (
                         candidate.metadata.metrics["baseline_mae"]
@@ -1051,10 +1105,10 @@ class ModelRegistry:
                         physical_improvement
                         <= self.min_mae_improvement + 1e-12
                     ):
-                        return PromotionDecision(
-                            False,
+                        return self._record_rejection_locked(
+                            current,
+                            candidate,
                             "insufficient_mae_improvement",
-                            champion,
                         )
                     return self._publish_decision(
                         candidate,
@@ -1066,29 +1120,35 @@ class ModelRegistry:
                     champion.evaluation_mode == "full_fit"
                     or champion.evaluation_set_hash is None
                 ):
-                    return PromotionDecision(
-                        False,
+                    return self._record_rejection_locked(
+                        current,
+                        candidate,
                         "champion_has_no_independent_evaluation",
-                        champion,
                     )
                 if (
                     candidate.metadata.evaluation_set_hash
                     != champion.evaluation_set_hash
                 ):
-                    return PromotionDecision(
-                        False, "evaluation_set_mismatch", champion
+                    return self._record_rejection_locked(
+                        current,
+                        candidate,
+                        "evaluation_set_mismatch",
                     )
                 if candidate.metadata.model_version == champion.model_version:
-                    return PromotionDecision(
-                        False, "model_version_conflict", champion
+                    return self._record_rejection_locked(
+                        current,
+                        candidate,
+                        "model_version_conflict",
                     )
                 improvement = (
                     champion.metrics["corrected_mae"]
                     - candidate.metadata.metrics["corrected_mae"]
                 )
                 if improvement <= self.min_mae_improvement + 1e-12:
-                    return PromotionDecision(
-                        False, "insufficient_mae_improvement", champion
+                    return self._record_rejection_locked(
+                        current,
+                        candidate,
+                        "insufficient_mae_improvement",
                     )
                 return self._publish_decision(
                     candidate,

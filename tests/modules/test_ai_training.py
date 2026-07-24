@@ -135,6 +135,59 @@ def test_training_metrics_compare_weather_to_truth_not_dlr():
     assert "mape" not in " ".join(result.metrics).lower()
 
 
+def test_training_preparation_matches_training_without_fitting_early():
+    estimator_calls = []
+
+    def estimator_factory():
+        estimator_calls.append("created")
+        return MeanResidualEstimator()
+
+    trainer = ResidualTrainer(estimator_factory=estimator_factory)
+    preparation = trainer.prepare_target(
+        make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0)),
+        target="wind_speed",
+    )
+
+    assert estimator_calls == []
+    assert preparation.evaluation_mode == "temporal_holdout"
+    assert preparation.evaluation_set_hash
+
+    result = trainer.train_prepared(preparation)
+
+    assert estimator_calls
+    assert result.metadata["input_data_hash"] == preparation.input_data_hash
+    assert result.metadata["evaluation_mode"] == preparation.evaluation_mode
+    assert (
+        result.metadata["evaluation_set_hash"]
+        == preparation.evaluation_set_hash
+    )
+
+
+def test_training_preparation_reports_full_fit_for_one_continuous_block():
+    timestamps = pd.date_range(
+        "2025-01-01 00:00",
+        periods=4,
+        freq="30min",
+        tz="UTC",
+    )
+    trainer = ResidualTrainer(
+        estimator_factory=lambda: (_ for _ in ()).throw(
+            AssertionError("preparation must not construct an estimator")
+        )
+    )
+
+    preparation = trainer.prepare_target(
+        make_training_frame(
+            residuals=(0.0, 1.0, 2.0, 3.0),
+            timestamps=timestamps,
+        ),
+        target="wind_speed",
+    )
+
+    assert preparation.evaluation_mode == "full_fit"
+    assert preparation.evaluation_set_hash is None
+
+
 def test_single_sample_is_trained_without_rejection():
     frame = make_training_frame(
         residuals=(2.0,),
@@ -305,7 +358,7 @@ def test_trained_bundle_clips_residual_and_weather_per_tower():
     assert predicted.loc[predicted.index[0], "wind_speed_residual"] <= upper
     assert predicted.loc[predicted.index[0], "wind_speed_residual"] == 0.0
     assert predicted.loc[predicted.index[0], "wind_speed_final"] == 74.5
-    assert predicted.loc[predicted.index[0], "used_ai"] == False
+    assert not predicted.loc[predicted.index[0], "used_ai"]
     assert predicted.loc[predicted.index[0], "fallback_reason"] == (
         "physical_bounds_exceeded"
     )

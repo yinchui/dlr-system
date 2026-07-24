@@ -1,11 +1,24 @@
+import json
+from pathlib import Path
+
+import joblib
 import numpy as np
 import pandas as pd
 import pytest
-from pathlib import Path
+from affine import Affine
+from pyproj import CRS
+from rasterio.coords import BoundingBox
 
+from modules.ai_prediction import FeatureBuilder, ModelBundle, ResidualPredictor
 from modules.ai_training import ResidualTrainer
-from modules.dlr_pipeline import DlrPipeline, LongFrameThermalAdapter
-from modules.model_registry import ModelKey
+from modules.dlr_pipeline import (
+    DlrPipeline,
+    DlrPipelineResult,
+    LongFrameThermalAdapter,
+    derive_line_id,
+)
+from modules.model_registry import ModelKey, ModelLoadResult
+from modules.terrain import DemGrid
 from modules.weather_correction import CorrectionOptions
 
 
@@ -54,6 +67,218 @@ def _conductor() -> dict:
     }
 
 
+def test_derived_line_id_is_stable_across_weather_and_coordinate_order():
+    weather = _weather("physical").assign(
+        longitude=[120.1, 120.1, 120.2, 120.2],
+        latitude=[40.1, 40.1, 40.2, 40.2],
+    )
+    coordinates = {
+        "002": {"lon": 120.2, "lat": 40.2},
+        "001": {"lon": 120.1, "lat": 40.1},
+    }
+
+    expected = derive_line_id(weather, tower_coords=coordinates)
+    reordered = derive_line_id(
+        weather.iloc[::-1].reset_index(drop=True),
+        tower_coords=dict(reversed(list(coordinates.items()))),
+    )
+
+    assert expected == reordered
+    assert expected.startswith("line-")
+    shifted_weather_coordinates = weather.assign(
+        longitude=weather["longitude"] + 0.001,
+        latitude=weather["latitude"] + 0.001,
+    )
+    assert expected == derive_line_id(
+        shifted_weather_coordinates,
+        tower_coords=coordinates,
+    )
+    assert derive_line_id(weather, tower_coords={}) != derive_line_id(
+        shifted_weather_coordinates,
+        tower_coords={},
+    )
+    assert expected != derive_line_id(
+        weather,
+        tower_coords=coordinates
+        | {"002": {"lon": 120.2001, "lat": 40.2}},
+    )
+    assert expected != derive_line_id(
+        pd.concat(
+            [
+                weather,
+                weather.iloc[[0]].assign(tower_id="003", longitude=120.3),
+            ],
+            ignore_index=True,
+        ),
+        tower_coords=coordinates
+        | {"003": {"lon": 120.3, "lat": 40.3}},
+    )
+
+
+def test_derived_line_id_without_coordinates_uses_only_tower_topology():
+    first = _weather("physical")
+    second = first.iloc[::-1].copy()
+    second["source_file_hash"] = "another-weather-upload"
+    second["ambient_temp"] += 10.0
+
+    assert derive_line_id(first, tower_coords={}) == derive_line_id(
+        second,
+        tower_coords=None,
+    )
+    assert derive_line_id(first, tower_coords={}) != derive_line_id(
+        first.loc[first["tower_id"] == "001"],
+        tower_coords={},
+    )
+
+
+def _dem_context(values, *, crs="EPSG:4326") -> DemGrid:
+    elevation = np.asarray(values)
+    return DemGrid(
+        elevation=elevation,
+        mask=np.zeros(elevation.shape, dtype=bool),
+        crs=CRS.from_user_input(crs),
+        transform=Affine(0.01, 0.0, 120.0, 0.0, -0.01, 40.0),
+        bounds=BoundingBox(120.0, 39.98, 120.02, 40.0),
+        nodata=None,
+    )
+
+
+def _compatibility_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "tower_id": ["001", "002"],
+            "elevation": [1000.0, 1200.0],
+            "slope": [0.0, 0.0],
+            "aspect": [0.0, 0.0],
+            "source": ["dem", "dem"],
+            "reason": [None, None],
+        }
+    )
+
+
+def test_runtime_compatibility_hashes_actual_dem_crs_and_coordinates():
+    frame = _compatibility_frame()
+    coordinates = {
+        "002": {"lon": 120.2, "lat": 40.2},
+        "001": {"lon": 120.1, "lat": 40.1},
+    }
+
+    def compatibility(dem, coordinate_context=coordinates):
+        return DlrPipeline._compatibility(
+            frame,
+            conductor=_conductor(),
+            correction_options=CorrectionOptions(),
+            interval_minutes=30,
+            dem_context=dem,
+            coordinate_context=coordinate_context,
+        )
+
+    baseline = compatibility(
+        _dem_context(np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype="float32"))
+    )
+    reordered = compatibility(
+        _dem_context(
+            np.asfortranarray(
+                np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype="float32")
+            )
+        ),
+        {
+            "001": {"lat": 40.1, "lon": 120.1},
+            "002": {"lat": 40.2, "lon": 120.2},
+        },
+    )
+    changed_content = compatibility(
+        _dem_context(np.asarray([[1.0, 2.0], [3.0, 4.1]], dtype="float32"))
+    )
+    changed_dtype = compatibility(
+        _dem_context(np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype="float64"))
+    )
+    changed_shape = compatibility(
+        _dem_context(np.asarray([[1.0, 2.0, 3.0]], dtype="float32"))
+    )
+    changed_crs = compatibility(
+        _dem_context(
+            np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype="float32"),
+            crs="EPSG:3857",
+        )
+    )
+    changed_coordinates = compatibility(
+        _dem_context(np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype="float32")),
+        coordinates | {"002": {"lon": 120.2001, "lat": 40.2}},
+    )
+
+    assert baseline == reordered
+    assert baseline.dem_hash != changed_content.dem_hash
+    assert baseline.dem_hash != changed_dtype.dem_hash
+    assert baseline.dem_hash != changed_shape.dem_hash
+    assert baseline.dem_hash == changed_crs.dem_hash
+    assert baseline.crs_hash != changed_crs.crs_hash
+    assert baseline.coordinate_hash != changed_coordinates.coordinate_hash
+
+
+def test_runtime_context_changes_invalidate_only_the_matching_model_field(
+    tmp_path,
+):
+    pipeline = DlrPipeline(model_root=tmp_path)
+    base_dem = _dem_context(
+        np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype="float32")
+    )
+    coordinates = {
+        "001": {"lon": 120.1, "lat": 40.1},
+        "002": {"lon": 120.2, "lat": 40.2},
+    }
+    pipeline.run(
+        physical=_weather("physical"),
+        truth=_weather("truth", truth_offset=True),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        dem_context=base_dem,
+        coordinate_context=coordinates,
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    cases = (
+        (
+            _dem_context(
+                np.asarray([[1.0, 2.0], [3.0, 4.1]], dtype="float32")
+            ),
+            coordinates,
+            "incompatible_dem_hash",
+        ),
+        (
+            _dem_context(
+                np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype="float32"),
+                crs="EPSG:3857",
+            ),
+            coordinates,
+            "incompatible_crs_hash",
+        ),
+        (
+            base_dem,
+            coordinates | {"002": {"lon": 120.2001, "lat": 40.2}},
+            "incompatible_coordinate_hash",
+        ),
+    )
+    for dem_context, coordinate_context, reason in cases:
+        result = pipeline.run(
+            physical=_weather("physical"),
+            project_id="project-a",
+            line_id="line-a",
+            terrain_lookup={},
+            dem_context=dem_context,
+            coordinate_context=coordinate_context,
+            ai_enabled=True,
+            conductor=_conductor(),
+        )
+        assert not result.model_report.loaded_targets
+        assert sum(
+            fallback.reason == reason
+            for fallback in result.model_report.fallbacks
+        ) == 4
+
+
 def test_pipeline_trains_missing_models_then_reuses_them(tmp_path):
     pipeline = DlrPipeline(model_root=tmp_path)
     terrain = {
@@ -87,6 +312,70 @@ def test_pipeline_trains_missing_models_then_reuses_them(tmp_path):
     assert second.model_report.loaded_targets == first.model_report.trained_targets
     assert first.model_report.active_model_count == 4
     np.testing.assert_allclose(first.max_currents, second.max_currents)
+
+
+def test_pipeline_interval_controls_training_bundle_and_model_compatibility(
+    tmp_path,
+):
+    pipeline = DlrPipeline(model_root=tmp_path)
+    no_correction = CorrectionOptions(
+        enable_vertical=False,
+        enable_terrain=False,
+        enable_desert=False,
+        enable_wind_direction=False,
+    )
+    first = pipeline.run(
+        physical=_weather("physical"),
+        truth=_weather("truth", truth_offset=True),
+        project_id="project-a",
+        line_id="line-a",
+        interval_minutes=60,
+        terrain_lookup={},
+        correction_options=no_correction,
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    bundle = joblib.load(pipeline.registry.path_for(key))
+    metadata = json.loads(
+        pipeline.registry.metadata_path_for(key).read_text(encoding="utf-8")
+    )
+
+    assert first.model_report.trained_targets
+    assert bundle.cadence_minutes == 60.0
+    assert metadata["cadence_minutes"] == 60.0
+
+    changed_interval = pipeline.run(
+        physical=_weather("physical"),
+        project_id="project-a",
+        line_id="line-a",
+        interval_minutes=30,
+        terrain_lookup={},
+        correction_options=no_correction,
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+    assert not changed_interval.model_report.loaded_targets
+    assert any(
+        fallback.reason == "incompatible_feature_version"
+        for fallback in changed_interval.model_report.fallbacks
+    )
+
+
+def test_pipeline_rejects_injected_trainer_with_mismatched_cadence(tmp_path):
+    trainer = ResidualTrainer(feature_builder=FeatureBuilder(cadence_minutes=30))
+    pipeline = DlrPipeline(model_root=tmp_path, trainer=trainer)
+
+    with pytest.raises(ValueError, match="cadence"):
+        pipeline.run(
+            physical=_weather("physical"),
+            project_id="project-a",
+            line_id="line-a",
+            interval_minutes=60,
+            terrain_lookup={},
+            ai_enabled=False,
+            conductor=_conductor(),
+        )
 
 
 class _SpyThermalAdapter:
@@ -162,7 +451,32 @@ def test_pipeline_uses_only_the_common_tower_timestamps(tmp_path):
     assert result.max_currents.shape == (2, 2)
 
 
-def test_pipeline_rejects_same_source_truth_but_still_calculates_dlr(tmp_path):
+def test_pipeline_rejects_fully_overlapping_truth_content_but_calculates_dlr(
+    tmp_path,
+):
+    physical = _weather("physical")
+    truth = _weather("truth").iloc[::-1].reset_index(drop=True)
+    truth["source_file_hash"] = "different-upload"
+
+    result = DlrPipeline(model_root=tmp_path).run(
+        physical=physical,
+        truth=truth,
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    assert result.max_currents.shape == (2, 2)
+    assert not result.model_report.trained_targets
+    assert any(
+        fallback.reason == "truth_rejected_overlapping_content"
+        for fallback in result.model_report.fallbacks
+    )
+
+
+def test_pipeline_allows_same_source_hash_when_weather_content_differs(tmp_path):
     physical = _weather("physical")
     truth = _weather("truth", truth_offset=True)
     truth["source_file_hash"] = physical["source_file_hash"]
@@ -178,9 +492,9 @@ def test_pipeline_rejects_same_source_truth_but_still_calculates_dlr(tmp_path):
     )
 
     assert result.max_currents.shape == (2, 2)
-    assert not result.model_report.trained_targets
-    assert any(
-        fallback.reason == "truth_rejected_same_source_hash"
+    assert len(result.model_report.trained_targets) == 4
+    assert all(
+        fallback.reason != "truth_rejected_overlapping_content"
         for fallback in result.model_report.fallbacks
     )
 
@@ -241,6 +555,108 @@ def test_legacy_projection_keeps_tower_by_common_time_matrices(tmp_path):
         assert np.asarray(legacy[key]).shape == (2, 2)
 
 
+def test_pipeline_result_is_a_defensive_snapshot_with_read_only_arrays(
+    tmp_path,
+):
+    base = DlrPipeline(model_root=tmp_path).run(
+        physical=_weather("physical"),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=False,
+        conductor=_conductor(),
+    )
+    physical = base.physical_weather
+    physical["object_payload"] = [
+        {"values": [index]} for index in range(len(physical))
+    ]
+    physical.attrs["nested"] = {"values": [1]}
+    terrain = base.terrain_corrected_weather
+    final = base.final_weather
+    comparison = base.comparison_weather
+    max_currents = np.asarray(base.max_currents).copy()
+    nested_array = np.asarray([1.0, 2.0])
+    thermal_result = {
+        key: value for key, value in base.thermal_result.items()
+    }
+    thermal_result["nested"] = {
+        "array": nested_array,
+        "items": [{"value": 1}],
+    }
+
+    result = DlrPipelineResult(
+        physical_weather=physical,
+        terrain_corrected_weather=terrain,
+        final_weather=final,
+        comparison_weather=comparison,
+        thermal_result=thermal_result,
+        max_currents=max_currents,
+        model_report=base.model_report,
+        weather_metrics=base.weather_metrics,
+    )
+    physical.loc[0, "object_payload"]["values"].append(99)
+    physical.attrs["nested"]["values"].append(99)
+    max_currents[0, 0] = -1.0
+    nested_array[0] = -1.0
+    thermal_result["nested"]["items"][0]["value"] = 99
+
+    first_view = result.physical_weather
+    assert first_view.loc[0, "object_payload"] == {"values": [0]}
+    assert first_view.attrs["nested"] == {"values": [1]}
+    first_view.loc[0, "object_payload"]["values"].append(2)
+    first_view.attrs["nested"]["values"].append(2)
+    assert result.physical_weather.loc[0, "object_payload"] == {"values": [0]}
+    assert result.physical_weather.attrs["nested"] == {"values": [1]}
+
+    assert result.max_currents[0, 0] != -1.0
+    assert not result.max_currents.flags.writeable
+    with pytest.raises(ValueError):
+        result.max_currents[0, 0] = 0.0
+    assert result.thermal_result["nested"]["array"][0] == 1.0
+    assert result.thermal_result["nested"]["items"][0]["value"] == 1
+    with pytest.raises(TypeError):
+        result.thermal_result["new"] = "value"
+    with pytest.raises(TypeError):
+        result.thermal_result["nested"]["new"] = "value"
+    with pytest.raises(ValueError):
+        result.thermal_result["nested"]["array"][0] = 0.0
+
+
+def test_legacy_projection_remains_independent_and_mutable(tmp_path):
+    result = DlrPipeline(model_root=tmp_path).run(
+        physical=_weather("physical"),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=False,
+        conductor=_conductor(),
+    )
+    baseline = result.to_legacy_line_data()
+    legacy = result.to_legacy_line_data()
+
+    assert legacy["winds"].flags.writeable
+    assert legacy["max_currents"].flags.writeable
+    legacy["winds"][0, 0] = -1.0
+    legacy["max_currents"][0, 0] = -1.0
+    legacy["correction_details"]["winds_orig"][0, 0] = -1.0
+    legacy["terrain_data"][0]["source"] = "changed"
+    legacy["comparison_weather"].loc[0, "wind_speed_ai"] = -1.0
+    legacy["new"] = "value"
+
+    fresh = result.to_legacy_line_data()
+    np.testing.assert_array_equal(fresh["winds"], baseline["winds"])
+    np.testing.assert_array_equal(
+        fresh["max_currents"], baseline["max_currents"]
+    )
+    np.testing.assert_array_equal(
+        fresh["correction_details"]["winds_orig"],
+        baseline["correction_details"]["winds_orig"],
+    )
+    assert fresh["terrain_data"][0]["source"] != "changed"
+    assert fresh["comparison_weather"].loc[0, "wind_speed_ai"] != -1.0
+    assert "new" not in fresh
+
+
 class _FailingTransientAdapter(_SpyThermalAdapter):
     def calculate_transient_from_long_frame(
         self, weather, *, base_params, request, steady_result
@@ -298,6 +714,127 @@ class _SelectiveFailTrainer:
         if str(frame["tower_id"].iloc[0]) == "001" and target == "wind_speed":
             raise RuntimeError("tower target failed")
         return self.delegate.train_target(frame, target, **kwargs)
+
+
+class _ZeroResidualModel:
+    def predict(self, features):
+        return np.zeros(len(features), dtype=float)
+
+
+class _PredictionContractRegistry:
+    def __init__(self, *, missing_feature=True):
+        self.missing_feature = missing_feature
+
+    def load_many(self, keys, *, expected_compatibility):
+        loaded = {}
+        for key in keys:
+            physical_column = (
+                "wind_speed_local"
+                if key.target == "wind_speed"
+                else "ambient_temp_local"
+            )
+            feature_columns = [physical_column]
+            if (
+                self.missing_feature
+                and key.tower_id == "001"
+                and key.target == "wind_speed"
+            ):
+                feature_columns = ["missing_contract_feature"]
+            loaded[key] = ModelLoadResult(
+                bundle=ModelBundle(
+                    target_name=key.target,
+                    feature_columns=feature_columns,
+                    model=_ZeroResidualModel(),
+                    residual_bounds=(-10.0, 10.0),
+                    line_id=key.line_id,
+                    tower_id=key.tower_id,
+                    cadence_minutes=30.0,
+                ),
+                metadata=None,
+            )
+        return loaded
+
+
+def test_prediction_contract_failure_isolated_to_one_tower_target(tmp_path):
+    failed_key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    result = DlrPipeline(
+        model_root=tmp_path,
+        registry=_PredictionContractRegistry(),
+    ).run(
+        physical=_weather("physical"),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    tower_one = result.comparison_weather.loc[
+        result.comparison_weather["tower_id"] == "001"
+    ]
+    assert result.max_currents.shape == (2, 2)
+    assert not tower_one["wind_speed_used_ai"].any()
+    np.testing.assert_array_equal(
+        tower_one["wind_speed_ai"], tower_one["wind_speed_physical"]
+    )
+    assert tower_one["ambient_temp_used_ai"].all()
+    assert result.model_report.active_model_count == 3
+    assert any(
+        fallback.key == failed_key
+        and fallback.reason == "prediction_failed:ValueError"
+        for fallback in result.model_report.fallbacks
+    )
+
+
+def test_incomplete_prediction_output_rolls_back_the_entire_key(
+    tmp_path,
+    monkeypatch,
+):
+    original_predict = ResidualPredictor.predict
+
+    def incomplete_predict(self, frame, target_name, physical_col):
+        predicted = original_predict(
+            self,
+            frame,
+            target_name=target_name,
+            physical_col=physical_col,
+        )
+        if str(frame["tower_id"].iloc[0]) == "001" and target_name == "wind_speed":
+            predicted["wind_speed_final"] = predicted[physical_col] + 1.0
+            return predicted.drop(columns="wind_speed_residual")
+        return predicted
+
+    monkeypatch.setattr(ResidualPredictor, "predict", incomplete_predict)
+    result = DlrPipeline(
+        model_root=tmp_path,
+        registry=_PredictionContractRegistry(missing_feature=False),
+    ).run(
+        physical=_weather("physical"),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    comparison = result.comparison_weather
+    failed_rows = comparison["tower_id"] == "001"
+    np.testing.assert_array_equal(
+        comparison.loc[failed_rows, "wind_speed_ai"],
+        comparison.loc[failed_rows, "wind_speed_physical"],
+    )
+    assert not comparison.loc[failed_rows, "wind_speed_used_ai"].any()
+    final = result.final_weather
+    local = result.terrain_corrected_weather
+    np.testing.assert_array_equal(
+        final.loc[final["tower_id"] == "001", "wind_speed"],
+        local.loc[local["tower_id"] == "001", "wind_speed_local"],
+    )
+    assert any(
+        fallback.key == ModelKey("project-a", "line-a", "001", "wind_speed")
+        and fallback.reason == "prediction_failed:KeyError"
+        for fallback in result.model_report.fallbacks
+    )
 
 
 def test_one_tower_target_training_failure_does_not_disable_other_models(tmp_path):
@@ -620,6 +1157,19 @@ def test_page_main_button_is_a_thin_pipeline_adapter():
     assert "convert_to_analysis_format(" not in button_block
     assert "apply_weather_corrections(" not in button_block
     assert "calculate_max_current_for_points(" not in button_block
+
+
+def test_page_derives_line_namespace_and_passes_runtime_contexts():
+    source = _page_source()
+    button_start = source.index("if btn_generate and weather_files:")
+    button_end = source.index("# 结果展示", button_start)
+    button_block = source[button_start:button_end]
+
+    assert "derive_line_id(" in button_block
+    assert 'line_id="main-line"' not in button_block
+    assert "tower_coords=st.session_state.tower_coords" in button_block
+    assert "dem_context=st.session_state.dem_data" in button_block
+    assert "coordinate_context=st.session_state.tower_coords" in button_block
 
 
 def test_page_reports_weather_error_and_has_no_random_dlr_ai_demo():

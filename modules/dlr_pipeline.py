@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
 import numpy as np
 import pandas as pd
+from pyproj import CRS
 
 from config.config import DEFAULT_INTERVAL_MINUTES, MODEL_DIR
-from modules.ai_prediction import ResidualPredictor
+from modules.ai_prediction import FeatureBuilder, ResidualPredictor
 from modules.ai_training import ResidualTrainer
 from modules.model_registry import (
     ModelCompatibility,
@@ -28,7 +31,6 @@ from modules.weather_pipeline import (
 )
 from modules.weather_upload import (
     WeatherUploadResult,
-    ensure_distinct_dataset_hashes,
 )
 
 
@@ -37,6 +39,19 @@ _LOCAL_COLUMNS = {
     "wind_speed": "wind_speed_local",
     "ambient_temp": "ambient_temp_local",
 }
+_CONTENT_COLUMNS = (
+    "tower_id",
+    "timestamp",
+    "ambient_temp",
+    "wind_speed",
+    "wind_direction",
+    "solar_radiation",
+    "humidity",
+    "elevation",
+    "measurement_height",
+    "longitude",
+    "latitude",
+)
 
 
 def _weather_axes(frame: pd.DataFrame) -> tuple[tuple[str, ...], pd.DatetimeIndex]:
@@ -76,6 +91,62 @@ def _long_frame_matrix(
     return values
 
 
+def _canonical_weather_content(frame: pd.DataFrame) -> pd.DataFrame:
+    projection = pd.DataFrame(index=frame.index)
+    projection["tower_id"] = frame["tower_id"].astype(str)
+    timestamps = pd.to_datetime(frame["timestamp"], utc=True)
+    projection["timestamp"] = timestamps.astype("int64")
+    for column in _CONTENT_COLUMNS[2:]:
+        if column not in frame.columns:
+            projection[column] = np.nan
+            continue
+        projection[column] = pd.to_numeric(
+            frame[column], errors="coerce"
+        ).astype(float)
+    return projection.sort_values(
+        list(_CONTENT_COLUMNS), kind="mergesort", ignore_index=True
+    )
+
+
+def _weather_content_overlaps(
+    physical: pd.DataFrame,
+    truth: pd.DataFrame,
+) -> bool:
+    if len(physical) != len(truth):
+        return False
+    return _canonical_weather_content(physical).equals(
+        _canonical_weather_content(truth)
+    )
+
+
+def _validated_prediction_output(
+    predicted: pd.DataFrame,
+    expected_index: pd.Index,
+    target: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if not isinstance(predicted, pd.DataFrame):
+        raise TypeError("prediction output must be a pandas DataFrame")
+    if not predicted.index.equals(expected_index):
+        raise ValueError("prediction output index does not match input")
+    final = pd.to_numeric(
+        predicted[f"{target}_final"], errors="raise"
+    ).to_numpy(dtype=float)
+    residual = pd.to_numeric(
+        predicted[f"{target}_residual"], errors="raise"
+    ).to_numpy(dtype=float)
+    if not np.isfinite(final).all() or not np.isfinite(residual).all():
+        raise ValueError("prediction output must be finite")
+    used_series = predicted["used_ai"]
+    if not used_series.map(lambda value: isinstance(value, (bool, np.bool_))).all():
+        raise TypeError("prediction used_ai must contain booleans")
+    used = used_series.to_numpy(dtype=bool)
+    reason_series = predicted["fallback_reason"]
+    if not reason_series.map(lambda value: isinstance(value, str)).all():
+        raise TypeError("prediction fallback_reason must contain strings")
+    reasons = reason_series.to_numpy(dtype=object)
+    return final, residual, used, reasons
+
+
 @dataclass(frozen=True)
 class WeatherMetrics:
     wind_speed_mae: Optional[float] = None
@@ -103,22 +174,119 @@ class ModelRunReport:
         return len(set(self.used_targets))
 
 
-@dataclass(frozen=True)
+def _dataframe_snapshot(frame: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError("weather stages must be pandas DataFrames")
+    result = frame.copy(deep=True)
+    result.attrs = copy.deepcopy(frame.attrs)
+    for column in result.select_dtypes(include=["object"]).columns:
+        result[column] = result[column].map(copy.deepcopy)
+    return result
+
+
+def _readonly_array(value: Any, *, dtype=None) -> np.ndarray:
+    source = np.asarray(value, dtype=dtype)
+    result = np.array(source, copy=True, subok=False)
+    if result.dtype.hasobject:
+        for index in np.ndindex(result.shape):
+            result[index] = copy.deepcopy(source[index])
+    result.setflags(write=False)
+    return result
+
+
+def _freeze_snapshot(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return _readonly_array(value)
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {
+                copy.deepcopy(key): _freeze_snapshot(item)
+                for key, item in value.items()
+            }
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_snapshot(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_snapshot(item) for item in value)
+    if isinstance(value, pd.DataFrame):
+        return _dataframe_snapshot(value)
+    return copy.deepcopy(value)
+
+
+@dataclass(frozen=True, init=False, eq=False)
 class DlrPipelineResult:
-    physical_weather: pd.DataFrame
-    terrain_corrected_weather: pd.DataFrame
-    final_weather: pd.DataFrame
-    comparison_weather: pd.DataFrame
-    thermal_result: Mapping[str, Any]
-    max_currents: np.ndarray
+    _physical_weather: pd.DataFrame
+    _terrain_corrected_weather: pd.DataFrame
+    _final_weather: pd.DataFrame
+    _comparison_weather: pd.DataFrame
+    _thermal_result: Mapping[str, Any]
+    _max_currents: np.ndarray
     model_report: ModelRunReport
     weather_metrics: WeatherMetrics
     transient_fallbacks: tuple[str, ...] = ()
 
+    def __init__(
+        self,
+        physical_weather: pd.DataFrame,
+        terrain_corrected_weather: pd.DataFrame,
+        final_weather: pd.DataFrame,
+        comparison_weather: pd.DataFrame,
+        thermal_result: Mapping[str, Any],
+        max_currents: np.ndarray,
+        model_report: ModelRunReport,
+        weather_metrics: WeatherMetrics,
+        transient_fallbacks: tuple[str, ...] = (),
+    ):
+        if not isinstance(thermal_result, Mapping):
+            raise TypeError("thermal_result must be a mapping")
+        weather_stages = {
+            "_physical_weather": physical_weather,
+            "_terrain_corrected_weather": terrain_corrected_weather,
+            "_final_weather": final_weather,
+            "_comparison_weather": comparison_weather,
+        }
+        for name, frame in weather_stages.items():
+            object.__setattr__(self, name, _dataframe_snapshot(frame))
+        object.__setattr__(self, "_thermal_result", _freeze_snapshot(thermal_result))
+        object.__setattr__(
+            self,
+            "_max_currents",
+            _readonly_array(max_currents, dtype=float),
+        )
+        object.__setattr__(self, "model_report", model_report)
+        object.__setattr__(self, "weather_metrics", weather_metrics)
+        object.__setattr__(
+            self, "transient_fallbacks", tuple(transient_fallbacks)
+        )
+
+    @property
+    def physical_weather(self) -> pd.DataFrame:
+        return _dataframe_snapshot(self._physical_weather)
+
+    @property
+    def terrain_corrected_weather(self) -> pd.DataFrame:
+        return _dataframe_snapshot(self._terrain_corrected_weather)
+
+    @property
+    def final_weather(self) -> pd.DataFrame:
+        return _dataframe_snapshot(self._final_weather)
+
+    @property
+    def comparison_weather(self) -> pd.DataFrame:
+        return _dataframe_snapshot(self._comparison_weather)
+
+    @property
+    def thermal_result(self) -> Mapping[str, Any]:
+        return self._thermal_result
+
+    @property
+    def max_currents(self) -> np.ndarray:
+        return self._max_currents
+
     def to_legacy_line_data(self) -> dict[str, Any]:
-        tower_ids = tuple(self.thermal_result.get("tower_ids", ()))
-        timestamps = self.thermal_result.get("timestamps")
-        default_towers, default_timestamps = _weather_axes(self.final_weather)
+        tower_ids = tuple(self._thermal_result.get("tower_ids", ()))
+        timestamps = self._thermal_result.get("timestamps")
+        default_towers, default_timestamps = _weather_axes(self._final_weather)
         tower_ids = tower_ids or default_towers
         timestamps = pd.DatetimeIndex(
             default_timestamps if timestamps is None else timestamps
@@ -127,24 +295,24 @@ class DlrPipelineResult:
         def matrix(frame: pd.DataFrame, column: str) -> np.ndarray:
             return _long_frame_matrix(frame, column, tower_ids, timestamps)
 
-        physical_winds = matrix(self.physical_weather, "wind_speed")
-        physical_temps = matrix(self.physical_weather, "ambient_temp")
-        physical_solar = matrix(self.physical_weather, "solar_radiation")
+        physical_winds = matrix(self._physical_weather, "wind_speed")
+        physical_temps = matrix(self._physical_weather, "ambient_temp")
+        physical_solar = matrix(self._physical_weather, "solar_radiation")
         local_solar = matrix(
-            self.terrain_corrected_weather, "solar_radiation_local"
+            self._terrain_corrected_weather, "solar_radiation_local"
         )
         vertical_factors = matrix(
-            self.terrain_corrected_weather, "vertical_wind_factor"
+            self._terrain_corrected_weather, "vertical_wind_factor"
         )
         terrain_factors = matrix(
-            self.terrain_corrected_weather, "terrain_wind_factor"
+            self._terrain_corrected_weather, "terrain_wind_factor"
         )
 
         elevations = []
         terrain_data = {}
         for index, tower_id in enumerate(tower_ids):
-            tower = self.final_weather.loc[
-                self.final_weather["tower_id"].astype(str) == tower_id
+            tower = self._final_weather.loc[
+                self._final_weather["tower_id"].astype(str) == tower_id
             ]
             row = tower.iloc[0]
             elevations.append(float(row["elevation"]))
@@ -153,21 +321,21 @@ class DlrPipelineResult:
                 "elevation": float(row["elevation"]),
                 "slope": float(row["slope"]),
                 "aspect": float(row["aspect"]),
-                "source": row["source"],
-                "reason": row["reason"],
+                "source": copy.deepcopy(row["source"]),
+                "reason": copy.deepcopy(row["reason"]),
             }
 
         fractional_hours = _fractional_hours(timestamps)
-        solar = matrix(self.final_weather, "solar_radiation")
-        temps = matrix(self.final_weather, "ambient_temp")
-        winds = matrix(self.final_weather, "wind_speed")
-        angles = matrix(self.final_weather, "wind_angle_deg")
-        max_currents = np.asarray(self.max_currents, dtype=float).copy()
+        solar = matrix(self._final_weather, "solar_radiation")
+        temps = matrix(self._final_weather, "ambient_temp")
+        winds = matrix(self._final_weather, "wind_speed")
+        angles = matrix(self._final_weather, "wind_angle_deg")
+        max_currents = np.asarray(self._max_currents, dtype=float).copy()
         corrected_winds = np.asarray(
-            self.thermal_result["corrected_winds"], dtype=float
+            self._thermal_result["corrected_winds"], dtype=float
         ).copy()
         local_temps = np.asarray(
-            self.thermal_result["local_temps"], dtype=float
+            self._thermal_result["local_temps"], dtype=float
         ).copy()
         expected_shape = (len(tower_ids), len(timestamps))
         for name, values in (
@@ -210,7 +378,9 @@ class DlrPipelineResult:
             "local_temps": local_temps,
             "sunrise": sunrise,
             "sunset": sunset,
-            "comparison_weather": self.comparison_weather.copy(deep=True),
+            "comparison_weather": _dataframe_snapshot(
+                self._comparison_weather
+            ),
             "model_report": self.model_report,
             "weather_metrics": self.weather_metrics,
             "correction_stage": "final",
@@ -390,6 +560,151 @@ def _stable_hash(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _array_fingerprint(value: Any) -> dict[str, Any]:
+    array = np.asarray(value)
+    if array.dtype.hasobject:
+        raise TypeError("runtime context arrays cannot use object dtype")
+    contiguous = np.ascontiguousarray(array)
+    return {
+        "dtype": array.dtype.str,
+        "shape": list(array.shape),
+        "content_sha256": hashlib.sha256(
+            contiguous.tobytes(order="C")
+        ).hexdigest(),
+    }
+
+
+def _context_value(context: Any, name: str, default: Any = None) -> Any:
+    if isinstance(context, Mapping):
+        return context.get(name, default)
+    return getattr(context, name, default)
+
+
+def _canonical_crs(value: Any) -> str:
+    if value is None:
+        return "crs-unavailable-v1"
+    crs = CRS.from_user_input(value)
+    authority = crs.to_authority()
+    if authority is not None:
+        return f"{authority[0].upper()}:{authority[1]}"
+    return crs.to_wkt(version="WKT2_2019", pretty=False)
+
+
+def _dem_context_hashes(context: Any) -> tuple[str, str]:
+    elevation = _context_value(context, "elevation")
+    if elevation is None:
+        raise ValueError("dem_context must contain elevation")
+    mask = _context_value(
+        context,
+        "mask",
+        np.zeros(np.asarray(elevation).shape, dtype=bool),
+    )
+    transform = _context_value(context, "transform")
+    transform_values = (
+        None
+        if transform is None
+        else [float(value) for value in tuple(transform)[:6]]
+    )
+    bounds = _context_value(context, "bounds")
+    bounds_values = (
+        None if bounds is None else [float(value) for value in tuple(bounds)]
+    )
+    payload = {
+        "version": "dem-context-v1",
+        "elevation": _array_fingerprint(elevation),
+        "mask": _array_fingerprint(mask),
+        "transform": transform_values,
+        "bounds": bounds_values,
+        "nodata": _context_value(context, "nodata"),
+    }
+    crs = _canonical_crs(_context_value(context, "crs"))
+    return _stable_hash(payload), _stable_hash(crs)
+
+
+def _coordinate_context_hash(context: Mapping[Any, Any]) -> str:
+    coordinates = []
+    for tower_id, value in context.items():
+        if not isinstance(value, Mapping):
+            continue
+        longitude = _finite_coordinate(value.get("lon", value.get("longitude")))
+        latitude = _finite_coordinate(value.get("lat", value.get("latitude")))
+        if longitude is None or latitude is None:
+            continue
+        coordinates.append((str(tower_id), longitude, latitude))
+    return _stable_hash(sorted(coordinates))
+
+
+def _finite_coordinate(value: Any) -> Optional[float]:
+    try:
+        coordinate = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(coordinate):
+        return None
+    return 0.0 if coordinate == 0.0 else coordinate
+
+
+def derive_line_id(
+    weather: pd.DataFrame,
+    *,
+    tower_coords: Optional[Mapping[Any, Any]] = None,
+) -> str:
+    """Derive a stable model namespace from tower topology and coordinates."""
+    if not isinstance(weather, pd.DataFrame):
+        raise TypeError("weather must be a pandas DataFrame")
+    if "tower_id" not in weather.columns:
+        raise ValueError("weather must contain tower_id")
+    tower_ids = tuple(sorted(weather["tower_id"].astype(str).unique()))
+    if not tower_ids:
+        raise ValueError("weather must contain at least one tower")
+
+    coordinates_by_id = {
+        str(key): value
+        for key, value in (tower_coords or {}).items()
+        if isinstance(value, Mapping)
+    }
+    weather_coordinates: dict[str, set[tuple[float, float]]] = {}
+    if {"longitude", "latitude"} <= set(weather.columns):
+        projection = weather.loc[
+            :, ["tower_id", "longitude", "latitude"]
+        ].copy()
+        projection["tower_id"] = projection["tower_id"].astype(str)
+        for row in projection.itertuples(index=False):
+            longitude = _finite_coordinate(row.longitude)
+            latitude = _finite_coordinate(row.latitude)
+            if longitude is not None and latitude is not None:
+                weather_coordinates.setdefault(str(row.tower_id), set()).add(
+                    (longitude, latitude)
+                )
+
+    selected_coordinates = []
+    for tower_id in tower_ids:
+        coordinates = coordinates_by_id.get(tower_id, {})
+        longitude = _finite_coordinate(
+            coordinates.get("lon", coordinates.get("longitude"))
+        )
+        latitude = _finite_coordinate(
+            coordinates.get("lat", coordinates.get("latitude"))
+        )
+        if longitude is not None and latitude is not None:
+            selected_coordinates.append((tower_id, longitude, latitude))
+            continue
+        selected_coordinates.extend(
+            (tower_id, weather_lon, weather_lat)
+            for weather_lon, weather_lat in sorted(
+                weather_coordinates.get(tower_id, set())
+            )
+        )
+
+    payload = {
+        "version": "line-identity-v2",
+        "tower_ids": tower_ids,
+        "coordinates": selected_coordinates,
+    }
+    mode = "coordinates" if selected_coordinates else "topology"
+    return f"line-{mode}-{_stable_hash(payload)[:24]}"
+
+
 class DlrPipeline:
     def __init__(
         self,
@@ -401,9 +716,30 @@ class DlrPipeline:
         thermal_adapter: Optional[Any] = None,
     ):
         self.correction_service = correction_service or WeatherCorrectionService()
-        self.trainer = trainer or ResidualTrainer()
+        self.trainer = trainer
         self.registry = registry or ModelRegistry(model_root)
         self.thermal_adapter = thermal_adapter or LongFrameThermalAdapter()
+
+    def _trainer_for_interval(self, interval_minutes: float) -> ResidualTrainer:
+        cadence = float(interval_minutes)
+        if self.trainer is None:
+            return ResidualTrainer(
+                feature_builder=FeatureBuilder(cadence_minutes=cadence)
+            )
+        feature_builder = getattr(self.trainer, "feature_builder", None)
+        configured_cadence = getattr(feature_builder, "cadence_minutes", None)
+        if configured_cadence is None:
+            if not np.isclose(cadence, float(DEFAULT_INTERVAL_MINUTES)):
+                raise ValueError(
+                    "injected trainer must declare cadence_minutes for "
+                    "a non-default pipeline cadence"
+                )
+            return self.trainer
+        if not np.isclose(float(configured_cadence), cadence):
+            raise ValueError(
+                "injected trainer cadence does not match interval_minutes"
+            )
+        return self.trainer
 
     @staticmethod
     def _weather_frame(value, *, role: str) -> pd.DataFrame:
@@ -479,6 +815,9 @@ class DlrPipeline:
         *,
         conductor: Mapping[str, Any],
         correction_options: CorrectionOptions,
+        interval_minutes: float,
+        dem_context: Any = None,
+        coordinate_context: Optional[Mapping[Any, Any]] = None,
     ) -> ModelCompatibility:
         coordinate_columns = [
             column
@@ -494,12 +833,25 @@ class DlrPipeline:
         terrain_projection = frame.loc[
             :, ["tower_id", "elevation", "slope", "aspect", "source", "reason"]
         ].drop_duplicates().sort_values("tower_id", kind="mergesort")
+        if dem_context is None:
+            dem_hash = _stable_hash(terrain_projection.to_dict(orient="records"))
+            crs_hash = _stable_hash("crs-unavailable-v1")
+        else:
+            dem_hash, crs_hash = _dem_context_hashes(dem_context)
+        coordinate_hash = (
+            _stable_hash(coordinates)
+            if coordinate_context is None
+            else _coordinate_context_hash(coordinate_context)
+        )
         return ModelCompatibility(
-            dem_hash=_stable_hash(terrain_projection.to_dict(orient="records")),
-            crs_hash=_stable_hash("crs-unavailable-v1"),
-            coordinate_hash=_stable_hash(coordinates),
+            dem_hash=dem_hash,
+            crs_hash=crs_hash,
+            coordinate_hash=coordinate_hash,
             conductor_hash=_stable_hash(conductor),
-            feature_version="weather-features-v1",
+            feature_version=(
+                "weather-features-v1-cadence-"
+                f"{float(interval_minutes):.12g}m"
+            ),
             correction_config_hash=_stable_hash(correction_options),
         )
 
@@ -509,10 +861,13 @@ class DlrPipeline:
             "wind_speed_physical",
             "ambient_temp_physical",
             "solar_radiation_physical",
+            "source_file_hash",
         }
-        return frame.drop(
+        result = frame.drop(
             columns=[column for column in conflicting_aliases if column in frame],
         )
+        result.attrs.pop("source_file_hashes", None)
+        return result
 
     @staticmethod
     def _alignment_truth(frame: pd.DataFrame) -> pd.DataFrame:
@@ -529,11 +884,12 @@ class DlrPipeline:
                 "elevation",
                 "measurement_height",
                 "dataset_role",
-                "source_file_hash",
             )
             if column in frame.columns
         ]
-        return frame.loc[:, allowed].copy(deep=True)
+        result = frame.loc[:, allowed].copy(deep=True)
+        result.attrs.pop("source_file_hashes", None)
+        return result
 
     @staticmethod
     def _common_time_weather(frame: pd.DataFrame) -> pd.DataFrame:
@@ -581,6 +937,8 @@ class DlrPipeline:
         line_id: str,
         interval_minutes: int = DEFAULT_INTERVAL_MINUTES,
         terrain_lookup: Optional[Mapping[Any, Any]] = None,
+        dem_context: Any = None,
+        coordinate_context: Optional[Mapping[Any, Any]] = None,
         correction_options: Optional[CorrectionOptions] = None,
         ai_enabled: bool = False,
         conductor: Mapping[str, Any],
@@ -589,6 +947,7 @@ class DlrPipeline:
         transient_request: Optional[Mapping[str, Any]] = None,
     ) -> DlrPipelineResult:
         options = correction_options or CorrectionOptions()
+        trainer = self._trainer_for_interval(interval_minutes)
         physical_input = self._weather_frame(physical, role="physical")
         physical_weather = resample_weather_by_tower(
             physical_input, interval_minutes=interval_minutes
@@ -606,6 +965,9 @@ class DlrPipeline:
             terrain_corrected,
             conductor=conductor,
             correction_options=options,
+            interval_minutes=interval_minutes,
+            dem_context=dem_context,
+            coordinate_context=coordinate_context,
         )
         keys = [
             ModelKey(str(project_id), str(line_id), str(tower_id), target)
@@ -632,24 +994,24 @@ class DlrPipeline:
         if ai_enabled and truth is not None:
             try:
                 truth_frame = self._weather_frame(truth, role="truth")
-                ensure_distinct_dataset_hashes(physical_input, truth_frame)
-                aligned, alignment_report = align_physical_and_truth(
-                    self._alignment_physical(terrain_corrected),
-                    self._alignment_truth(truth_frame),
-                    tolerance=truth_tolerance,
-                    roughness_alpha=options.roughness_alpha,
-                    temp_lapse_rate=options.temp_lapse_rate,
-                )
-            except ValueError as exc:
-                reason = (
-                    "truth_rejected_same_source_hash"
-                    if "同一文件哈希" in str(exc)
-                    else f"truth_alignment_failed:{type(exc).__name__}"
-                )
-                fallbacks.append(
-                    ModelFallback(None, reason)
-                )
-                aligned = None
+                if _weather_content_overlaps(physical_input, truth_frame):
+                    fallbacks.append(
+                        ModelFallback(
+                            None,
+                            "truth_rejected_overlapping_content",
+                        )
+                    )
+                    truth_frame = None
+                if truth_frame is None:
+                    aligned = None
+                else:
+                    aligned, alignment_report = align_physical_and_truth(
+                        self._alignment_physical(terrain_corrected),
+                        self._alignment_truth(truth_frame),
+                        tolerance=truth_tolerance,
+                        roughness_alpha=options.roughness_alpha,
+                        temp_lapse_rate=options.temp_lapse_rate,
+                    )
             except Exception as exc:
                 fallbacks.append(
                     ModelFallback(None, f"truth_alignment_failed:{type(exc).__name__}")
@@ -673,7 +1035,7 @@ class DlrPipeline:
                         fallbacks.append(ModelFallback(key, "no_aligned_truth"))
                         continue
                     try:
-                        training = self.trainer.train_target(
+                        training = trainer.train_target(
                             tower_training,
                             key.target,
                             physical_col=physical_column,
@@ -720,27 +1082,54 @@ class DlrPipeline:
                     continue
                 row_mask = prediction["tower_id"].astype(str) == key.tower_id
                 tower = prediction.loc[row_mask].copy()
-                predicted = ResidualPredictor(
-                    {key.target: load_result.bundle}
-                ).predict(
-                    tower,
-                    target_name=key.target,
-                    physical_col=_LOCAL_COLUMNS[key.target],
-                )
-                prediction.loc[row_mask, f"{key.target}_final"] = predicted[
-                    f"{key.target}_final"
-                ].to_numpy()
-                prediction.loc[row_mask, f"{key.target}_residual"] = predicted[
-                    f"{key.target}_residual"
-                ].to_numpy()
-                prediction.loc[row_mask, f"{key.target}_used_ai"] = predicted[
-                    "used_ai"
-                ].to_numpy(dtype=bool)
-                prediction.loc[row_mask, f"{key.target}_fallback_reason"] = predicted[
-                    "fallback_reason"
-                ].to_numpy(dtype=object)
-                if predicted["used_ai"].any():
+                try:
+                    predicted = ResidualPredictor(
+                        {key.target: load_result.bundle}
+                    ).predict(
+                        tower,
+                        target_name=key.target,
+                        physical_col=_LOCAL_COLUMNS[key.target],
+                    )
+                    final, residual, used_ai, prediction_reasons = (
+                        _validated_prediction_output(
+                            predicted,
+                            tower.index,
+                            key.target,
+                        )
+                    )
+                    candidate = prediction.copy(deep=True)
+                    candidate.loc[row_mask, f"{key.target}_final"] = final
+                    candidate.loc[row_mask, f"{key.target}_residual"] = residual
+                    candidate.loc[row_mask, f"{key.target}_used_ai"] = used_ai
+                    candidate.loc[
+                        row_mask, f"{key.target}_fallback_reason"
+                    ] = prediction_reasons
+                    prediction = candidate
+                except Exception as exc:
+                    reason = f"prediction_failed:{type(exc).__name__}"
+                    prediction.loc[row_mask, f"{key.target}_final"] = prediction.loc[
+                        row_mask, _LOCAL_COLUMNS[key.target]
+                    ].to_numpy()
+                    prediction.loc[row_mask, f"{key.target}_residual"] = 0.0
+                    prediction.loc[row_mask, f"{key.target}_used_ai"] = False
+                    prediction.loc[
+                        row_mask, f"{key.target}_fallback_reason"
+                    ] = reason
+                    fallbacks.append(ModelFallback(key, reason))
+                    continue
+                if used_ai.any():
                     used_targets.append(key)
+                else:
+                    failed_reasons = {
+                        str(reason)
+                        for reason in prediction_reasons
+                        if not pd.isna(reason)
+                        if str(reason).startswith("prediction_failed:")
+                    }
+                    fallbacks.extend(
+                        ModelFallback(key, reason)
+                        for reason in sorted(failed_reasons)
+                    )
 
         comparison = prediction.loc[
             :,

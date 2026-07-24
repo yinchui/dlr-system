@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import hashlib
 from io import BytesIO
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
@@ -35,6 +36,12 @@ class WeatherUploadResult:
     frame: pd.DataFrame
     report: DataQualityReport
     files: tuple[NormalizedWeatherFile, ...]
+
+
+@dataclass(frozen=True)
+class OptionalTruthNormalization:
+    snapshot: Optional[WeatherUploadResult]
+    warning: Optional[str]
 
 
 def freeze_uploaded_file(uploaded_file) -> UploadBlob:
@@ -161,6 +168,29 @@ def normalize_uploaded_weather_files(
         report=report,
         files=tuple(normalized_files),
     )
+
+
+def normalize_optional_truth_weather(
+    uploaded_files,
+    *,
+    ai_enabled: bool,
+    normalizer=None,
+) -> OptionalTruthNormalization:
+    if not ai_enabled or not uploaded_files:
+        return OptionalTruthNormalization(snapshot=None, warning=None)
+
+    normalize = normalizer or normalize_uploaded_weather_files
+    try:
+        snapshot = normalize(uploaded_files, role="truth")
+    except Exception as exc:
+        return OptionalTruthNormalization(
+            snapshot=None,
+            warning=(
+                "真实气象数据解析失败，已跳过 AI 训练并继续物理 DLR "
+                f"计算：{exc}"
+            ),
+        )
+    return OptionalTruthNormalization(snapshot=snapshot, warning=None)
 
 
 def _extract_source_hashes(dataset) -> set[str]:

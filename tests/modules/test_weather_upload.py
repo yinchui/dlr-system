@@ -156,6 +156,92 @@ def test_normalize_uploaded_weather_files_supports_xlsx():
     assert uploaded.getvalue_calls == 1
 
 
+def test_optional_truth_skips_normalizer_when_ai_is_disabled():
+    weather_upload = weather_upload_module()
+    uploaded = FakeUploadedFile("truth.csv", b"not-weather")
+
+    def exploding_normalizer(*args, **kwargs):
+        raise AssertionError("AI 关闭时不应访问真值解析器")
+
+    result = weather_upload.normalize_optional_truth_weather(
+        [uploaded],
+        ai_enabled=False,
+        normalizer=exploding_normalizer,
+    )
+
+    assert result.snapshot is None
+    assert result.warning is None
+    assert uploaded.getvalue_calls == 0
+
+
+def test_optional_truth_skips_normalizer_when_no_file_is_uploaded():
+    weather_upload = weather_upload_module()
+
+    def exploding_normalizer(*args, **kwargs):
+        raise AssertionError("没有真值文件时不应访问解析器")
+
+    result = weather_upload.normalize_optional_truth_weather(
+        [],
+        ai_enabled=True,
+        normalizer=exploding_normalizer,
+    )
+
+    assert result.snapshot is None
+    assert result.warning is None
+
+
+def test_optional_truth_bad_csv_becomes_a_non_blocking_warning():
+    weather_upload = weather_upload_module()
+    uploaded = FakeUploadedFile(
+        "truth.csv",
+        b"not,a,weather\n1,2,3\n",
+    )
+
+    result = weather_upload.normalize_optional_truth_weather(
+        [uploaded],
+        ai_enabled=True,
+    )
+
+    assert result.snapshot is None
+    assert "真实气象数据解析失败" in result.warning
+    assert uploaded.getvalue_calls == 1
+
+
+def test_optional_truth_bad_xlsx_becomes_a_non_blocking_warning():
+    weather_upload = weather_upload_module()
+    uploaded = FakeUploadedFile("truth.xlsx", b"not-an-excel-workbook")
+
+    result = weather_upload.normalize_optional_truth_weather(
+        [uploaded],
+        ai_enabled=True,
+    )
+
+    assert result.snapshot is None
+    assert "真实气象数据解析失败" in result.warning
+    assert uploaded.getvalue_calls == 1
+
+
+def test_optional_truth_rejects_the_whole_mixed_batch_on_one_bad_file():
+    weather_upload = weather_upload_module()
+    valid = to_csv_upload(
+        "valid.csv", make_tower_time_weather_dataframe().iloc[[0]]
+    )
+    invalid = FakeUploadedFile(
+        "invalid.csv",
+        b"not,a,weather\n1,2,3\n",
+    )
+
+    result = weather_upload.normalize_optional_truth_weather(
+        [valid, invalid],
+        ai_enabled=True,
+    )
+
+    assert result.snapshot is None
+    assert "真实气象数据解析失败" in result.warning
+    assert valid.getvalue_calls == 1
+    assert invalid.getvalue_calls == 1
+
+
 @pytest.mark.parametrize("extension", ["json", "xls"])
 def test_normalize_uploaded_weather_files_rejects_unsupported_extension(extension):
     weather_upload = weather_upload_module()

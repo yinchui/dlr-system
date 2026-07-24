@@ -10,7 +10,10 @@ from modules.data_processor import normalize_weather_input_dataframe
 from modules.dlr_pipeline import DlrPipeline, derive_line_id
 from modules import terrain as terrain_module
 from modules.weather_correction import CorrectionOptions, WeatherCorrectionService
-from modules.weather_upload import normalize_uploaded_weather_files
+from modules.weather_upload import (
+    normalize_optional_truth_weather,
+    normalize_uploaded_weather_files,
+)
 import os
 
 
@@ -654,16 +657,17 @@ with tab_line:
 
         try:
             status_text.text("正在规范化物理气象数据...")
+            corr_cfg = st.session_state.get('correction_config', {})
             physical_snapshot = normalize_uploaded_weather_files(
                 weather_files, role="physical"
             )
-            truth_snapshot = (
-                normalize_uploaded_weather_files(
-                    truth_weather_files, role="truth"
-                )
-                if truth_weather_files
-                else None
+            truth_normalization = normalize_optional_truth_weather(
+                truth_weather_files,
+                ai_enabled=bool(corr_cfg.get('ai_enabled', False)),
             )
+            truth_snapshot = truth_normalization.snapshot
+            if truth_normalization.warning:
+                st.warning(truth_normalization.warning)
 
             progress_bar.progress(30)
             status_text.text("正在构建地形修正表...")
@@ -683,7 +687,6 @@ with tab_line:
             else:
                 st.warning("⚠️ 未加载地形数据，将使用气象文件海拔")
 
-            corr_cfg = st.session_state.get('correction_config', {})
             options = CorrectionOptions(
                 enable_vertical=bool(corr_cfg.get('vertical', False)),
                 enable_terrain=bool(corr_cfg.get('terrain', False)),
@@ -703,7 +706,7 @@ with tab_line:
             status_text.text("正在修正气象并进行热平衡计算...")
             pipeline = DlrPipeline()
             line_id = derive_line_id(
-                physical_snapshot.frame,
+                physical_snapshot,
                 tower_coords=st.session_state.tower_coords,
             )
             result = pipeline.run(

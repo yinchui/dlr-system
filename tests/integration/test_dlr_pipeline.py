@@ -15,6 +15,7 @@ from modules.dlr_pipeline import (
     DlrPipeline,
     DlrPipelineResult,
     LongFrameThermalAdapter,
+    ModelRunReport,
     derive_line_id,
 )
 from modules.model_registry import ModelKey, ModelLoadResult
@@ -115,13 +116,16 @@ def test_derived_line_id_is_stable_across_weather_and_coordinate_order():
     )
 
 
-def test_derived_line_id_without_coordinates_uses_only_tower_topology():
+def test_derived_line_id_without_coordinates_uses_stable_source_lineage():
     first = _weather("physical")
     second = first.iloc[::-1].copy()
     second["source_file_hash"] = "another-weather-upload"
-    second["ambient_temp"] += 10.0
 
     assert derive_line_id(first, tower_coords={}) == derive_line_id(
+        first.iloc[::-1].reset_index(drop=True),
+        tower_coords=None,
+    )
+    assert derive_line_id(first, tower_coords={}) != derive_line_id(
         second,
         tower_coords=None,
     )
@@ -129,6 +133,49 @@ def test_derived_line_id_without_coordinates_uses_only_tower_topology():
         first.loc[first["tower_id"] == "001"],
         tower_coords={},
     )
+
+
+def test_derived_line_id_without_coordinates_or_lineage_uses_weather_content():
+    first = _weather("physical").drop(columns="source_file_hash")
+    changed = first.copy(deep=True)
+    changed["ambient_temp"] += 10.0
+
+    assert derive_line_id(first, tower_coords={}) == derive_line_id(
+        first.iloc[::-1].reset_index(drop=True),
+        tower_coords=None,
+    )
+    assert derive_line_id(first, tower_coords={}) != derive_line_id(
+        changed,
+        tower_coords=None,
+    )
+
+
+def test_derived_line_id_reuses_models_for_the_same_reordered_upload(tmp_path):
+    physical = _weather("physical")
+    reordered = physical.iloc[::-1].reset_index(drop=True)
+    line_id = derive_line_id(physical, tower_coords={})
+    pipeline = DlrPipeline(model_root=tmp_path)
+
+    first = pipeline.run(
+        physical=physical,
+        truth=_weather("truth", truth_offset=True),
+        project_id="project-a",
+        line_id=line_id,
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+    second = pipeline.run(
+        physical=reordered,
+        project_id="project-a",
+        line_id=derive_line_id(reordered, tower_coords={}),
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    assert first.model_report.trained_targets
+    assert second.model_report.loaded_targets == first.model_report.trained_targets
 
 
 def _dem_context(values, *, crs="EPSG:4326") -> DemGrid:
@@ -314,6 +361,73 @@ def test_pipeline_trains_missing_models_then_reuses_them(tmp_path):
     np.testing.assert_allclose(first.max_currents, second.max_currents)
 
 
+class _CountingTrainer:
+    def __init__(self):
+        self.delegate = ResidualTrainer()
+        self.feature_builder = self.delegate.feature_builder
+        self.calls = []
+
+    def train_target(self, frame, target, **kwargs):
+        self.calls.append((str(frame["tower_id"].iloc[0]), target))
+        return self.delegate.train_target(frame, target, **kwargs)
+
+
+def test_pipeline_does_not_retrain_loaded_models_when_truth_is_reuploaded(
+    tmp_path,
+):
+    trainer = _CountingTrainer()
+    pipeline = DlrPipeline(model_root=tmp_path, trainer=trainer)
+    run_kwargs = {
+        "physical": _weather("physical"),
+        "truth": _weather("truth", truth_offset=True),
+        "project_id": "project-a",
+        "line_id": "line-a",
+        "terrain_lookup": {},
+        "ai_enabled": True,
+        "conductor": _conductor(),
+    }
+
+    first = pipeline.run(**run_kwargs)
+    second = pipeline.run(**run_kwargs)
+
+    assert len(trainer.calls) == 4
+    assert len(first.model_report.trained_targets) == 4
+    assert second.model_report.loaded_targets == first.model_report.trained_targets
+    assert second.model_report.used_targets == first.model_report.trained_targets
+    assert second.model_report.trained_targets == ()
+
+
+def test_pipeline_retrains_only_the_corrupt_model_when_truth_is_available(
+    tmp_path,
+):
+    trainer = _CountingTrainer()
+    pipeline = DlrPipeline(model_root=tmp_path, trainer=trainer)
+    run_kwargs = {
+        "physical": _weather("physical"),
+        "truth": _weather("truth", truth_offset=True),
+        "project_id": "project-a",
+        "line_id": "line-a",
+        "terrain_lookup": {},
+        "ai_enabled": True,
+        "conductor": _conductor(),
+    }
+    first = pipeline.run(**run_kwargs)
+    damaged = ModelKey("project-a", "line-a", "001", "wind_speed")
+    pipeline.registry.path_for(damaged).write_bytes(b"not-a-model")
+    trainer.calls.clear()
+
+    repaired = pipeline.run(**run_kwargs)
+
+    assert trainer.calls == [(damaged.tower_id, damaged.target)]
+    assert repaired.model_report.loaded_targets == tuple(
+        key for key in first.model_report.trained_targets if key != damaged
+    )
+    assert repaired.model_report.trained_targets == (damaged,)
+    assert set(repaired.model_report.used_targets) == set(
+        first.model_report.trained_targets
+    )
+
+
 def test_pipeline_interval_controls_training_bundle_and_model_compatibility(
     tmp_path,
 ):
@@ -415,6 +529,85 @@ def test_mismatched_trainer_cadence_fails_only_matched_training_keys(tmp_path):
         fallback.reason == "training_failed:ValueError"
         for fallback in result.model_report.fallbacks
     ) == 4
+
+
+class _UnusedCompatibility:
+    def __bool__(self):
+        raise AssertionError("AI-disabled run evaluated model compatibility")
+
+
+class _UnusedRegistry:
+    def load_many(self, *args, **kwargs):
+        raise AssertionError("AI-disabled run accessed model registry")
+
+    def promote(self, *args, **kwargs):
+        raise AssertionError("AI-disabled run accessed model registry")
+
+    def load(self, *args, **kwargs):
+        raise AssertionError("AI-disabled run accessed model registry")
+
+
+def test_ai_disabled_runs_without_constructing_model_registry():
+    pipeline = DlrPipeline(model_root="/dev/null/models")
+    result = pipeline.run(
+        physical=_weather("physical"),
+        project_id="../not-a-model-project",
+        line_id="invalid/model/line",
+        terrain_lookup={},
+        ai_enabled=False,
+        conductor=_conductor(),
+        model_compatibility=_UnusedCompatibility(),
+    )
+
+    assert result.max_currents.shape == (2, 2)
+    assert result.model_report == ModelRunReport()
+    assert pipeline.registry is None
+
+
+def test_ai_disabled_does_not_access_injected_model_dependencies(tmp_path):
+    registry = _UnusedRegistry()
+    result = DlrPipeline(model_root=tmp_path, registry=registry).run(
+        physical=_weather("physical"),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=False,
+        conductor=_conductor(),
+        model_compatibility=_UnusedCompatibility(),
+    )
+
+    assert result.max_currents.shape == (2, 2)
+    assert result.model_report == ModelRunReport()
+
+
+def test_invalid_optional_truth_still_calculates_physical_dlr(tmp_path):
+    from modules import weather_upload
+
+    class InvalidTruthUpload:
+        name = "truth.csv"
+
+        @staticmethod
+        def getvalue():
+            return b"not,a,weather\n1,2,3\n"
+
+    truth = weather_upload.normalize_optional_truth_weather(
+        [InvalidTruthUpload()],
+        ai_enabled=True,
+    )
+    result = DlrPipeline(model_root=tmp_path).run(
+        physical=_weather("physical"),
+        truth=truth.snapshot,
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    assert truth.snapshot is None
+    assert truth.warning
+    assert result.max_currents.shape == (2, 2)
+    assert not result.model_report.trained_targets
 
 
 class _SpyThermalAdapter:
@@ -1264,9 +1457,11 @@ def test_page_adds_truth_upload_and_normalizes_each_role_once():
     assert "accept_multiple_files=True" in source[
         truth_upload_start:truth_upload_end
     ]
-    assert source.count("normalize_uploaded_weather_files(") == 2
+    assert source.count("normalize_uploaded_weather_files(") == 1
+    assert source.count("normalize_optional_truth_weather(") == 1
     assert 'role="physical"' in source
-    assert 'role="truth"' in source
+    assert "truth_normalization.warning" in source
+    assert "st.warning(truth_normalization.warning)" in source
     assert "physical_weather_snapshot" in source
     assert "truth_weather_snapshot" in source
 
@@ -1295,6 +1490,7 @@ def test_page_derives_line_namespace_and_passes_runtime_contexts():
     button_block = source[button_start:button_end]
 
     assert "derive_line_id(" in button_block
+    assert "derive_line_id(\n                physical_snapshot," in button_block
     assert 'line_id="main-line"' not in button_block
     assert "tower_coords=st.session_state.tower_coords" in button_block
     assert "dem_context=st.session_state.dem_data" in button_block

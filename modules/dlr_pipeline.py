@@ -700,17 +700,60 @@ def _finite_coordinate(value: Any) -> Optional[float]:
     return 0.0 if coordinate == 0.0 else coordinate
 
 
+def _nonempty_text_values(values: Any) -> tuple[str, ...]:
+    if values is None:
+        return ()
+    if isinstance(values, str):
+        candidates = (values,)
+    else:
+        try:
+            candidates = tuple(values)
+        except TypeError:
+            candidates = (values,)
+    result = set()
+    for value in candidates:
+        if value is None:
+            continue
+        missing = pd.isna(value)
+        if isinstance(missing, (bool, np.bool_)) and missing:
+            continue
+        text = str(value).strip()
+        if text:
+            result.add(text)
+    return tuple(sorted(result))
+
+
+def _line_source_lineage(
+    weather: Any,
+    frame: pd.DataFrame,
+) -> tuple[str, ...]:
+    if isinstance(weather, WeatherUploadResult):
+        file_hashes = _nonempty_text_values(
+            item.sha256 for item in weather.files
+        )
+        if file_hashes:
+            return file_hashes
+    for attribute in ("source_file_hashes", "source_file_hash"):
+        hashes = _nonempty_text_values(frame.attrs.get(attribute))
+        if hashes:
+            return hashes
+    if "source_file_hash" in frame.columns:
+        return _nonempty_text_values(frame["source_file_hash"])
+    return ()
+
+
 def derive_line_id(
-    weather: pd.DataFrame,
+    weather: Any,
     *,
     tower_coords: Optional[Mapping[Any, Any]] = None,
 ) -> str:
     """Derive a stable model namespace from tower topology and coordinates."""
-    if not isinstance(weather, pd.DataFrame):
-        raise TypeError("weather must be a pandas DataFrame")
-    if "tower_id" not in weather.columns:
+    frame = weather.frame if isinstance(weather, WeatherUploadResult) else weather
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError("weather must be a DataFrame or WeatherUploadResult")
+    if "tower_id" not in frame.columns:
         raise ValueError("weather must contain tower_id")
-    tower_ids = tuple(sorted(weather["tower_id"].astype(str).unique()))
+    tower_ids = tuple(sorted(frame["tower_id"].astype(str).unique()))
     if not tower_ids:
         raise ValueError("weather must contain at least one tower")
 
@@ -720,8 +763,8 @@ def derive_line_id(
         if isinstance(value, Mapping)
     }
     weather_coordinates: dict[str, set[tuple[float, float]]] = {}
-    if {"longitude", "latitude"} <= set(weather.columns):
-        projection = weather.loc[
+    if {"longitude", "latitude"} <= set(frame.columns):
+        projection = frame.loc[
             :, ["tower_id", "longitude", "latitude"]
         ].copy()
         projection["tower_id"] = projection["tower_id"].astype(str)
@@ -752,12 +795,20 @@ def derive_line_id(
             )
         )
 
-    payload = {
-        "version": "line-identity-v2",
-        "tower_ids": tower_ids,
-        "coordinates": selected_coordinates,
-    }
-    mode = "coordinates" if selected_coordinates else "topology"
+    payload = {"version": "line-identity-v3", "tower_ids": tower_ids}
+    if selected_coordinates:
+        mode = "coordinates"
+        payload["coordinates"] = selected_coordinates
+    else:
+        source_lineage = _line_source_lineage(weather, frame)
+        if source_lineage:
+            mode = "lineage"
+            payload["source_file_hashes"] = source_lineage
+        else:
+            mode = "weather"
+            payload["weather_content_hash"] = _stable_hash(
+                _canonical_weather_content(frame).to_dict(orient="records")
+            )
     return f"line-{mode}-{_stable_hash(payload)[:24]}"
 
 
@@ -773,8 +824,14 @@ class DlrPipeline:
     ):
         self.correction_service = correction_service or WeatherCorrectionService()
         self.trainer = trainer
-        self.registry = registry or ModelRegistry(model_root)
+        self.model_root = model_root
+        self.registry = registry
         self.thermal_adapter = thermal_adapter or LongFrameThermalAdapter()
+
+    def _registry_for_ai(self) -> ModelRegistry:
+        if self.registry is None:
+            self.registry = ModelRegistry(self.model_root)
+        return self.registry
 
     def _trainer_for_interval(self, interval_minutes: float) -> ResidualTrainer:
         cadence = float(interval_minutes)
@@ -1017,19 +1074,9 @@ class DlrPipeline:
             options,
         )
 
-        compatibility = model_compatibility or self._compatibility(
-            terrain_corrected,
-            conductor=conductor,
-            correction_options=options,
-            interval_minutes=interval_minutes,
-            dem_context=dem_context,
-            coordinate_context=coordinate_context,
-        )
-        keys = [
-            ModelKey(str(project_id), str(line_id), str(tower_id), target)
-            for tower_id in sorted(terrain_corrected["tower_id"].astype(str).unique())
-            for target in _TARGETS
-        ]
+        compatibility = None
+        keys = []
+        registry = None
         loaded = {}
         loaded_targets = []
         trained_targets = []
@@ -1039,7 +1086,27 @@ class DlrPipeline:
         alignment_report = None
 
         if ai_enabled:
-            loaded = self.registry.load_many(
+            registry = self._registry_for_ai()
+            compatibility = (
+                model_compatibility
+                if model_compatibility is not None
+                else self._compatibility(
+                    terrain_corrected,
+                    conductor=conductor,
+                    correction_options=options,
+                    interval_minutes=interval_minutes,
+                    dem_context=dem_context,
+                    coordinate_context=coordinate_context,
+                )
+            )
+            keys = [
+                ModelKey(str(project_id), str(line_id), str(tower_id), target)
+                for tower_id in sorted(
+                    terrain_corrected["tower_id"].astype(str).unique()
+                )
+                for target in _TARGETS
+            ]
+            loaded = registry.load_many(
                 keys,
                 expected_compatibility={key: compatibility for key in keys},
             )
@@ -1077,6 +1144,9 @@ class DlrPipeline:
             if aligned is not None:
                 matched = aligned.loc[aligned["truth_timestamp"].notna()].copy()
                 for key in keys:
+                    load_result = loaded.get(key)
+                    if load_result is not None and load_result.bundle is not None:
+                        continue
                     tower_training = matched.loc[
                         matched["tower_id"].astype(str) == key.tower_id
                     ].copy()
@@ -1105,10 +1175,10 @@ class DlrPipeline:
                             model_version=f"train-{training.metadata['input_data_hash'][:24]}",
                             compatibility=compatibility,
                         )
-                        decision = self.registry.promote(candidate)
+                        decision = registry.promote(candidate)
                         if decision.promoted:
                             trained_targets.append(key)
-                            loaded[key] = self.registry.load(
+                            loaded[key] = registry.load(
                                 key, expected_compatibility=compatibility
                             )
                         elif loaded.get(key) is None or loaded[key].bundle is None:

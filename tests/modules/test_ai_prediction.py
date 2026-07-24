@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from config.config import PROJECT_TIMEZONE
 from modules.ai_prediction import FeatureBuilder, ModelBundle, ResidualPredictor
 
 
@@ -223,6 +224,56 @@ def test_feature_columns_are_deterministic_and_cycles_are_finite():
     assert np.isfinite(
         first[builder.feature_columns("wind_speed_local")].to_numpy()
     ).all()
+
+
+def test_naive_feature_timestamps_are_localized_to_project_timezone():
+    frame = pd.DataFrame(
+        {
+            "tower_id": ["001"],
+            "timestamp": [pd.Timestamp("2025-01-01 08:00")],
+            "wind_speed_local": [3.0],
+        }
+    )
+
+    features = FeatureBuilder().transform(
+        frame, physical_col="wind_speed_local"
+    )
+
+    assert str(features["timestamp"].dt.tz) == PROJECT_TIMEZONE
+    assert features.loc[0, "hour"] == 8
+
+
+def test_equivalent_aware_timestamps_have_identical_project_time_features():
+    utc_frame = pd.DataFrame(
+        {
+            "tower_id": ["001"],
+            "timestamp": [pd.Timestamp("2025-01-01 00:00", tz="UTC")],
+            "wind_speed_local": [3.0],
+        }
+    )
+    local_frame = utc_frame.copy(deep=True)
+    local_frame["timestamp"] = [
+        pd.Timestamp("2025-01-01 08:00", tz=PROJECT_TIMEZONE)
+    ]
+
+    utc_features = FeatureBuilder().transform(
+        utc_frame, physical_col="wind_speed_local"
+    )
+    local_features = FeatureBuilder().transform(
+        local_frame, physical_col="wind_speed_local"
+    )
+
+    assert utc_features.loc[0, "timestamp"] == local_features.loc[0, "timestamp"]
+    cycle_columns = [
+        "hour_sin",
+        "hour_cos",
+        "day_of_year_sin",
+        "day_of_year_cos",
+    ]
+    assert np.allclose(
+        utc_features.loc[0, cycle_columns].to_numpy(dtype=float),
+        local_features.loc[0, cycle_columns].to_numpy(dtype=float),
+    )
 
 
 @pytest.mark.parametrize(

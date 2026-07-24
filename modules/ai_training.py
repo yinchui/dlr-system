@@ -335,7 +335,7 @@ class ResidualTrainer:
         if not np.isfinite(model_features.to_numpy(dtype=float)).all():
             raise ValueError("model features must contain finite values")
         segments = self.feature_builder.continuous_segments(working)
-        split = self._time_split(working, segments)
+        split = self._time_split(feature_frame, segments)
 
         if split is None:
             evaluation_mode = "full_fit"
@@ -386,7 +386,7 @@ class ResidualTrainer:
             final_bounds = _robust_residual_bounds(residual)
             full_fit_metrics = None
 
-        timestamp_values = pd.to_datetime(working["timestamp"], errors="coerce")
+        timestamp_values = feature_frame["timestamp"]
         metadata = {
             "line_id": line_id,
             "tower_id": tower_id,

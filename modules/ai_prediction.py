@@ -9,8 +9,13 @@ from typing import Optional
 import joblib
 import numpy as np
 import pandas as pd
+from pytz.exceptions import AmbiguousTimeError, NonExistentTimeError
 
-from config.config import DEFAULT_INTERVAL_MINUTES, PHYSICAL_BOUNDS
+from config.config import (
+    DEFAULT_INTERVAL_MINUTES,
+    PHYSICAL_BOUNDS,
+    PROJECT_TIMEZONE,
+)
 
 
 _OPTIONAL_FEATURES = {
@@ -130,13 +135,46 @@ class FeatureBuilder:
             raise ValueError("missing required column: timestamp")
         try:
             timestamps = pd.to_datetime(frame["timestamp"], errors="coerce")
-        except (TypeError, ValueError, OverflowError) as exc:
+            if timestamps.isna().any():
+                raise ValueError("timestamp contains missing or invalid values")
+            if isinstance(timestamps.dtype, pd.DatetimeTZDtype):
+                return timestamps.dt.tz_convert(PROJECT_TIMEZONE)
+            if pd.api.types.is_datetime64_dtype(timestamps.dtype):
+                return timestamps.dt.tz_localize(
+                    PROJECT_TIMEZONE,
+                    ambiguous="raise",
+                    nonexistent="raise",
+                )
+
+            normalized = []
+            for value in frame["timestamp"]:
+                timestamp = pd.Timestamp(value)
+                if pd.isna(timestamp):
+                    raise ValueError(
+                        "timestamp contains missing or invalid values"
+                    )
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.tz_localize(
+                        PROJECT_TIMEZONE,
+                        ambiguous="raise",
+                        nonexistent="raise",
+                    )
+                else:
+                    timestamp = timestamp.tz_convert(PROJECT_TIMEZONE)
+                normalized.append(timestamp)
+            return pd.Series(
+                pd.DatetimeIndex(normalized),
+                index=frame.index,
+                name="timestamp",
+            )
+        except (
+            AmbiguousTimeError,
+            NonExistentTimeError,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ) as exc:
             raise ValueError("timestamp must contain valid datetime values") from exc
-        if timestamps.isna().any() or not pd.api.types.is_datetime64_any_dtype(
-            timestamps.dtype
-        ):
-            raise ValueError("timestamp must contain valid datetime values")
-        return timestamps
 
     @classmethod
     def _group_columns(cls, frame: pd.DataFrame) -> list[str]:

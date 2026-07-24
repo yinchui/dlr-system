@@ -1,4 +1,5 @@
 import json
+import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -134,6 +135,87 @@ def training_frame():
     )
 
 
+def _process_promote_worker(
+    model_dir,
+    model_version,
+    corrected_mae,
+    model_value,
+    start_event,
+    result_queue,
+):
+    if not start_event.wait(10):
+        raise TimeoutError("promotion start event was not released")
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    decision = ModelRegistry(model_dir).promote(
+        model_candidate(
+            key,
+            model_version=model_version,
+            corrected_mae=corrected_mae,
+            model_value=model_value,
+        )
+    )
+    result_queue.put((model_version, decision.promoted, decision.reason))
+
+
+def _loaded_model_snapshot(model_dir):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    loaded = ModelRegistry(model_dir).load(
+        key, expected_compatibility=compatible_hashes()
+    )
+    if loaded.bundle is None:
+        return (None, None, loaded.fallback_reason)
+    prediction = loaded.bundle.model.predict(np.zeros((1, 2))).item()
+    return (loaded.metadata.model_version, prediction, loaded.fallback_reason)
+
+
+def _process_reader_worker(
+    model_dir,
+    ready_queue,
+    start_event,
+    stop_event,
+    result_queue,
+):
+    observations = [_loaded_model_snapshot(model_dir)]
+    ready_queue.put("reader-ready")
+    if not start_event.wait(10):
+        raise TimeoutError("reader start event was not released")
+    for _ in range(500):
+        if stop_event.is_set():
+            break
+        observations.append(_loaded_model_snapshot(model_dir))
+    if not stop_event.wait(10):
+        raise TimeoutError("writer did not finish")
+    observations.append(_loaded_model_snapshot(model_dir))
+    result_queue.put(("reader", observations))
+
+
+def _process_writer_worker(model_dir, start_event, stop_event, result_queue):
+    if not start_event.wait(10):
+        raise TimeoutError("writer start event was not released")
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    decision = ModelRegistry(model_dir).promote(
+        model_candidate(
+            key,
+            model_version="version-2",
+            corrected_mae=0.5,
+            model_value=0.9,
+        )
+    )
+    result_queue.put(("writer", decision.promoted, decision.reason))
+    stop_event.set()
+
+
+def _join_processes(processes):
+    for process in processes:
+        process.join(15)
+    alive = [process for process in processes if process.is_alive()]
+    for process in alive:
+        process.terminate()
+        process.join(5)
+    assert not alive, "child process exceeded timeout"
+    assert [process.exitcode for process in processes] == [0] * len(processes)
+
+
 def test_same_tower_on_different_lines_never_shares_model(tmp_path):
     registry = ModelRegistry(tmp_path)
 
@@ -195,6 +277,135 @@ def test_registry_root_is_resolved_without_changing_key_layout(tmp_path):
     assert registry.path_for(key).name == "model.joblib"
     assert registry.metadata_path_for(key).name == "metadata.json"
     assert registry.manifest_path_for(key).name == "manifest.json"
+
+
+def test_configured_model_root_symlink_is_canonicalized_and_allowed(tmp_path):
+    actual_root = tmp_path / "actual-models"
+    actual_root.mkdir()
+    configured_root = tmp_path / "configured-models"
+    configured_root.symlink_to(actual_root, target_is_directory=True)
+    registry = ModelRegistry(configured_root)
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    decision = registry.promote(
+        model_candidate(key, evaluation_mode="full_fit")
+    )
+
+    assert registry.model_dir == actual_root.resolve()
+    assert decision.promoted is True
+    assert registry.path_for(key).is_relative_to(actual_root.resolve())
+
+
+@pytest.mark.parametrize("symlink_component", ["project", "line", "tower"])
+def test_promote_rejects_symlinked_key_ancestor_without_external_writes(
+    tmp_path, symlink_component
+):
+    model_root = tmp_path / "models"
+    model_root.mkdir()
+    outside = tmp_path / f"outside-{symlink_component}"
+    outside.mkdir()
+    components = ["project-a", "line-a", "001"]
+    component_index = {"project": 0, "line": 1, "tower": 2}[
+        symlink_component
+    ]
+    parent = model_root.joinpath(*components[:component_index])
+    parent.mkdir(parents=True, exist_ok=True)
+    (parent / components[component_index]).symlink_to(
+        outside, target_is_directory=True
+    )
+    registry = ModelRegistry(model_root)
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    decision = registry.promote(
+        model_candidate(key, evaluation_mode="full_fit")
+    )
+
+    assert decision.promoted is False
+    assert decision.reason == "unsafe_model_path"
+    assert list(outside.iterdir()) == []
+
+
+def test_promote_rejects_symlinked_lock_root_without_external_writes(tmp_path):
+    model_root = tmp_path / "models"
+    model_root.mkdir()
+    outside = tmp_path / "outside-locks"
+    outside.mkdir()
+    (model_root / ".locks").symlink_to(outside, target_is_directory=True)
+    registry = ModelRegistry(model_root)
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    decision = registry.promote(
+        model_candidate(key, evaluation_mode="full_fit")
+    )
+
+    assert decision.promoted is False
+    assert decision.reason == "unsafe_model_path"
+    assert list(outside.iterdir()) == []
+
+
+def test_promote_rejects_symlinked_generation_root_without_external_writes(
+    tmp_path,
+):
+    model_root = tmp_path / "models"
+    tower_dir = model_root / "project-a" / "line-a" / "001"
+    tower_dir.mkdir(parents=True)
+    outside = tmp_path / "outside-generations"
+    outside.mkdir()
+    (tower_dir / ".wind_speed.generations").symlink_to(
+        outside, target_is_directory=True
+    )
+    registry = ModelRegistry(model_root)
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    decision = registry.promote(
+        model_candidate(key, evaluation_mode="full_fit")
+    )
+
+    assert decision.promoted is False
+    assert decision.reason == "unsafe_model_path"
+    assert list(outside.iterdir()) == []
+
+
+def test_load_rejects_key_ancestor_symlink_to_external_bundle(tmp_path):
+    model_root = tmp_path / "models"
+    registry = ModelRegistry(model_root)
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry.promote(model_candidate(key, evaluation_mode="full_fit"))
+    outside = tmp_path / "outside-project"
+    outside.mkdir()
+    project_dir = model_root / "project-a"
+    moved_project = outside / "project-a"
+    project_dir.rename(moved_project)
+    project_dir.symlink_to(moved_project, target_is_directory=True)
+
+    loaded = registry.load(
+        key, expected_compatibility=compatible_hashes()
+    )
+
+    assert loaded.bundle is None
+    assert loaded.fallback_reason == "unsafe_model_path"
+
+
+def test_load_rejects_generation_root_symlink_to_external_bundle(tmp_path):
+    model_root = tmp_path / "models"
+    registry = ModelRegistry(model_root)
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry.promote(model_candidate(key, evaluation_mode="full_fit"))
+    target_dir = registry.path_for(key).parent
+    generation_dir = target_dir.resolve(strict=True)
+    generation_root = generation_dir.parent
+    outside = tmp_path / "outside-generations"
+    outside.mkdir()
+    generation_dir.rename(outside / generation_dir.name)
+    generation_root.rmdir()
+    generation_root.symlink_to(outside, target_is_directory=True)
+
+    loaded = registry.load(
+        key, expected_compatibility=compatible_hashes()
+    )
+
+    assert loaded.bundle is None
+    assert loaded.fallback_reason == "unsafe_model_path"
 
 
 def test_full_fit_metadata_keeps_independent_metrics_empty():
@@ -525,6 +736,160 @@ def test_candidate_with_same_evaluation_set_and_enough_improvement_is_active(
     assert loaded.metadata.metrics["corrected_mae"] == 0.7
 
 
+def test_successive_promotions_keep_only_active_and_one_history_generation(
+    tmp_path,
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    corrected_values = [1.0, 0.8, 0.6, 0.4, 0.2]
+
+    for index, corrected_mae in enumerate(corrected_values, start=1):
+        decision = registry.promote(
+            model_candidate(
+                key,
+                model_version=f"version-{index}",
+                corrected_mae=corrected_mae,
+            )
+        )
+        assert decision.promoted is True
+
+    generation_root = (
+        registry.path_for(key).parent.parent / ".wind_speed.generations"
+    )
+    generations = [path for path in generation_root.iterdir() if path.is_dir()]
+    versions = {
+        json.loads((path / "metadata.json").read_text("utf-8"))["model_version"]
+        for path in generations
+    }
+    assert len(generations) == 2
+    assert versions == {"version-4", "version-5"}
+    assert registry.path_for(key).parent.resolve() in generations
+
+
+def test_configurable_generation_retention_and_validation(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path / "models", max_generations=3)
+    for index, corrected_mae in enumerate([1.0, 0.8, 0.6, 0.4], start=1):
+        registry.promote(
+            model_candidate(
+                key,
+                model_version=f"version-{index}",
+                corrected_mae=corrected_mae,
+            )
+        )
+    generation_root = (
+        registry.path_for(key).parent.parent / ".wind_speed.generations"
+    )
+    assert len(list(generation_root.iterdir())) == 3
+
+    for invalid in (True, 0, -1, 1.5):
+        with pytest.raises(ValueError, match="max_generations"):
+            ModelRegistry(tmp_path / f"invalid-{invalid}", max_generations=invalid)
+
+
+def test_successful_publish_cleans_interrupted_and_symlink_generations_safely(
+    tmp_path,
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path / "models")
+    registry.promote(
+        model_candidate(key, model_version="version-1", corrected_mae=1.0)
+    )
+    generation_root = (
+        registry.path_for(key).parent.parent / ".wind_speed.generations"
+    )
+    interrupted = generation_root / "interrupted-generation"
+    interrupted.mkdir()
+    (interrupted / ".model.tmp").write_bytes(b"partial")
+    outside = tmp_path / "outside-history"
+    outside.mkdir()
+    sentinel = outside / "must-survive.txt"
+    sentinel.write_text("safe", encoding="utf-8")
+    malicious_link = generation_root / "linked-generation"
+    malicious_link.symlink_to(outside, target_is_directory=True)
+
+    decision = registry.promote(
+        model_candidate(key, model_version="version-2", corrected_mae=0.5)
+    )
+
+    assert decision.promoted is True
+    assert not interrupted.exists()
+    assert not malicious_link.exists()
+    assert sentinel.read_text("utf-8") == "safe"
+    assert len(list(generation_root.iterdir())) == 2
+
+
+def test_publish_fsyncs_generation_directories_before_and_after_pointer(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    def record_directory_fsync(path):
+        calls.append(Path(path))
+        return True
+
+    monkeypatch.setattr(
+        model_registry,
+        "_fsync_directory",
+        record_directory_fsync,
+        raising=False,
+    )
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+
+    decision = registry.promote(
+        model_candidate(key, evaluation_mode="full_fit")
+    )
+
+    assert decision.promoted is True
+    target_dir = registry.path_for(key).parent
+    active_generation = target_dir.resolve(strict=True)
+    generation_root = active_generation.parent
+    target_parent = target_dir.parent
+    assert calls.index(active_generation) < calls.index(generation_root)
+    assert calls.index(generation_root) < calls.index(target_parent)
+
+
+def test_post_commit_parent_fsync_failure_keeps_new_active_generation(
+    tmp_path, monkeypatch
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(
+        model_candidate(key, model_version="version-1", corrected_mae=1.0)
+    )
+    target_parent = registry.path_for(key).parent.parent
+
+    def fail_target_parent_fsync(path):
+        if Path(path) == target_parent:
+            raise OSError("simulated post-commit directory fsync failure")
+        return True
+
+    monkeypatch.setattr(
+        model_registry,
+        "_fsync_directory",
+        fail_target_parent_fsync,
+        raising=False,
+    )
+
+    decision = registry.promote(
+        model_candidate(
+            key,
+            model_version="version-2",
+            corrected_mae=0.5,
+            model_value=0.9,
+        )
+    )
+
+    assert decision.promoted is True
+    loaded = registry.load(
+        key, expected_compatibility=compatible_hashes()
+    )
+    assert loaded.fallback_reason == ""
+    assert loaded.metadata.model_version == "version-2"
+    assert loaded.bundle.model.predict(np.zeros((1, 2))).tolist() == [0.9]
+
+
 def test_first_candidate_must_improve_over_physical_baseline(tmp_path):
     key = ModelKey("project-a", "line-a", "001", "wind_speed")
     registry = ModelRegistry(tmp_path)
@@ -850,3 +1215,100 @@ def test_concurrent_candidates_recheck_champion_inside_key_lock(tmp_path):
     assert loaded.metadata.model_version == "version-3"
     assert loaded.metadata.metrics["corrected_mae"] == 0.6
     assert not [path for path in tmp_path.rglob("*") if path.name.endswith(".tmp")]
+
+
+def test_file_lock_serializes_competing_promotions_across_processes(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(
+        model_candidate(
+            key,
+            model_version="version-1",
+            corrected_mae=1.0,
+            model_value=0.5,
+        )
+    )
+    context = multiprocessing.get_context("spawn")
+    start_event = context.Event()
+    result_queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_process_promote_worker,
+            args=(tmp_path, "version-2", 0.7, 0.7, start_event, result_queue),
+        ),
+        context.Process(
+            target=_process_promote_worker,
+            args=(tmp_path, "version-3", 0.6, 0.9, start_event, result_queue),
+        ),
+    ]
+    for process in processes:
+        process.start()
+    start_event.set()
+
+    _join_processes(processes)
+    results = [result_queue.get(timeout=5) for _ in processes]
+    result_queue.close()
+    result_queue.join_thread()
+
+    assert any(promoted for _, promoted, _ in results)
+    loaded = registry.load(
+        key, expected_compatibility=compatible_hashes()
+    )
+    assert loaded.fallback_reason == ""
+    assert loaded.metadata.model_version == "version-3"
+    assert loaded.bundle.model.predict(np.zeros((1, 2))).tolist() == [0.9]
+
+
+def test_concurrent_process_reader_observes_only_complete_old_or_new_bundle(
+    tmp_path,
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(
+        model_candidate(
+            key,
+            model_version="version-1",
+            corrected_mae=1.0,
+            model_value=0.5,
+        )
+    )
+    context = multiprocessing.get_context("spawn")
+    ready_queue = context.Queue()
+    result_queue = context.Queue()
+    start_event = context.Event()
+    stop_event = context.Event()
+    reader = context.Process(
+        target=_process_reader_worker,
+        args=(
+            tmp_path,
+            ready_queue,
+            start_event,
+            stop_event,
+            result_queue,
+        ),
+    )
+    writer = context.Process(
+        target=_process_writer_worker,
+        args=(tmp_path, start_event, stop_event, result_queue),
+    )
+    reader.start()
+    writer.start()
+    assert ready_queue.get(timeout=10) == "reader-ready"
+    start_event.set()
+
+    _join_processes([reader, writer])
+    messages = [result_queue.get(timeout=5) for _ in range(2)]
+    reader_message = next(message for message in messages if message[0] == "reader")
+    writer_message = next(message for message in messages if message[0] == "writer")
+    observations = reader_message[1]
+
+    assert writer_message[1:] == (True, "promoted")
+    assert observations[0] == ("version-1", 0.5, "")
+    assert observations[-1] == ("version-2", 0.9, "")
+    assert set(observations) <= {
+        ("version-1", 0.5, ""),
+        ("version-2", 0.9, ""),
+    }
+    for queue in (ready_queue, result_queue):
+        queue.close()
+        queue.join_thread()

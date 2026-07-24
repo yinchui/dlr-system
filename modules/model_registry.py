@@ -5,6 +5,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import uuid
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path, PureWindowsPath
@@ -51,6 +52,7 @@ _MANIFEST_FIELDS = frozenset(
         "metadata_checksum",
     }
 )
+_GENERATION_ARTIFACTS = ("model.joblib", "metadata.json", "manifest.json")
 
 
 def _validate_identifier(value: str, name: str) -> None:
@@ -423,9 +425,46 @@ def _write_bytes(path: Path, payload: bytes) -> None:
         os.fsync(stream.fileno())
 
 
+def _fsync_directory(path: Path) -> bool:
+    if os.name != "posix":
+        return False
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return True
+
+
+class UnsafeModelPathError(OSError):
+    pass
+
+
 class ModelRegistry:
-    def __init__(self, model_dir: Path | str, *, min_mae_improvement: float = 0.0):
-        self.model_dir = Path(model_dir).expanduser()
+    def __init__(
+        self,
+        model_dir: Path | str,
+        *,
+        min_mae_improvement: float = 0.0,
+        max_generations: int = 2,
+    ):
+        if (
+            isinstance(max_generations, bool)
+            or not isinstance(max_generations, int)
+            or max_generations < 1
+        ):
+            raise ValueError("max_generations must be a positive integer")
+        configured_root = Path(model_dir).expanduser()
+        try:
+            canonical_root = configured_root.resolve(strict=False)
+            canonical_root.mkdir(parents=True, exist_ok=True)
+            canonical_root = canonical_root.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError("model_dir must resolve to a writable directory") from exc
+        if not canonical_root.is_dir():
+            raise ValueError("model_dir must resolve to a directory")
+        self.model_dir = canonical_root
         if (
             isinstance(min_mae_improvement, bool)
             or not isinstance(min_mae_improvement, (int, float))
@@ -434,6 +473,48 @@ class ModelRegistry:
         ):
             raise ValueError("min_mae_improvement must be finite and non-negative")
         self.min_mae_improvement = float(min_mae_improvement)
+        self.max_generations = max_generations
+
+    def _safe_directory(self, path: Path, *, create: bool) -> bool:
+        try:
+            relative = path.relative_to(self.model_dir)
+        except ValueError as exc:
+            raise UnsafeModelPathError("path escapes canonical model root") from exc
+        try:
+            root_info = self.model_dir.lstat()
+            if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(
+                root_info.st_mode
+            ):
+                raise UnsafeModelPathError("canonical model root is unsafe")
+            if self.model_dir.resolve(strict=True) != self.model_dir:
+                raise UnsafeModelPathError("canonical model root changed")
+
+            current = self.model_dir
+            for component in relative.parts:
+                current = current / component
+                try:
+                    info = current.lstat()
+                except FileNotFoundError:
+                    if not create:
+                        return False
+                    try:
+                        current.mkdir()
+                    except FileExistsError:
+                        pass
+                    info = current.lstat()
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    raise UnsafeModelPathError(
+                        f"unsafe model directory component: {component}"
+                    )
+                if current.resolve(strict=True) != current:
+                    raise UnsafeModelPathError(
+                        f"model directory component escaped root: {component}"
+                    )
+        except UnsafeModelPathError:
+            raise
+        except OSError as exc:
+            raise UnsafeModelPathError("cannot validate model directory") from exc
+        return True
 
     def _target_dir(self, key: ModelKey) -> Path:
         if not isinstance(key, ModelKey):
@@ -468,7 +549,7 @@ class ModelRegistry:
             / key.tower_id
             / f"{key.target}.lock"
         )
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._safe_directory(lock_path.parent, create=True)
         return FileLock(lock_path)
 
     @staticmethod
@@ -478,13 +559,106 @@ class ModelRegistry:
     def _validate_generation_location(
         self, key: ModelKey, generation_dir: Path
     ) -> bool:
+        generation_root = self._generation_root(key)
+        if not self._safe_directory(generation_root, create=False):
+            return False
         try:
-            generation_dir.resolve(strict=True).relative_to(
-                self._generation_root(key).resolve(strict=True)
-            )
-        except (FileNotFoundError, OSError, ValueError):
+            info = generation_dir.lstat()
+            if (
+                generation_dir.parent != generation_root
+                or stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISDIR(info.st_mode)
+                or generation_dir.resolve(strict=True) != generation_dir
+            ):
+                return False
+        except (FileNotFoundError, OSError):
             return False
         return True
+
+    def _active_generation(self, key: ModelKey) -> Path:
+        target_dir = self._target_dir(key)
+        generation_root = self._generation_root(key)
+        if not self._safe_directory(generation_root, create=False):
+            raise UnsafeModelPathError("active generation root is missing")
+        try:
+            link_value = os.readlink(target_dir)
+        except OSError as exc:
+            raise UnsafeModelPathError("active model pointer is unreadable") from exc
+        relative_link = Path(link_value)
+        if (
+            relative_link.is_absolute()
+            or len(relative_link.parts) != 2
+            or relative_link.parts[0] != generation_root.name
+            or relative_link.parts[1] in {".", ".."}
+            or "\\" in link_value
+        ):
+            raise UnsafeModelPathError("active model pointer is unsafe")
+        generation_dir = target_dir.parent / relative_link
+        if not self._validate_generation_location(key, generation_dir):
+            raise UnsafeModelPathError("active generation escaped model root")
+        return generation_dir
+
+    @staticmethod
+    def _complete_generation(path: Path) -> bool:
+        try:
+            for artifact_name in _GENERATION_ARTIFACTS:
+                if not stat.S_ISREG((path / artifact_name).lstat().st_mode):
+                    return False
+            return not any(
+                child.name.endswith(".tmp") for child in path.iterdir()
+            )
+        except OSError:
+            return False
+
+    def _remove_generation_entry(self, key: ModelKey, path: Path) -> None:
+        generation_root = self._generation_root(key)
+        if path.parent != generation_root:
+            raise UnsafeModelPathError("generation cleanup escaped its root")
+        if not self._safe_directory(generation_root, create=False):
+            raise UnsafeModelPathError("generation root is missing")
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            path.unlink()
+            return
+        if path.resolve(strict=True) != path:
+            raise UnsafeModelPathError("generation cleanup target escaped root")
+        shutil.rmtree(path)
+
+    def _prune_generations(
+        self, key: ModelKey, active_generation: Path
+    ) -> None:
+        generation_root = self._generation_root(key)
+        if not self._validate_generation_location(key, active_generation):
+            raise UnsafeModelPathError("active generation is unsafe")
+        history = []
+        with os.scandir(generation_root) as entries:
+            for entry in entries:
+                path = generation_root / entry.name
+                if path == active_generation:
+                    continue
+                if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                    self._remove_generation_entry(key, path)
+                    continue
+                if not self._complete_generation(path):
+                    self._remove_generation_entry(key, path)
+                    continue
+                history.append(
+                    (entry.stat(follow_symlinks=False).st_mtime_ns, path)
+                )
+        history.sort(key=lambda item: item[0], reverse=True)
+        for _, obsolete in history[self.max_generations - 1 :]:
+            self._remove_generation_entry(key, obsolete)
+
+    @staticmethod
+    def _reject_artifact_symlink(path: Path) -> None:
+        try:
+            if stat.S_ISLNK(path.lstat().st_mode):
+                raise UnsafeModelPathError("model artifact cannot be a symlink")
+        except FileNotFoundError:
+            return
 
     def _read_generation(
         self,
@@ -492,9 +666,13 @@ class ModelRegistry:
         generation_dir: Path,
         expected_compatibility: ModelCompatibility,
     ) -> ModelLoadResult:
+        if not self._validate_generation_location(key, generation_dir):
+            return self._fallback("corrupt_manifest")
         manifest_path = generation_dir / "manifest.json"
         metadata_path = generation_dir / "metadata.json"
         model_path = generation_dir / "model.joblib"
+        for artifact_path in (manifest_path, metadata_path, model_path):
+            self._reject_artifact_symlink(artifact_path)
         try:
             manifest_bytes = manifest_path.read_bytes()
             manifest = json.loads(manifest_bytes.decode("utf-8"))
@@ -569,16 +747,13 @@ class ModelRegistry:
         expected_compatibility: ModelCompatibility,
     ) -> ModelLoadResult:
         target_dir = self._target_dir(key)
+        if not self._safe_directory(target_dir.parent, create=False):
+            return self._fallback("model_not_found")
         if not target_dir.is_symlink():
             if target_dir.exists() or target_dir.is_symlink():
                 return self._fallback("corrupt_manifest")
             return self._fallback("model_not_found")
-        try:
-            generation_dir = target_dir.resolve(strict=True)
-        except (FileNotFoundError, OSError):
-            return self._fallback("corrupt_manifest")
-        if not self._validate_generation_location(key, generation_dir):
-            return self._fallback("corrupt_manifest")
+        generation_dir = self._active_generation(key)
         return self._read_generation(key, generation_dir, expected_compatibility)
 
     def load(
@@ -593,8 +768,11 @@ class ModelRegistry:
             raise TypeError(
                 "expected_compatibility must be provided as ModelCompatibility"
             )
-        with self._lock_for(key):
-            return self._load_locked(key, expected_compatibility)
+        try:
+            with self._lock_for(key):
+                return self._load_locked(key, expected_compatibility)
+        except UnsafeModelPathError:
+            return self._fallback("unsafe_model_path")
 
     def load_many(
         self,
@@ -647,8 +825,8 @@ class ModelRegistry:
         target_dir = self._target_dir(key)
         target_parent = target_dir.parent
         generation_root = self._generation_root(key)
-        target_parent.mkdir(parents=True, exist_ok=True)
-        generation_root.mkdir(parents=True, exist_ok=True)
+        self._safe_directory(target_parent, create=True)
+        self._safe_directory(generation_root, create=True)
         token = uuid.uuid4().hex
         generation_name = f"{candidate.metadata.model_version}-{token}"
         generation_dir = generation_root / generation_name
@@ -686,6 +864,8 @@ class ModelRegistry:
             os.replace(temp_model, final_model)
             os.replace(temp_metadata, final_metadata)
             os.replace(temp_manifest, final_manifest)
+            _fsync_directory(generation_dir)
+            _fsync_directory(generation_root)
 
             validated = self._read_generation(
                 key, generation_dir, active_metadata.compatibility
@@ -700,12 +880,24 @@ class ModelRegistry:
             os.symlink(relative_generation, temp_link, target_is_directory=True)
             os.replace(temp_link, target_dir)
             published = True
+            try:
+                _fsync_directory(target_parent)
+            except OSError:
+                pass
+            try:
+                self._prune_generations(key, generation_dir)
+                _fsync_directory(generation_root)
+            except OSError:
+                pass
             return active_metadata
         finally:
             if temp_link.is_symlink() or temp_link.exists():
                 temp_link.unlink()
             if not published:
-                shutil.rmtree(generation_dir, ignore_errors=True)
+                try:
+                    self._remove_generation_entry(key, generation_dir)
+                except OSError:
+                    pass
 
     def _publish_decision(
         self,
@@ -717,6 +909,8 @@ class ModelRegistry:
     ) -> PromotionDecision:
         try:
             metadata = self._publish_locked(candidate, status=status)
+        except UnsafeModelPathError:
+            return PromotionDecision(False, "unsafe_model_path", champion)
         except Exception as exc:
             return PromotionDecision(
                 False,
@@ -738,10 +932,20 @@ class ModelRegistry:
             return PromotionDecision(
                 False, "candidate_not_better_than_physical"
             )
-        with self._lock_for(candidate.key):
-            current = self._load_locked(
-                candidate.key, candidate.metadata.compatibility
+        try:
+            self._safe_directory(
+                self._target_dir(candidate.key).parent, create=False
             )
+            lock = self._lock_for(candidate.key)
+        except UnsafeModelPathError:
+            return PromotionDecision(False, "unsafe_model_path")
+        with lock:
+            try:
+                current = self._load_locked(
+                    candidate.key, candidate.metadata.compatibility
+                )
+            except UnsafeModelPathError:
+                return PromotionDecision(False, "unsafe_model_path")
             if current.bundle is not None:
                 champion = current.metadata
                 if candidate.metadata.evaluation_mode == "full_fit":

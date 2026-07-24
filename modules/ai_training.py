@@ -8,6 +8,7 @@ import importlib.metadata
 import inspect
 import json
 import platform
+import sys
 import types
 from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
@@ -58,6 +59,10 @@ _DEFAULT_ESTIMATOR_PARAMETERS = (
 )
 _MAX_CONTRACT_DEPTH = 12
 _MAX_CONTRACT_ITEMS = 256
+_MAX_CONTRACT_NODES = 2_048
+_EXTERNAL_CONTRACT_ROOTS = frozenset(
+    {"joblib", "numpy", "pandas", "scipy", "sklearn", "xgboost"}
+)
 _DYNAMIC_GLOBAL_ACCESS_NAMES = frozenset(
     {"__import__", "eval", "exec", "globals", "locals"}
 )
@@ -104,6 +109,12 @@ class TrainingContractError(RuntimeError):
 class _FactoryContractContext:
     def __init__(self) -> None:
         self.active: set[int] = set()
+        self.remaining_nodes = _MAX_CONTRACT_NODES
+
+    def consume(self) -> None:
+        if self.remaining_nodes <= 0:
+            raise TrainingContractError("training contract exceeds node limit")
+        self.remaining_nodes -= 1
 
 
 class ConstantResidualEstimator:
@@ -425,6 +436,7 @@ def _contract_value(
     if _depth > _MAX_CONTRACT_DEPTH:
         raise TrainingContractError("training contract exceeds recursion limit")
     _context = _context or _FactoryContractContext()
+    _context.consume()
     if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, float):
@@ -452,7 +464,7 @@ def _contract_value(
             "complex factory configuration requires an explicit descriptor"
         )
     if isinstance(value, types.ModuleType):
-        return _module_contract(value)
+        return _module_contract(value, _context=_context)
     if isinstance(value, types.CodeType):
         return {"kind": "code", "value": _code_contract(value, _context)}
     if callable(value):
@@ -514,34 +526,140 @@ def _code_contract(
     return {
         "bytecode_hash": hashlib.sha256(code.co_code).hexdigest(),
         "exception_table_hash": hashlib.sha256(code.co_exceptiontable).hexdigest(),
+        "names": list(code.co_names),
         "constants": _contract_value(tuple(code.co_consts), _context=context),
     }
 
 
-def _referenced_global_names(code: types.CodeType) -> tuple[str, ...]:
-    names = {
-        str(instruction.argval)
-        for instruction in dis.get_instructions(code)
-        if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"}
-    }
+def _referenced_global_dependencies(
+    code: types.CodeType,
+) -> dict[str, tuple[tuple[str, ...], ...]]:
+    dependencies: dict[str, set[tuple[str, ...]]] = {}
+    instructions = list(dis.get_instructions(code))
+    for index, instruction in enumerate(instructions):
+        if instruction.opname not in {"LOAD_GLOBAL", "LOAD_NAME"}:
+            continue
+        name = str(instruction.argval)
+        attribute_path = []
+        for following in instructions[index + 1 :]:
+            if following.opname not in {"LOAD_ATTR", "LOAD_METHOD"}:
+                break
+            attribute_path.append(str(following.argval))
+        dependencies.setdefault(name, set()).add(tuple(attribute_path))
     for constant in code.co_consts:
         if isinstance(constant, types.CodeType):
-            names.update(_referenced_global_names(constant))
-    return tuple(sorted(names))
+            for name, paths in _referenced_global_dependencies(constant).items():
+                dependencies.setdefault(name, set()).update(paths)
+    return {
+        name: tuple(sorted(paths))
+        for name, paths in sorted(dependencies.items())
+    }
 
 
-def _module_contract(value: types.ModuleType) -> dict[str, Any]:
+def _module_namespace(value: types.ModuleType) -> dict[str, Any]:
+    try:
+        namespace = object.__getattribute__(value, "__dict__")
+    except Exception as exc:
+        raise TrainingContractError("module contract cannot be read safely") from exc
+    if not isinstance(namespace, dict):
+        raise TrainingContractError("module contract has no static namespace")
+    return namespace
+
+
+def _symbol_module_name(value: Any) -> str:
+    if inspect.isclass(value) or inspect.isfunction(value) or inspect.ismethod(value):
+        module_name = getattr(value, "__module__", "")
+    else:
+        module_name = getattr(type(value), "__module__", "")
+    return module_name if isinstance(module_name, str) else ""
+
+
+def _is_external_contract_symbol(value: Any) -> bool:
+    module_name = _symbol_module_name(value)
+    root = module_name.partition(".")[0]
+    return bool(
+        module_name == "builtins"
+        or root in sys.stdlib_module_names
+        or root in _EXTERNAL_CONTRACT_ROOTS
+    )
+
+
+def _external_symbol_contract(value: Any) -> dict[str, Any]:
+    module_name = _symbol_module_name(value)
+    root = module_name.partition(".")[0]
+    descriptor = {
+        "kind": "external_symbol",
+        "identity": _qualified_name(value if inspect.isroutine(value) or inspect.isclass(value) else type(value)),
+    }
+    if root in sys.stdlib_module_names or module_name == "builtins":
+        descriptor["version"] = platform.python_version()
+    else:
+        try:
+            descriptor["version"] = importlib.metadata.version(root)
+        except (importlib.metadata.PackageNotFoundError, ValueError):
+            descriptor["version"] = "unavailable"
+    return descriptor
+
+
+def _static_dependency_value(value: Any, path: tuple[str, ...]) -> Any:
+    current = value
+    for name in path:
+        if isinstance(current, types.ModuleType):
+            namespace = _module_namespace(current)
+            if name not in namespace:
+                raise TrainingContractError(
+                    f"module dependency {name} is not statically available"
+                )
+            current = namespace[name]
+            continue
+        try:
+            current = inspect.getattr_static(current, name)
+        except AttributeError as exc:
+            raise TrainingContractError(
+                f"dependency attribute {name} is not statically available"
+            ) from exc
+        if isinstance(current, (staticmethod, classmethod)):
+            current = current.__func__
+    return current
+
+
+def _module_contract(
+    value: types.ModuleType,
+    *,
+    attribute_paths: Sequence[tuple[str, ...]] = (),
+    _context: Optional[_FactoryContractContext] = None,
+) -> dict[str, Any]:
+    _context = _context or _FactoryContractContext()
+    namespace = _module_namespace(value)
+    module_name = namespace.get("__name__", "")
     descriptor = {
         "kind": "module",
-        "identity": str(getattr(value, "__name__", "")),
+        "identity": module_name if type(module_name) is str else "",
     }
-    version = getattr(value, "__version__", None)
-    if isinstance(version, str):
+    version = namespace.get("__version__")
+    if type(version) is str:
         descriptor["version"] = (
             version
             if len(version) <= 128
             else hashlib.sha256(version.encode("utf-8")).hexdigest()
         )
+    accessed_attributes = []
+    for path in sorted(set(attribute_paths)):
+        if not path:
+            continue
+        dependency = _static_dependency_value(value, path)
+        accessed_attributes.append(
+            {
+                "path": list(path),
+                "value": _global_contract_value(
+                    dependency,
+                    attribute_paths=(),
+                    _context=_context,
+                ),
+            }
+        )
+    if accessed_attributes:
+        descriptor["accessed_attributes"] = accessed_attributes
     return descriptor
 
 
@@ -569,19 +687,28 @@ def _function_core_contract(
 def _global_contract_value(
     value: Any,
     *,
+    attribute_paths: Sequence[tuple[str, ...]] = (),
     _context: _FactoryContractContext,
 ) -> Any:
     if isinstance(value, types.ModuleType):
-        return _module_contract(value)
+        return _module_contract(
+            value,
+            attribute_paths=attribute_paths,
+            _context=_context,
+        )
+    if callable(value) and _is_external_contract_symbol(value):
+        return _external_symbol_contract(value)
     if inspect.isclass(value):
-        return {"kind": "class_reference", "identity": _qualified_name(value)}
+        return {
+            "kind": "class_reference",
+            "contract": _callable_contract(value, _context),
+        }
     if inspect.isbuiltin(value) or inspect.ismethoddescriptor(value):
         return {"kind": "builtin_callable", "identity": _qualified_name(value)}
     if inspect.isfunction(value) or inspect.ismethod(value):
-        _, _, descriptor = _function_core_contract(value, _context)
         return {
             "kind": "function_reference",
-            **descriptor,
+            "contract": _callable_contract(value, _context),
         }
     if callable(value):
         explicit = _explicit_contract_descriptor(value)
@@ -596,7 +723,31 @@ def _global_contract_value(
                 explicit, _context=_context
             ),
         }
-    return _contract_value(value, _context=_context)
+    descriptor = _contract_value(value, _context=_context)
+    if not attribute_paths:
+        return descriptor
+    accessed_attributes = []
+    for path in sorted(set(attribute_paths)):
+        if not path:
+            continue
+        dependency = _static_dependency_value(value, path)
+        accessed_attributes.append(
+            {
+                "path": list(path),
+                "value": _global_contract_value(
+                    dependency,
+                    attribute_paths=(),
+                    _context=_context,
+                ),
+            }
+        )
+    if not accessed_attributes:
+        return descriptor
+    return {
+        "kind": "referenced_value",
+        "value": descriptor,
+        "accessed_attributes": accessed_attributes,
+    }
 
 
 def _function_contract(
@@ -638,7 +789,7 @@ def _function_contract(
     if not isinstance(builtin_values, Mapping):
         builtin_values = vars(builtin_values)
     references = {}
-    for name in _referenced_global_names(code):
+    for name, attribute_paths in _referenced_global_dependencies(code).items():
         if name in global_values:
             scope, global_value = "global", global_values[name]
         elif name in builtin_values:
@@ -652,7 +803,11 @@ def _function_contract(
             continue
         references[name] = {
             "scope": scope,
-            "value": _global_contract_value(global_value, _context=_context),
+            "value": _global_contract_value(
+                global_value,
+                attribute_paths=attribute_paths,
+                _context=_context,
+            ),
         }
     if references:
         descriptor["globals"] = references
@@ -678,6 +833,11 @@ def _class_contract(
     method_count = 0
     owners = [owner for owner in reversed(value.__mro__) if owner is not object]
     for owner in owners:
+        if _is_external_contract_symbol(owner):
+            members[f"{_qualified_name(owner)}::__external__"] = (
+                _external_symbol_contract(owner)
+            )
+            continue
         for name, item in sorted(vars(owner).items()):
             if name in {
                 "__classcell__",
@@ -687,13 +847,20 @@ def _class_contract(
                 "__weakref__",
             }:
                 continue
-            if name.startswith("__") and name not in {"__call__", "__init__"}:
+            if name.startswith("__") and name not in {
+                "__call__",
+                "__init__",
+                "__repr__",
+                "__str__",
+            }:
                 continue
             if isinstance(item, (staticmethod, classmethod)):
                 item = item.__func__
             if inspect.isfunction(item):
-                _, _, contract = _function_core_contract(item, _context)
-                members[name] = {"kind": "method", **contract}
+                members[name] = {
+                    "kind": "method",
+                    "contract": _callable_contract(item, _context),
+                }
                 method_count += 1
             elif not name.startswith("_") and not inspect.isdatadescriptor(item):
                 members[name] = {
@@ -716,16 +883,23 @@ def _callable_contract(
     value: Any,
     _context: Optional[_FactoryContractContext] = None,
 ) -> dict[str, Any]:
+    _context = _context or _FactoryContractContext()
+    _context.consume()
     if value is default_estimator:
         return {
             "kind": "default_estimator",
             "symbol": "xgboost.XGBRegressor",
             "declared_parameters": dict(_DEFAULT_ESTIMATOR_PARAMETERS),
         }
-    _context = _context or _FactoryContractContext()
+    if not isinstance(value, functools.partial) and _is_external_contract_symbol(
+        value
+    ):
+        return _external_symbol_contract(value)
     identity = id(value)
     if identity in _context.active:
         raise TrainingContractError("cyclic callable factory is unsupported")
+    if len(_context.active) >= _MAX_CONTRACT_DEPTH:
+        raise TrainingContractError("training contract exceeds recursion limit")
     _context.active.add(identity)
     try:
         if isinstance(value, functools.partial):
@@ -782,9 +956,64 @@ def _trainer_runtime_descriptor(trainer: Any) -> dict[str, Any]:
         raise TrainingContractError(
             "trainer must implement training_contract_descriptor()"
         )
-    return {
+    descriptor = {
         "trainer_type": _qualified_name(type(trainer)),
         "configuration": _contract_value(explicit),
+    }
+    if isinstance(trainer, ResidualTrainer):
+        descriptor["builtin_runtime"] = _builtin_trainer_runtime_descriptor(
+            trainer
+        )
+    return descriptor
+
+
+def _builtin_trainer_runtime_descriptor(trainer: Any) -> dict[str, Any]:
+    context = _FactoryContractContext()
+    trainer_type = type(trainer)
+
+    def method_code(name: str) -> dict[str, Any]:
+        try:
+            value = inspect.getattr_static(trainer_type, name)
+        except AttributeError as exc:
+            raise TrainingContractError(
+                f"builtin trainer dependency {name} is missing"
+            ) from exc
+        if isinstance(value, (staticmethod, classmethod)):
+            value = value.__func__
+        code = getattr(value, "__code__", None)
+        if not isinstance(code, types.CodeType):
+            raise TrainingContractError(
+                f"builtin trainer dependency {name} is not inspectable"
+            )
+        return _code_contract(code, context)
+
+    return {
+        "methods": {
+            "prepare_target": method_code("prepare_target"),
+            "train_prepared": method_code("train_prepared"),
+            "_fit_estimator": method_code("_fit_estimator"),
+            "_fallback_estimator": method_code("_fallback_estimator"),
+            "_predict_corrected": method_code("_predict_corrected"),
+            "_time_split": method_code("_time_split"),
+        },
+        "callables": {
+            "_metric_values": _callable_contract(_metric_values, context),
+            "_robust_residual_bounds": _callable_contract(
+                _robust_residual_bounds, context
+            ),
+            "_training_outcome": _callable_contract(
+                _training_outcome, context
+            ),
+        },
+        "configuration": _contract_value(
+            {
+                "physical_bounds": PHYSICAL_BOUNDS,
+                "training_outcomes": _TRAINING_OUTCOMES,
+                "operational_fallback_reasons": _OPERATIONAL_FALLBACK_REASONS,
+                "operational_fallback_prefixes": _OPERATIONAL_FALLBACK_PREFIXES,
+            },
+            _context=context,
+        ),
     }
 
 
@@ -871,7 +1100,10 @@ def _pandas_training_summary(
                 _training_digest(str(column)) for column in value.columns[:visible]
             ],
             "dtype_hashes": [
-                _training_digest(str(dtype)) for dtype in value.dtypes.iloc[:visible]
+                _training_digest(
+                    _canonical_json(_training_dtype_summary(dtype))
+                )
+                for dtype in value.dtypes.iloc[:visible]
             ],
         }
         if column_count > visible:
@@ -879,7 +1111,7 @@ def _pandas_training_summary(
     else:
         schema = {
             "shape": shape,
-            "dtype": str(value.dtype),
+            "dtype": _training_dtype_summary(value.dtype),
             "name_hash": _training_digest(str(value.name)),
         }
     return {
@@ -893,7 +1125,7 @@ def _ndarray_training_summary(value: np.ndarray) -> dict[str, Any]:
     array = np.asarray(value)
     schema = {
         "shape": [int(item) for item in array.shape],
-        "dtype": str(array.dtype),
+        "dtype": _training_dtype_summary(array.dtype),
     }
     digest = hashlib.sha256(_canonical_json(schema).encode())
     if not array.dtype.hasobject:
@@ -905,18 +1137,51 @@ def _ndarray_training_summary(value: np.ndarray) -> dict[str, Any]:
     }
 
 
-def _is_sensitive_parameter_name(name: str) -> bool:
+def _training_dtype_summary(value: Any) -> dict[str, Any]:
+    dtype_type = type(value)
+    module_root = dtype_type.__module__.partition(".")[0]
+    summary = {"type": _safe_training_type(value)}
+    if module_root == "numpy" and isinstance(value, np.dtype):
+        name = value.name
+        kind = value.kind
+        if type(name) is str:
+            summary["name"] = name
+        if type(kind) is str:
+            summary["kind"] = kind
+        summary["itemsize"] = int(value.itemsize)
+    elif module_root == "pandas" and isinstance(
+        value, pd.api.extensions.ExtensionDtype
+    ):
+        name = value.name
+        if type(name) is str:
+            summary["name"] = name
+    return summary
+
+
+def _is_sensitive_parameter_name(name: Any) -> bool:
+    if isinstance(name, str):
+        lowered = str.lower(name)
+    elif isinstance(name, bytes):
+        try:
+            lowered = str.lower(bytes.decode(name, "ascii"))
+        except UnicodeDecodeError:
+            return False
+    else:
+        return False
     normalized = "".join(
-        character for character in name.lower() if character.isalnum()
+        character
+        for character in lowered
+        if "a" <= character <= "z" or "0" <= character <= "9"
     )
     return any(marker in normalized for marker in _SENSITIVE_PARAMETER_MARKERS)
 
 
 def _safe_mapping_key(value: Any) -> str:
-    if isinstance(value, str) and len(value) <= 128:
-        return value
     if isinstance(value, str):
-        return f"str_sha256:{_training_digest(value)}"
+        safe_value = str.__str__(value)
+        if str.__len__(value) <= 128:
+            return safe_value
+        return f"str_sha256:{_training_digest(safe_value)}"
     return f"{_safe_training_type(value)}_sha256:{_training_digest(value)}"
 
 
@@ -1054,7 +1319,6 @@ def _json_safe_training_value(
                 sanitized = (
                     _sensitive_training_summary(item)
                     if mapping_value
-                    and isinstance(key, str)
                     and _is_sensitive_parameter_name(key)
                     else sanitize(item)
                 )

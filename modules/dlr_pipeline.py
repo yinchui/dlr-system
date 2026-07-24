@@ -1270,19 +1270,17 @@ class DlrPipeline:
                         if trainer is None:
                             trainer = self._trainer_for_interval(interval_minutes)
                         attempt = None
+                        preparation = trainer.prepare_target(
+                            tower_training,
+                            key.target,
+                            physical_col=physical_column,
+                            truth_col=truth_column,
+                        )
+                        runtime_contract_hash = training_runtime_contract_hash(
+                            trainer,
+                            preparation,
+                        )
                         if model_persistence_allowed:
-                            preparation = trainer.prepare_target(
-                                tower_training,
-                                key.target,
-                                physical_col=physical_column,
-                                truth_col=truth_column,
-                            )
-                            runtime_contract_hash = (
-                                training_runtime_contract_hash(
-                                    trainer,
-                                    preparation,
-                                )
-                            )
                             attempt = registry.build_attempt(
                                 key,
                                 input_data_hash=preparation.input_data_hash,
@@ -1307,28 +1305,21 @@ class DlrPipeline:
                                 != "temporal_holdout"
                             ):
                                 continue
-                            training = trainer.train_prepared(preparation)
-                            if (
-                                training_runtime_contract_hash(
-                                    trainer,
-                                    preparation,
-                                )
-                                != runtime_contract_hash
-                            ):
-                                raise TrainingContractError(
-                                    "trainer runtime contract changed during training"
-                                )
-                            training = bind_training_result_contract(
-                                training,
-                                runtime_contract_hash,
+                        training = trainer.train_prepared(preparation)
+                        if (
+                            training_runtime_contract_hash(
+                                trainer,
+                                preparation,
                             )
-                        else:
-                            training = trainer.train_target(
-                                tower_training,
-                                key.target,
-                                physical_col=physical_column,
-                                truth_col=truth_column,
+                            != runtime_contract_hash
+                        ):
+                            raise TrainingContractError(
+                                "trainer runtime contract changed during training"
                             )
+                        training = bind_training_result_contract(
+                            training,
+                            runtime_contract_hash,
+                        )
                         if not model_persistence_allowed:
                             admission_reason = candidate_admission_reason(
                                 evaluation_mode=training.metadata[

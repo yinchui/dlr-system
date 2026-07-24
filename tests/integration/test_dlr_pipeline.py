@@ -328,6 +328,61 @@ def test_nonpersistent_identity_rejects_model_not_better_than_physical(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_nonpersistent_training_requires_explicit_runtime_contract(tmp_path):
+    class DescriptorlessTrainer:
+        def __init__(self):
+            self.delegate = ResidualTrainer()
+            self.feature_builder = self.delegate.feature_builder
+            self.training_calls = []
+
+        def prepare_target(self, frame, target, **kwargs):
+            return self.delegate.prepare_target(frame, target, **kwargs)
+
+        def train_prepared(self, preparation):
+            self.training_calls.append(
+                (preparation.tower_id, preparation.target)
+            )
+            return self.delegate.train_prepared(preparation)
+
+        def train_target(self, frame, target, **kwargs):
+            self.training_calls.append(
+                (str(frame["tower_id"].iloc[0]), target)
+            )
+            return self.delegate.train_target(frame, target, **kwargs)
+
+    trainer = DescriptorlessTrainer()
+    pipeline = DlrPipeline(model_root=tmp_path, trainer=trainer)
+
+    result = pipeline.run(
+        physical=_weather("physical"),
+        truth=_weather("truth", truth_offset=True),
+        project_id="project-a",
+        line_id="transient-line",
+        model_persistence_allowed=False,
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    comparison = result.comparison_weather
+    assert trainer.training_calls == []
+    assert result.model_report.trained_targets == ()
+    assert result.model_report.used_targets == ()
+    assert sum(
+        fallback.reason == "training_failed:TrainingContractError"
+        for fallback in result.model_report.fallbacks
+    ) == 4
+    np.testing.assert_array_equal(
+        comparison["wind_speed_ai"], comparison["wind_speed_physical"]
+    )
+    np.testing.assert_array_equal(
+        comparison["ambient_temp_ai"], comparison["ambient_temp_physical"]
+    )
+    assert result.max_currents.shape == (2, 2)
+    assert pipeline.registry is None
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_complete_coordinate_identity_reuses_models_for_new_weather_batch(
     tmp_path,
 ):

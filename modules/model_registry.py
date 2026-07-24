@@ -403,14 +403,13 @@ class ModelMetadata:
         values.setdefault("metric_domain", "weather_vs_truth")
         values.setdefault("last_attempted_input_data_hash", None)
         values.setdefault("training_outcome", "legacy")
-        values.setdefault(
-            "training_contract_hash",
-            _LEGACY_TRAINING_CONTRACT_HASH,
-        )
+        missing_training_contract = "training_contract_hash" not in values
+        if missing_training_contract:
+            values["training_contract_hash"] = _LEGACY_TRAINING_CONTRACT_HASH
         return cls(
             key=key,
             compatibility=compatibility,
-            _allow_legacy_training_contract=True,
+            _allow_legacy_training_contract=missing_training_contract,
             **values,
         )
 

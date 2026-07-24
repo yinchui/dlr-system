@@ -1,4 +1,5 @@
 import json
+import types
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -408,6 +409,90 @@ def test_training_contract_tracks_globals_used_by_nested_code_objects():
     assert zero.training_contract_hash != five.training_contract_hash
 
 
+def test_training_contract_tracks_globals_used_by_referenced_helper():
+    source = """
+def helper_offset():
+    return OFFSET
+
+def estimator_factory():
+    return FixedResidualEstimator(helper_offset())
+"""
+
+    def make_factory(offset):
+        namespace = {
+            "__name__": __name__,
+            "FixedResidualEstimator": FixedResidualEstimator,
+            "OFFSET": float(offset),
+        }
+        exec(source, namespace)  # noqa: S102
+        return namespace["estimator_factory"]
+
+    frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
+    zero = ResidualTrainer(estimator_factory=make_factory(0.0)).prepare_target(
+        frame, target="wind_speed"
+    )
+    five = ResidualTrainer(estimator_factory=make_factory(5.0)).prepare_target(
+        frame, target="wind_speed"
+    )
+
+    assert zero.training_contract_hash != five.training_contract_hash
+
+
+def test_training_contract_tracks_referenced_module_attribute_names():
+    estimator_module = types.ModuleType("contract_test_estimators")
+
+    class ZeroEstimator(FixedResidualEstimator):
+        def __init__(self):
+            super().__init__(0.0)
+
+    class FiveEstimator(FixedResidualEstimator):
+        def __init__(self):
+            super().__init__(5.0)
+
+    estimator_module.Zero = ZeroEstimator
+    estimator_module.Five = FiveEstimator
+    zero_factory = eval(  # noqa: S307
+        "lambda: estimator_module.Zero()", {"estimator_module": estimator_module}
+    )
+    five_factory = eval(  # noqa: S307
+        "lambda: estimator_module.Five()", {"estimator_module": estimator_module}
+    )
+    frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
+
+    zero = ResidualTrainer(estimator_factory=zero_factory).prepare_target(
+        frame, target="wind_speed"
+    )
+    five = ResidualTrainer(estimator_factory=five_factory).prepare_target(
+        frame, target="wind_speed"
+    )
+
+    assert zero.training_contract_hash != five.training_contract_hash
+
+
+def test_train_prepared_rejects_referenced_class_configuration_change():
+    class PublicConfiguredEstimator(MeanResidualEstimator):
+        offset = 0.0
+
+        def fit(self, features, target):
+            self.value = float(np.mean(target) + type(self).offset)
+            return self
+
+    estimator_factory = eval(  # noqa: S307
+        "lambda: PublicConfiguredEstimator()",
+        {"PublicConfiguredEstimator": PublicConfiguredEstimator},
+    )
+
+    trainer = ResidualTrainer(estimator_factory=estimator_factory)
+    preparation = trainer.prepare_target(
+        make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0)),
+        target="wind_speed",
+    )
+    PublicConfiguredEstimator.offset = 7.0
+
+    with pytest.raises(ai_training.TrainingContractError, match="contract.*changed"):
+        trainer.train_prepared(preparation)
+
+
 def test_train_prepared_rejects_inherited_class_configuration_change():
     class BaseConfiguredEstimator:
         offset = 0.0
@@ -634,6 +719,27 @@ def test_runtime_contract_accepts_builtin_residual_trainer():
     )
 
     assert len(contract_hash) == 64
+
+
+def test_runtime_contract_tracks_builtin_training_dependencies(monkeypatch):
+    trainer, _, preparation = _temporal_preparation()
+    original_hash = ai_training.training_runtime_contract_hash(
+        trainer, preparation
+    )
+
+    def changed_metric_values(physical, truth, corrected):
+        return {
+            "baseline_mae": 0.0,
+            "baseline_rmse": 0.0,
+            "corrected_mae": 0.0,
+            "corrected_rmse": 0.0,
+        }
+
+    monkeypatch.setattr(ai_training, "_metric_values", changed_metric_values)
+
+    assert ai_training.training_runtime_contract_hash(
+        trainer, preparation
+    ) != original_hash
 
 
 def test_training_contract_changes_with_dependency_versions(monkeypatch):
@@ -1147,6 +1253,56 @@ def test_long_sensitive_parameter_key_never_leaks_value():
 
     assert secret not in serialized
     assert "password" not in serialized
+
+
+def test_sensitive_string_subclass_key_cannot_override_detection():
+    secret = "VALUE-MUST-NOT-PERSIST"
+    lower_calls = []
+
+    class MisleadingSensitiveKey(str):
+        def lower(self):
+            lower_calls.append(True)
+            return "ordinary"
+
+    value = ai_training._json_safe_training_value(
+        {MisleadingSensitiveKey("service_token"): secret}
+    )
+    serialized = json.dumps(value, allow_nan=False, sort_keys=True)
+
+    assert lower_calls == []
+    assert secret not in serialized
+
+
+def test_series_with_untrusted_dtype_never_calls_dtype_stringifier():
+    secret = "VALUE-MUST-NOT-PERSIST"
+
+    class SecretDType:
+        def __str__(self):
+            return secret
+
+    class ForgedDTypeSeries(pd.Series):
+        @property
+        def dtype(self):
+            return SecretDType()
+
+    value = ai_training._json_safe_training_value(ForgedDTypeSeries([1.0]))
+    serialized = json.dumps(value, allow_nan=False, sort_keys=True)
+
+    assert secret not in serialized
+    assert value["dtype"] == {
+        "type": f"{SecretDType.__module__}.{SecretDType.__qualname__}"
+    }
+
+
+def test_ascii_bytes_sensitive_parameter_key_never_leaks_value():
+    secret = "VALUE-MUST-NOT-PERSIST"
+
+    value = ai_training._json_safe_training_value(
+        {b"customer_password": secret}
+    )
+    serialized = json.dumps(value, allow_nan=False, sort_keys=True)
+
+    assert secret not in serialized
 
 
 def test_unknown_training_parameter_does_not_persist_dtype_content():

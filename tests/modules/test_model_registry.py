@@ -634,6 +634,15 @@ def test_new_metadata_cannot_claim_the_legacy_training_contract():
         )
 
 
+def test_serialized_metadata_cannot_claim_the_legacy_training_contract():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    payload = model_metadata(key).to_dict()
+    payload["training_contract_hash"] = "legacy-training-contract-v0"
+
+    with pytest.raises(ValueError, match="legacy.*training contract"):
+        ModelMetadata.from_dict(payload)
+
+
 @pytest.mark.parametrize(
     "field",
     [

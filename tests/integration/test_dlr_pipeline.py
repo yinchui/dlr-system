@@ -362,20 +362,59 @@ def test_pipeline_interval_controls_training_bundle_and_model_compatibility(
     )
 
 
-def test_pipeline_rejects_injected_trainer_with_mismatched_cadence(tmp_path):
+def test_pipeline_does_not_validate_trainer_cadence_without_training(tmp_path):
     trainer = ResidualTrainer(feature_builder=FeatureBuilder(cadence_minutes=30))
-    pipeline = DlrPipeline(model_root=tmp_path, trainer=trainer)
+    no_matching_truth = _weather("truth", truth_offset=True).assign(
+        tower_id="999"
+    )
+    cases = (
+        (False, None),
+        (False, _weather("truth", truth_offset=True)),
+        (True, None),
+        (True, _weather("truth")),
+        (True, no_matching_truth),
+    )
 
-    with pytest.raises(ValueError, match="cadence"):
-        pipeline.run(
+    for index, (ai_enabled, truth) in enumerate(cases):
+        result = DlrPipeline(
+            model_root=tmp_path / str(index),
+            trainer=trainer,
+        ).run(
             physical=_weather("physical"),
+            truth=truth,
             project_id="project-a",
             line_id="line-a",
             interval_minutes=60,
             terrain_lookup={},
-            ai_enabled=False,
+            ai_enabled=ai_enabled,
             conductor=_conductor(),
         )
+        assert result.max_currents.shape == (2, 2)
+        assert not any(
+            fallback.reason.startswith("training_failed:")
+            for fallback in result.model_report.fallbacks
+        )
+
+
+def test_mismatched_trainer_cadence_fails_only_matched_training_keys(tmp_path):
+    trainer = ResidualTrainer(feature_builder=FeatureBuilder(cadence_minutes=30))
+    result = DlrPipeline(model_root=tmp_path, trainer=trainer).run(
+        physical=_weather("physical"),
+        truth=_weather("truth", truth_offset=True),
+        project_id="project-a",
+        line_id="line-a",
+        interval_minutes=60,
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    assert result.max_currents.shape == (2, 2)
+    assert not result.model_report.trained_targets
+    assert sum(
+        fallback.reason == "training_failed:ValueError"
+        for fallback in result.model_report.fallbacks
+    ) == 4
 
 
 class _SpyThermalAdapter:
@@ -621,6 +660,33 @@ def test_pipeline_result_is_a_defensive_snapshot_with_read_only_arrays(
     with pytest.raises(ValueError):
         result.thermal_result["nested"]["array"][0] = 0.0
 
+    expected_currents = result.max_currents.copy()
+    exposed_currents = result.max_currents
+    exposed_currents.setflags(write=True)
+    exposed_currents[0, 0] = -999.0
+    assert result.max_currents is not exposed_currents
+    np.testing.assert_array_equal(result.max_currents, expected_currents)
+
+    expected_winds = result.thermal_result["corrected_winds"].copy()
+    exposed_thermal = result.thermal_result
+    exposed_winds = exposed_thermal["corrected_winds"]
+    exposed_nested = exposed_thermal["nested"]["array"]
+    exposed_winds.setflags(write=True)
+    exposed_nested.setflags(write=True)
+    exposed_winds[0, 0] = -999.0
+    exposed_nested[0] = -999.0
+    fresh_thermal = result.thermal_result
+    assert fresh_thermal is not exposed_thermal
+    np.testing.assert_array_equal(
+        fresh_thermal["corrected_winds"], expected_winds
+    )
+    np.testing.assert_array_equal(
+        fresh_thermal["nested"]["array"], [1.0, 2.0]
+    )
+    legacy = result.to_legacy_line_data()
+    np.testing.assert_array_equal(legacy["max_currents"], expected_currents)
+    np.testing.assert_array_equal(legacy["corrected_winds"], expected_winds)
+
 
 def test_legacy_projection_remains_independent_and_mutable(tmp_path):
     result = DlrPipeline(model_root=tmp_path).run(
@@ -786,25 +852,94 @@ def test_prediction_contract_failure_isolated_to_one_tower_target(tmp_path):
     )
 
 
-def test_incomplete_prediction_output_rolls_back_the_entire_key(
+def test_prediction_input_drops_outputs_and_incomplete_key_rolls_back(
     tmp_path,
     monkeypatch,
 ):
     original_predict = ResidualPredictor.predict
+    leaked_output_columns = set()
 
     def incomplete_predict(self, frame, target_name, physical_col):
-        predicted = original_predict(
+        if str(frame["tower_id"].iloc[0]) == "001" and target_name == "wind_speed":
+            output_columns = {"final", "residual", "used_ai", "fallback_reason"}
+            for target in ("wind_speed", "ambient_temp"):
+                output_columns.update(
+                    {
+                        f"{target}_final",
+                        f"{target}_residual",
+                        f"{target}_used_ai",
+                        f"{target}_fallback_reason",
+                    }
+                )
+            leaked_output_columns.update(output_columns & set(frame.columns))
+            predicted = frame.copy(deep=True)
+            predicted["wind_speed_final"] = predicted[physical_col] + 1.0
+            predicted["used_ai"] = True
+            predicted["fallback_reason"] = ""
+            return predicted
+        return original_predict(
             self,
             frame,
             target_name=target_name,
             physical_col=physical_col,
         )
-        if str(frame["tower_id"].iloc[0]) == "001" and target_name == "wind_speed":
-            predicted["wind_speed_final"] = predicted[physical_col] + 1.0
-            return predicted.drop(columns="wind_speed_residual")
-        return predicted
 
     monkeypatch.setattr(ResidualPredictor, "predict", incomplete_predict)
+    result = DlrPipeline(
+        model_root=tmp_path,
+        registry=_PredictionContractRegistry(missing_feature=False),
+    ).run(
+        physical=_weather("physical"),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    comparison = result.comparison_weather
+    failed_rows = comparison["tower_id"] == "001"
+    assert not leaked_output_columns
+    np.testing.assert_array_equal(
+        comparison.loc[failed_rows, "wind_speed_ai"],
+        comparison.loc[failed_rows, "wind_speed_physical"],
+    )
+    assert not comparison.loc[failed_rows, "wind_speed_used_ai"].any()
+    final = result.final_weather
+    local = result.terrain_corrected_weather
+    np.testing.assert_array_equal(
+        final.loc[final["tower_id"] == "001", "wind_speed"],
+        local.loc[local["tower_id"] == "001", "wind_speed_local"],
+    )
+    assert any(
+        fallback.key == ModelKey("project-a", "line-a", "001", "wind_speed")
+        and fallback.reason == "prediction_failed:KeyError"
+        for fallback in result.model_report.fallbacks
+    )
+
+
+def test_inconsistent_non_ai_prediction_rolls_back_the_entire_key(
+    tmp_path,
+    monkeypatch,
+):
+    original_predict = ResidualPredictor.predict
+
+    def inconsistent_predict(self, frame, target_name, physical_col):
+        if str(frame["tower_id"].iloc[0]) == "001" and target_name == "wind_speed":
+            predicted = frame.copy(deep=True)
+            predicted["wind_speed_residual"] = 0.5
+            predicted["wind_speed_final"] = predicted[physical_col] + 0.5
+            predicted["used_ai"] = False
+            predicted["fallback_reason"] = ""
+            return predicted
+        return original_predict(
+            self,
+            frame,
+            target_name=target_name,
+            physical_col=physical_col,
+        )
+
+    monkeypatch.setattr(ResidualPredictor, "predict", inconsistent_predict)
     result = DlrPipeline(
         model_root=tmp_path,
         registry=_PredictionContractRegistry(missing_feature=False),
@@ -824,15 +959,9 @@ def test_incomplete_prediction_output_rolls_back_the_entire_key(
         comparison.loc[failed_rows, "wind_speed_physical"],
     )
     assert not comparison.loc[failed_rows, "wind_speed_used_ai"].any()
-    final = result.final_weather
-    local = result.terrain_corrected_weather
-    np.testing.assert_array_equal(
-        final.loc[final["tower_id"] == "001", "wind_speed"],
-        local.loc[local["tower_id"] == "001", "wind_speed_local"],
-    )
     assert any(
         fallback.key == ModelKey("project-a", "line-a", "001", "wind_speed")
-        and fallback.reason == "prediction_failed:KeyError"
+        and fallback.reason == "prediction_failed:ValueError"
         for fallback in result.model_report.fallbacks
     )
 

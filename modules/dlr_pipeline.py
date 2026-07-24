@@ -39,6 +39,12 @@ _LOCAL_COLUMNS = {
     "wind_speed": "wind_speed_local",
     "ambient_temp": "ambient_temp_local",
 }
+_GENERIC_PREDICTION_OUTPUT_COLUMNS = {
+    "final",
+    "residual",
+    "used_ai",
+    "fallback_reason",
+}
 _CONTENT_COLUMNS = (
     "tower_id",
     "timestamp",
@@ -119,15 +125,48 @@ def _weather_content_overlaps(
     )
 
 
+def _prediction_input(frame: pd.DataFrame) -> pd.DataFrame:
+    output_columns = set(_GENERIC_PREDICTION_OUTPUT_COLUMNS)
+    for target in _TARGETS:
+        output_columns.update(
+            {
+                f"{target}_final",
+                f"{target}_residual",
+                f"{target}_used_ai",
+                f"{target}_fallback_reason",
+            }
+        )
+    return frame.drop(
+        columns=[column for column in output_columns if column in frame.columns]
+    )
+
+
 def _validated_prediction_output(
     predicted: pd.DataFrame,
     expected_index: pd.Index,
     target: str,
+    physical: Any,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     if not isinstance(predicted, pd.DataFrame):
         raise TypeError("prediction output must be a pandas DataFrame")
+    if len(predicted) != len(expected_index):
+        raise ValueError("prediction output length does not match input")
     if not predicted.index.equals(expected_index):
         raise ValueError("prediction output index does not match input")
+    required = {
+        f"{target}_final",
+        f"{target}_residual",
+        "used_ai",
+        "fallback_reason",
+    }
+    missing = sorted(required - set(predicted.columns))
+    if missing:
+        raise KeyError(f"prediction output missing columns: {', '.join(missing)}")
+    physical_values = np.asarray(physical, dtype=float).reshape(-1)
+    if len(physical_values) != len(predicted) or not np.isfinite(
+        physical_values
+    ).all():
+        raise ValueError("prediction physical values must be finite and aligned")
     final = pd.to_numeric(
         predicted[f"{target}_final"], errors="raise"
     ).to_numpy(dtype=float)
@@ -136,6 +175,10 @@ def _validated_prediction_output(
     ).to_numpy(dtype=float)
     if not np.isfinite(final).all() or not np.isfinite(residual).all():
         raise ValueError("prediction output must be finite")
+    with np.errstate(over="ignore", invalid="ignore"):
+        expected_final = physical_values + residual
+    if not np.allclose(final, expected_final, rtol=1e-12, atol=1e-12):
+        raise ValueError("prediction final must equal physical plus residual")
     used_series = predicted["used_ai"]
     if not used_series.map(lambda value: isinstance(value, (bool, np.bool_))).all():
         raise TypeError("prediction used_ai must contain booleans")
@@ -144,6 +187,19 @@ def _validated_prediction_output(
     if not reason_series.map(lambda value: isinstance(value, str)).all():
         raise TypeError("prediction fallback_reason must contain strings")
     reasons = reason_series.to_numpy(dtype=object)
+    fallback_rows = ~used
+    if fallback_rows.any():
+        if not np.allclose(
+            residual[fallback_rows], 0.0, rtol=0.0, atol=1e-12
+        ) or not np.allclose(
+            final[fallback_rows],
+            physical_values[fallback_rows],
+            rtol=1e-12,
+            atol=1e-12,
+        ):
+            raise ValueError("non-AI predictions must use physical values")
+        if any(not str(reason).strip() for reason in reasons[fallback_rows]):
+            raise ValueError("non-AI predictions require a fallback reason")
     return final, residual, used, reasons
 
 
@@ -277,11 +333,11 @@ class DlrPipelineResult:
 
     @property
     def thermal_result(self) -> Mapping[str, Any]:
-        return self._thermal_result
+        return _freeze_snapshot(self._thermal_result)
 
     @property
     def max_currents(self) -> np.ndarray:
-        return self._max_currents
+        return _readonly_array(self._max_currents, dtype=float)
 
     def to_legacy_line_data(self) -> dict[str, Any]:
         tower_ids = tuple(self._thermal_result.get("tower_ids", ()))
@@ -947,7 +1003,7 @@ class DlrPipeline:
         transient_request: Optional[Mapping[str, Any]] = None,
     ) -> DlrPipelineResult:
         options = correction_options or CorrectionOptions()
-        trainer = self._trainer_for_interval(interval_minutes)
+        trainer = None
         physical_input = self._weather_frame(physical, role="physical")
         physical_weather = resample_weather_by_tower(
             physical_input, interval_minutes=interval_minutes
@@ -1035,6 +1091,8 @@ class DlrPipeline:
                         fallbacks.append(ModelFallback(key, "no_aligned_truth"))
                         continue
                     try:
+                        if trainer is None:
+                            trainer = self._trainer_for_interval(interval_minutes)
                         training = trainer.train_target(
                             tower_training,
                             key.target,
@@ -1081,7 +1139,7 @@ class DlrPipeline:
                     fallbacks.append(ModelFallback(key, reason))
                     continue
                 row_mask = prediction["tower_id"].astype(str) == key.tower_id
-                tower = prediction.loc[row_mask].copy()
+                tower = _prediction_input(prediction.loc[row_mask])
                 try:
                     predicted = ResidualPredictor(
                         {key.target: load_result.bundle}
@@ -1095,6 +1153,7 @@ class DlrPipeline:
                             predicted,
                             tower.index,
                             key.target,
+                            tower[_LOCAL_COLUMNS[key.target]],
                         )
                     )
                     candidate = prediction.copy(deep=True)

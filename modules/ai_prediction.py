@@ -133,21 +133,21 @@ class FeatureBuilder:
     def _timestamps(frame: pd.DataFrame) -> pd.Series:
         if "timestamp" not in frame.columns:
             raise ValueError("missing required column: timestamp")
+        values = frame["timestamp"]
         try:
-            timestamps = pd.to_datetime(frame["timestamp"], errors="coerce")
-            if timestamps.isna().any():
+            if values.isna().any():
                 raise ValueError("timestamp contains missing or invalid values")
-            if isinstance(timestamps.dtype, pd.DatetimeTZDtype):
-                return timestamps.dt.tz_convert(PROJECT_TIMEZONE)
-            if pd.api.types.is_datetime64_dtype(timestamps.dtype):
-                return timestamps.dt.tz_localize(
+            if isinstance(values.dtype, pd.DatetimeTZDtype):
+                return values.dt.tz_convert(PROJECT_TIMEZONE)
+            if pd.api.types.is_datetime64_dtype(values.dtype):
+                return values.dt.tz_localize(
                     PROJECT_TIMEZONE,
                     ambiguous="raise",
                     nonexistent="raise",
                 )
 
             normalized = []
-            for value in frame["timestamp"]:
+            for value in values:
                 timestamp = pd.Timestamp(value)
                 if pd.isna(timestamp):
                     raise ValueError(
@@ -162,8 +162,13 @@ class FeatureBuilder:
                 else:
                     timestamp = timestamp.tz_convert(PROJECT_TIMEZONE)
                 normalized.append(timestamp)
+            normalized_index = (
+                pd.DatetimeIndex(normalized)
+                if normalized
+                else pd.DatetimeIndex([], tz=PROJECT_TIMEZONE)
+            )
             return pd.Series(
-                pd.DatetimeIndex(normalized),
+                normalized_index,
                 index=frame.index,
                 name="timestamp",
             )

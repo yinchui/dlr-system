@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import modules.ai_prediction as ai_prediction
 from config.config import PROJECT_TIMEZONE
 from modules.ai_prediction import FeatureBuilder, ModelBundle, ResidualPredictor
 
@@ -274,6 +275,87 @@ def test_equivalent_aware_timestamps_have_identical_project_time_features():
         utc_features.loc[0, cycle_columns].to_numpy(dtype=float),
         local_features.loc[0, cycle_columns].to_numpy(dtype=float),
     )
+
+
+def test_mixed_naive_and_aware_timestamps_normalize_in_one_frame():
+    frame = pd.DataFrame(
+        {
+            "tower_id": ["001", "001"],
+            "timestamp": pd.Series(
+                [
+                    pd.Timestamp("2025-01-01 08:00"),
+                    pd.Timestamp("2025-01-01 01:00", tz="UTC"),
+                ],
+                dtype=object,
+            ),
+            "wind_speed_local": [3.0, 4.0],
+        }
+    )
+
+    features = FeatureBuilder(cadence_minutes=60).transform(
+        frame, physical_col="wind_speed_local"
+    )
+
+    assert str(features["timestamp"].dt.tz) == PROJECT_TIMEZONE
+    assert features["hour"].tolist() == [8, 9]
+    assert features["lag_1"].tolist() == [3.0, 3.0]
+
+
+def test_mixed_aware_timezones_normalize_in_one_frame():
+    frame = pd.DataFrame(
+        {
+            "tower_id": ["001", "002"],
+            "timestamp": pd.Series(
+                [
+                    pd.Timestamp("2025-01-01 00:00", tz="UTC"),
+                    pd.Timestamp(
+                        "2025-01-01 08:00", tz=PROJECT_TIMEZONE
+                    ),
+                ],
+                dtype=object,
+            ),
+            "wind_speed_local": [3.0, 4.0],
+        }
+    )
+
+    features = FeatureBuilder().transform(
+        frame, physical_col="wind_speed_local"
+    )
+
+    assert str(features["timestamp"].dt.tz) == PROJECT_TIMEZONE
+    assert features.loc[0, "timestamp"] == features.loc[1, "timestamp"]
+    cycle_columns = [
+        "hour_sin",
+        "hour_cos",
+        "day_of_year_sin",
+        "day_of_year_cos",
+    ]
+    assert np.allclose(
+        features.loc[0, cycle_columns].to_numpy(dtype=float),
+        features.loc[1, cycle_columns].to_numpy(dtype=float),
+    )
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    ["2025-11-02 01:30", "2025-03-09 02:30"],
+)
+def test_ambiguous_or_nonexistent_naive_local_time_is_rejected(
+    monkeypatch, timestamp
+):
+    monkeypatch.setattr(
+        ai_prediction, "PROJECT_TIMEZONE", "America/New_York"
+    )
+    frame = pd.DataFrame(
+        {
+            "tower_id": ["001"],
+            "timestamp": [timestamp],
+            "wind_speed_local": [3.0],
+        }
+    )
+
+    with pytest.raises(ValueError, match="timestamp"):
+        FeatureBuilder().transform(frame, physical_col="wind_speed_local")
 
 
 @pytest.mark.parametrize(

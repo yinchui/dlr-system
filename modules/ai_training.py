@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import importlib.metadata
+import json
+import platform
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
@@ -107,6 +111,88 @@ def _robust_residual_bounds(residual: np.ndarray) -> tuple[float, float]:
     if lower > upper:
         return median, median
     return lower, upper
+
+
+def _stable_training_data_hash(
+    frame: pd.DataFrame,
+    columns: Sequence[str],
+    *,
+    target: str,
+) -> str:
+    selected_columns = list(dict.fromkeys(columns))
+    canonical = frame.loc[:, selected_columns].copy(deep=True)
+    sort_columns = [
+        column
+        for column in ("line_id", "tower_id", "timestamp")
+        if column in canonical.columns
+    ]
+    if sort_columns:
+        canonical = canonical.sort_values(sort_columns, kind="mergesort")
+    row_hashes = pd.util.hash_pandas_object(
+        canonical,
+        index=False,
+        categorize=True,
+    ).to_numpy(dtype=np.uint64)
+    digest = hashlib.sha256()
+    digest.update(
+        json.dumps(
+            {"target": target, "columns": selected_columns},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    digest.update(row_hashes.tobytes())
+    return digest.hexdigest()
+
+
+def _json_safe_training_value(value):
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if np.isfinite(value) else str(value)
+    if isinstance(value, np.generic):
+        return _json_safe_training_value(value.item())
+    if isinstance(value, dict):
+        return {
+            str(key): _json_safe_training_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_training_value(item) for item in value]
+    return repr(value)
+
+
+def _estimator_training_params(estimator: object) -> dict:
+    estimator_class = type(estimator)
+    metadata = {
+        "estimator_class": (
+            f"{estimator_class.__module__}.{estimator_class.__qualname__}"
+        )
+    }
+    get_params = getattr(estimator, "get_params", None)
+    if callable(get_params):
+        try:
+            metadata["parameters"] = _json_safe_training_value(
+                get_params(deep=False)
+            )
+        except Exception as exc:
+            metadata["parameter_read_error"] = type(exc).__name__
+    return metadata
+
+
+def _dependency_versions() -> dict[str, str]:
+    versions = {
+        "python": platform.python_version(),
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+    }
+    for distribution in ("joblib", "xgboost"):
+        try:
+            versions[distribution] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            versions[distribution] = "unavailable"
+    return versions
 
 
 class ResidualTrainer:
@@ -346,6 +432,30 @@ class ResidualTrainer:
             raise ValueError("model features must contain finite values")
         segments = self.feature_builder.continuous_segments(working)
         split = self._time_split(feature_frame, segments)
+        lineage_columns = [
+            column
+            for column in (
+                "source_file_hash",
+                "source_file_hash_physical",
+                "source_file_hash_truth",
+                "dataset_id",
+                "dataset_role",
+            )
+            if column in feature_frame.columns
+        ]
+        hash_columns = [
+            "line_id",
+            "tower_id",
+            "timestamp",
+            *lineage_columns,
+            *feature_columns,
+            truth_col,
+        ]
+        input_data_hash = _stable_training_data_hash(
+            feature_frame,
+            hash_columns,
+            target=target,
+        )
 
         if split is None:
             evaluation_mode = "full_fit"
@@ -365,6 +475,7 @@ class ResidualTrainer:
                 final_reason = prediction_reason
             full_fit_metrics = _metric_values(physical, truth, corrected)
             metrics = {}
+            evaluation_set_hash = None
             evaluation_reason = final_reason
         else:
             evaluation_mode = "temporal_holdout"
@@ -390,6 +501,11 @@ class ResidualTrainer:
                 truth[holdout_positions],
                 corrected,
             )
+            evaluation_set_hash = _stable_training_data_hash(
+                feature_frame.iloc[holdout_positions],
+                hash_columns,
+                target=target,
+            )
             final_estimator, final_reason = self._fit_estimator(
                 model_features, residual
             )
@@ -410,9 +526,13 @@ class ResidualTrainer:
             "evaluation_mode": evaluation_mode,
             "independent_evaluation": independent_evaluation,
             "metric_domain": "weather_vs_truth",
+            "input_data_hash": input_data_hash,
+            "evaluation_set_hash": evaluation_set_hash,
             "feature_columns": feature_columns.copy(),
             "cadence_minutes": self.feature_builder.cadence_minutes,
             "random_state": 42,
+            "training_params": _estimator_training_params(final_estimator),
+            "dependency_versions": _dependency_versions(),
             "fallback_reason": final_reason,
             "evaluation_fallback_reason": evaluation_reason,
             "residual_bounds": final_bounds,

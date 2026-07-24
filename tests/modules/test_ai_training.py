@@ -1,5 +1,7 @@
-from dataclasses import replace
+import json
+from dataclasses import dataclass, replace
 from functools import partial
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -75,6 +77,68 @@ class OrderSensitiveEstimator:
 
     def get_params(self, deep=False):
         return {"offset": self.offset}
+
+
+class ConfiguredEstimatorFactory:
+    def __init__(self, offset=0.0, values=None):
+        self.offset = float(offset)
+        self.values = values
+        self.calls = []
+
+    def __call__(self):
+        self.calls.append(self.offset)
+        return OrderSensitiveEstimator(offset=self.offset)
+
+    def training_contract_descriptor(self):
+        return {"offset": self.offset, "values": self.values}
+
+
+class ConfigurableTrainer:
+    def __init__(self, poor):
+        self.poor = bool(poor)
+        self.delegate = ResidualTrainer(estimator_factory=constant_factory)
+        self.feature_builder = self.delegate.feature_builder
+        self.calls = []
+
+    def prepare_target(self, frame, target, **kwargs):
+        return self.delegate.prepare_target(frame, target, **kwargs)
+
+    def train_prepared(self, preparation):
+        self.calls.append((preparation.tower_id, preparation.target))
+        result = self.delegate.train_prepared(preparation)
+        if not self.poor or not result.metrics:
+            return result
+        metrics = dict(result.metrics)
+        metrics["corrected_mae"] = metrics["baseline_mae"]
+        metrics["corrected_rmse"] = metrics["baseline_rmse"]
+        return replace(result, metrics=metrics)
+
+    def train_target(self, frame, target, **kwargs):
+        preparation = self.prepare_target(frame, target, **kwargs)
+        return self.train_prepared(preparation)
+
+    def training_contract_descriptor(self):
+        return {
+            "poor": self.poor,
+            "delegate": self.delegate.training_contract_descriptor(),
+        }
+
+
+class SecretReprObject:
+    def __repr__(self):
+        return "SecretReprObject(secret-123)"
+
+
+class SecretParameterEstimator(MeanResidualEstimator):
+    def get_params(self, deep=False):
+        return {
+            "customer_secret": "secret-123",
+            "diagnostic_frame": pd.DataFrame(
+                {"customer_secret": ["secret-123"]}
+            ),
+            "artifact_path": Path("/private/secret-123/model.bin"),
+            "opaque": SecretReprObject(),
+        }
 
 
 def make_training_frame(
@@ -162,6 +226,9 @@ def test_training_preparation_matches_training_without_fitting_early():
         estimator_calls.append("created")
         return MeanResidualEstimator()
 
+    estimator_factory.training_contract_descriptor = lambda: {
+        "type": "recording-mean-residual-factory"
+    }
     trainer = ResidualTrainer(estimator_factory=estimator_factory)
     preparation = trainer.prepare_target(
         make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0)),
@@ -247,6 +314,326 @@ def test_training_contract_changes_with_estimator_parameters():
     ).prepare_target(frame, target="wind_speed")
 
     assert first.training_contract_hash != changed.training_contract_hash
+
+
+def test_training_contract_distinguishes_callable_instance_configuration():
+    frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
+
+    zero = ResidualTrainer(
+        estimator_factory=ConfiguredEstimatorFactory(offset=0.0)
+    ).prepare_target(frame, target="wind_speed")
+    five = ResidualTrainer(
+        estimator_factory=ConfiguredEstimatorFactory(offset=5.0)
+    ).prepare_target(frame, target="wind_speed")
+
+    assert zero.training_contract_hash != five.training_contract_hash
+
+
+def test_training_contract_distinguishes_dynamic_lambda_bytecode_constants():
+    frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
+    namespace = {"FixedResidualEstimator": FixedResidualEstimator}
+    zero_factory = eval(
+        "lambda: FixedResidualEstimator(0.0)", namespace  # noqa: S307
+    )
+    five_factory = eval(
+        "lambda: FixedResidualEstimator(5.0)", namespace  # noqa: S307
+    )
+
+    zero = ResidualTrainer(estimator_factory=zero_factory).prepare_target(
+        frame, target="wind_speed"
+    )
+    five = ResidualTrainer(estimator_factory=five_factory).prepare_target(
+        frame, target="wind_speed"
+    )
+
+    assert zero.training_contract_hash != five.training_contract_hash
+
+
+def test_training_contract_rejects_opaque_public_class_configuration():
+    class OpaqueConfiguredEstimator:
+        strategy = object()
+
+        def fit(self, features, target):
+            return self
+
+        def predict(self, features):
+            return np.zeros(len(features))
+
+    with pytest.raises(
+        ai_training.TrainingContractError,
+        match="describe|contract|configuration",
+    ):
+        ResidualTrainer(estimator_factory=OpaqueConfiguredEstimator)
+
+
+def test_train_prepared_rejects_referenced_global_callable_changed_after_init():
+    namespace = {"Estimator": MeanResidualEstimator}
+    estimator_factory = eval("lambda: Estimator()", namespace)  # noqa: S307
+    trainer = ResidualTrainer(estimator_factory=estimator_factory)
+    preparation = trainer.prepare_target(
+        make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0)),
+        target="wind_speed",
+    )
+
+    namespace["Estimator"] = NonFiniteEstimator
+
+    with pytest.raises(
+        ai_training.TrainingContractError,
+        match="factory.*contract|contract.*changed",
+    ):
+        trainer.train_prepared(preparation)
+
+
+def test_training_contract_tracks_globals_used_by_nested_code_objects():
+    source = (
+        "lambda: [FixedResidualEstimator(OFFSET) for _ in (0,)][0]"
+    )
+    zero_factory = eval(  # noqa: S307
+        source,
+        {"FixedResidualEstimator": FixedResidualEstimator, "OFFSET": 0.0},
+    )
+    five_factory = eval(  # noqa: S307
+        source,
+        {"FixedResidualEstimator": FixedResidualEstimator, "OFFSET": 5.0},
+    )
+    frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
+
+    zero = ResidualTrainer(estimator_factory=zero_factory).prepare_target(
+        frame, target="wind_speed"
+    )
+    five = ResidualTrainer(estimator_factory=five_factory).prepare_target(
+        frame, target="wind_speed"
+    )
+
+    assert zero.training_contract_hash != five.training_contract_hash
+
+
+def test_train_prepared_rejects_inherited_class_configuration_change():
+    class BaseConfiguredEstimator:
+        offset = 0.0
+
+        def fit(self, features, target):
+            self.value = float(np.mean(target) + type(self).offset)
+            return self
+
+        def predict(self, features):
+            return np.full(len(features), self.value)
+
+    class InheritedConfiguredEstimator(BaseConfiguredEstimator):
+        def __init__(self):
+            self.value = 0.0
+
+    trainer = ResidualTrainer(estimator_factory=InheritedConfiguredEstimator)
+    preparation = trainer.prepare_target(
+        make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0)),
+        target="wind_speed",
+    )
+
+    BaseConfiguredEstimator.offset = 5.0
+
+    with pytest.raises(ai_training.TrainingContractError, match="contract.*changed"):
+        trainer.train_prepared(preparation)
+
+
+def test_train_prepared_rejects_builtin_class_strategy_change():
+    class TransformEstimator:
+        transform = abs
+
+        def fit(self, features, target):
+            self.value = float(type(self).transform(float(np.mean(target))))
+            return self
+
+        def predict(self, features):
+            return np.full(len(features), self.value)
+
+    trainer = ResidualTrainer(estimator_factory=TransformEstimator)
+    preparation = trainer.prepare_target(
+        make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0)),
+        target="wind_speed",
+    )
+
+    TransformEstimator.transform = round
+
+    with pytest.raises(ai_training.TrainingContractError, match="contract.*changed"):
+        trainer.train_prepared(preparation)
+
+
+def test_train_prepared_rejects_callable_instance_class_configuration_change():
+    class ClassConfiguredFactory:
+        offset = 0.0
+
+        def __call__(self):
+            return FixedResidualEstimator(type(self).offset)
+
+    factory = ClassConfiguredFactory()
+    trainer = ResidualTrainer(estimator_factory=factory)
+    preparation = trainer.prepare_target(
+        make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0)),
+        target="wind_speed",
+    )
+
+    ClassConfiguredFactory.offset = 5.0
+
+    with pytest.raises(ai_training.TrainingContractError, match="contract.*changed"):
+        trainer.train_prepared(preparation)
+
+
+def test_training_contract_does_not_drop_call_count_configuration():
+    class CallCountConfiguredFactory:
+        def __init__(self, call_count):
+            self.call_count = float(call_count)
+
+        def __call__(self):
+            return FixedResidualEstimator(self.call_count)
+
+    frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
+
+    zero = ResidualTrainer(
+        estimator_factory=CallCountConfiguredFactory(0.0)
+    ).prepare_target(frame, target="wind_speed")
+    five = ResidualTrainer(
+        estimator_factory=CallCountConfiguredFactory(5.0)
+    ).prepare_target(frame, target="wind_speed")
+
+    assert zero.training_contract_hash != five.training_contract_hash
+
+
+def test_training_contract_does_not_treat_custom_append_as_observation():
+    class AppendFactoryDelegate:
+        def __init__(self, offset):
+            self.offset = float(offset)
+
+        def append(self):
+            return FixedResidualEstimator(self.offset)
+
+    def make_factory(offset):
+        delegate = AppendFactoryDelegate(offset)
+
+        def estimator_factory():
+            return delegate.append()
+
+        return estimator_factory
+
+    frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
+    zero = ResidualTrainer(estimator_factory=make_factory(0.0)).prepare_target(
+        frame, target="wind_speed"
+    )
+    five = ResidualTrainer(estimator_factory=make_factory(5.0)).prepare_target(
+        frame, target="wind_speed"
+    )
+
+    assert zero.training_contract_hash != five.training_contract_hash
+
+
+def test_training_contract_preserves_mutable_alias_topology():
+    def make_factory(left, right):
+        def estimator_factory():
+            offset = 0.0 if left is right else 5.0
+            return FixedResidualEstimator(offset)
+
+        estimator_factory.training_contract_descriptor = lambda: {
+            "shared_configuration": left is right
+        }
+        return estimator_factory
+
+    shared = []
+    frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
+    aliased = ResidualTrainer(
+        estimator_factory=make_factory(shared, shared)
+    ).prepare_target(frame, target="wind_speed")
+    distinct = ResidualTrainer(
+        estimator_factory=make_factory([], [])
+    ).prepare_target(frame, target="wind_speed")
+
+    assert aliased.training_contract_hash != distinct.training_contract_hash
+
+
+def test_frozen_callable_contract_tracks_exception_table_semantics():
+    def estimator_factory():
+        try:
+            return MeanResidualEstimator()
+        except RuntimeError:
+            return NonFiniteEstimator()
+
+    original_code = estimator_factory.__code__
+    assert original_code.co_exceptiontable
+    frozen = ai_training.FrozenCallableContract.capture(estimator_factory)
+    estimator_factory.__code__ = original_code.replace(co_exceptiontable=b"")
+    try:
+        with pytest.raises(
+            ai_training.TrainingContractError,
+            match="contract.*changed",
+        ):
+            frozen.verify(estimator_factory)
+    finally:
+        estimator_factory.__code__ = original_code
+
+
+def test_training_contract_preserves_container_type_tags():
+    frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
+
+    list_contract = ResidualTrainer(
+        estimator_factory=ConfiguredEstimatorFactory(values=[1, 2])
+    ).prepare_target(frame, target="wind_speed")
+    tuple_contract = ResidualTrainer(
+        estimator_factory=ConfiguredEstimatorFactory(values=(1, 2))
+    ).prepare_target(frame, target="wind_speed")
+
+    assert list_contract.training_contract_hash != tuple_contract.training_contract_hash
+
+
+def test_train_prepared_rejects_partial_configuration_changed_after_init():
+    frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
+    factory = partial(OrderSensitiveEstimator, offset=0.0)
+    trainer = ResidualTrainer(estimator_factory=factory)
+    preparation = trainer.prepare_target(frame, target="wind_speed")
+
+    factory.keywords["offset"] = 7.0
+
+    with pytest.raises(RuntimeError, match="factory.*contract|contract.*changed"):
+        trainer.train_prepared(preparation)
+
+
+def test_train_prepared_rejects_function_defaults_changed_after_init():
+    frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
+
+    def estimator_factory(offset=0.0):
+        return OrderSensitiveEstimator(offset=offset)
+
+    trainer = ResidualTrainer(estimator_factory=estimator_factory)
+    preparation = trainer.prepare_target(frame, target="wind_speed")
+
+    estimator_factory.__defaults__ = (7.0,)
+
+    with pytest.raises(RuntimeError, match="factory.*contract|contract.*changed"):
+        trainer.train_prepared(preparation)
+
+
+def test_runtime_contract_includes_trainer_config_but_ignores_call_history():
+    frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
+    normal = ConfigurableTrainer(poor=False)
+    poor = ConfigurableTrainer(poor=True)
+    preparation = normal.prepare_target(frame, target="wind_speed")
+
+    normal_hash = ai_training.training_runtime_contract_hash(normal, preparation)
+    poor_hash = ai_training.training_runtime_contract_hash(poor, preparation)
+    normal.calls.append(("observed", "only"))
+    after_observation = ai_training.training_runtime_contract_hash(
+        normal, preparation
+    )
+
+    assert normal_hash != poor_hash
+    assert after_observation == normal_hash
+
+
+def test_runtime_contract_accepts_builtin_residual_trainer():
+    trainer, _, preparation = _temporal_preparation()
+
+    contract_hash = ai_training.training_runtime_contract_hash(
+        trainer, preparation
+    )
+
+    assert len(contract_hash) == 64
 
 
 def test_training_contract_changes_with_dependency_versions(monkeypatch):
@@ -433,6 +820,10 @@ def test_temporal_holdout_never_fits_future_block_during_evaluation():
     fitted_targets = []
 
     class RecordingEstimator(MeanResidualEstimator):
+        @classmethod
+        def training_contract_descriptor(cls):
+            return {"type": "recording-mean-residual-estimator"}
+
         def fit(self, features, target):
             fitted_targets.append(np.asarray(target, dtype=float).copy())
             return super().fit(features, target)
@@ -473,8 +864,20 @@ def test_missing_xgboost_falls_back_to_median_residual(monkeypatch):
     )
 
     assert result.metadata["fallback_reason"] == "xgboost_unavailable"
+    assert result.training_outcome == "operational_fallback"
+    assert result.metadata["training_outcome"] == "operational_fallback"
     prediction = result.bundle.model.predict(np.zeros((2, 1)))
     assert prediction.tolist() == [1.5, 1.5]
+
+
+def test_constant_residual_is_a_data_fallback_not_an_operational_failure():
+    result = ResidualTrainer(estimator_factory=constant_factory).train_target(
+        make_training_frame(residuals=(1.0, 1.0, 1.0, 1.0)),
+        target="wind_speed",
+    )
+
+    assert result.training_outcome == "data_fallback"
+    assert result.metadata["training_outcome"] == "data_fallback"
 
 
 def test_non_finite_estimator_prediction_falls_back_to_physical():
@@ -684,6 +1087,152 @@ def test_default_estimator_has_deterministic_xgboost_parameters(monkeypatch):
         "random_state": 42,
         "n_jobs": 1,
     }
+
+
+def test_training_parameter_metadata_never_persists_secret_object_content():
+    result = ResidualTrainer(
+        estimator_factory=SecretParameterEstimator
+    ).train_target(
+        make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0)),
+        target="wind_speed",
+    )
+
+    serialized = json.dumps(result.metadata, sort_keys=True)
+
+    assert "secret-123" not in serialized
+    parameters = result.metadata["training_params"]["parameters"]
+    assert parameters["diagnostic_frame"]["type"].endswith("DataFrame")
+    assert parameters["diagnostic_frame"]["shape"] == [1, 1]
+    assert len(parameters["diagnostic_frame"]["content_hash"]) == 64
+    assert parameters["artifact_path"]["type"].endswith("Path")
+    assert parameters["opaque"] == {
+        "type": f"{SecretReprObject.__module__}.SecretReprObject"
+    }
+
+
+def test_training_parameter_serialization_is_bounded_and_cycle_safe():
+    cyclic = []
+    cyclic.append(cyclic)
+    payload = {
+        "long": "x" * 10_000,
+        "many": list(range(1_000)),
+        "cyclic": cyclic,
+    }
+
+    serialized = json.dumps(ai_training._json_safe_training_value(payload))
+
+    assert len(serialized) < 10_000
+    assert "x" * 1_000 not in serialized
+    assert "truncated" in serialized or "content_hash" in serialized
+
+
+def test_sensitive_non_finite_training_parameter_is_json_safe():
+    value = ai_training._json_safe_training_value(
+        {"service_token": float("nan")}
+    )
+
+    serialized = json.dumps(value, allow_nan=False, sort_keys=True)
+
+    assert "NaN" not in serialized
+    assert value["service_token"]["type"].endswith("float")
+    assert len(value["service_token"]["content_hash"]) == 64
+
+
+def test_long_sensitive_parameter_key_never_leaks_value():
+    secret = "VALUE-MUST-NOT-PERSIST"
+    key = "customer_password_" + "x" * 256
+
+    value = ai_training._json_safe_training_value({key: secret})
+    serialized = json.dumps(value, allow_nan=False, sort_keys=True)
+
+    assert secret not in serialized
+    assert "password" not in serialized
+
+
+def test_unknown_training_parameter_does_not_persist_dtype_content():
+    secret = "VALUE-MUST-NOT-PERSIST"
+
+    class SecretDType:
+        name = secret
+
+    class OpaqueParameter:
+        dtype = SecretDType()
+
+    value = ai_training._json_safe_training_value(OpaqueParameter())
+    serialized = json.dumps(value, allow_nan=False, sort_keys=True)
+
+    assert secret not in serialized
+    assert value == {
+        "type": f"{OpaqueParameter.__module__}.{OpaqueParameter.__qualname__}"
+    }
+
+
+def test_training_parameter_serialization_has_global_node_budget():
+    shared = {"payload": "x" * 256}
+    payload = shared
+    for _ in range(5):
+        payload = [payload] * 5
+
+    value = ai_training._json_safe_training_value(payload)
+    serialized = json.dumps(value, allow_nan=False, sort_keys=True)
+
+    assert len(serialized) < 100_000
+    assert "max_nodes" in serialized
+
+
+def test_training_parameter_mapping_iteration_is_bounded_even_if_len_lies():
+    class LyingMapping(dict):
+        def __len__(self):
+            return 0
+
+    payload = LyingMapping({str(index): index for index in range(200)})
+
+    value = ai_training._json_safe_training_value(payload)
+    serialized = json.dumps(value, allow_nan=False, sort_keys=True)
+
+    assert len(value) <= ai_training._MAX_TRAINING_METADATA_ITEMS + 1
+    assert "max_items" in serialized
+
+
+def test_wide_dataframe_training_summary_is_bounded():
+    frame = pd.DataFrame(columns=[f"column-{index}" for index in range(200)])
+
+    value = ai_training._json_safe_training_value(frame)
+    serialized = json.dumps(value, allow_nan=False, sort_keys=True)
+
+    assert value["column_count"] == 200
+    assert len(value["column_hashes"]) <= ai_training._MAX_TRAINING_METADATA_ITEMS
+    assert value["truncated"] == "max_columns"
+    assert len(serialized) < 20_000
+
+
+def test_huge_integer_training_parameters_are_json_safe_and_bounded():
+    huge = 10**5_000
+
+    value = ai_training._json_safe_training_value(
+        {"ordinary": huge, "service_token": huge}
+    )
+    serialized = json.dumps(value, allow_nan=False, sort_keys=True)
+
+    assert len(serialized) < 2_000
+    assert value["ordinary"]["type"].endswith("int")
+    assert len(value["ordinary"]["content_hash"]) == 64
+    assert len(value["service_token"]["content_hash"]) == 64
+
+
+def test_training_parameter_serialization_handles_self_referential_dataclass():
+    @dataclass
+    class RecursiveParameter:
+        child: object = None
+
+    parameter = RecursiveParameter()
+    parameter.child = parameter
+
+    value = ai_training._json_safe_training_value(parameter)
+    serialized = json.dumps(value, allow_nan=False, sort_keys=True)
+
+    assert len(serialized) < 1_000
+    assert len(value["content_hash"]) == 64
 
 
 def test_training_persists_feature_cadence_in_bundle_and_metadata():

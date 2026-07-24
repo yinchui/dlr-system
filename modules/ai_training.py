@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import copy
+import dis
 import functools
 import hashlib
 import importlib.metadata
 import inspect
 import json
 import platform
-from dataclasses import dataclass, replace
+import types
+from dataclasses import dataclass, fields, is_dataclass, replace
+from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 import numpy as np
@@ -53,6 +56,54 @@ _DEFAULT_ESTIMATOR_PARAMETERS = (
     ("random_state", 42),
     ("n_jobs", 1),
 )
+_MAX_CONTRACT_DEPTH = 12
+_MAX_CONTRACT_ITEMS = 256
+_DYNAMIC_GLOBAL_ACCESS_NAMES = frozenset(
+    {"__import__", "eval", "exec", "globals", "locals"}
+)
+_TRAINING_OUTCOMES = frozenset(
+    {"trained", "data_fallback", "operational_fallback"}
+)
+_OPERATIONAL_FALLBACK_REASONS = frozenset(
+    {
+        "invalid_estimator",
+        "non_finite_prediction",
+        "unexpected_prediction_length",
+        "xgboost_unavailable",
+    }
+)
+_OPERATIONAL_FALLBACK_PREFIXES = (
+    "estimator_factory_failed:",
+    "estimator_fit_failed:",
+    "estimator_prediction_failed:",
+    "prediction_failed:",
+)
+_MAX_TRAINING_METADATA_DEPTH = 6
+_MAX_TRAINING_METADATA_ITEMS = 64
+_MAX_TRAINING_METADATA_STRING = 256
+_MAX_TRAINING_METADATA_NODES = 512
+_MAX_TRAINING_METADATA_INTEGER_BITS = 1_024
+_SENSITIVE_PARAMETER_MARKERS = frozenset(
+    {
+        "accesskey",
+        "apikey",
+        "credential",
+        "password",
+        "passwd",
+        "privatekey",
+        "secret",
+        "token",
+    }
+)
+
+
+class TrainingContractError(RuntimeError):
+    """Raised when executable training configuration cannot be frozen safely."""
+
+
+class _FactoryContractContext:
+    def __init__(self) -> None:
+        self.active: set[int] = set()
 
 
 class ConstantResidualEstimator:
@@ -75,6 +126,7 @@ class TrainingResult:
     metrics: dict[str, float]
     metadata: dict
     training_contract_hash: str
+    training_outcome: str
 
     def __post_init__(self) -> None:
         if (
@@ -93,6 +145,14 @@ class TrainingResult:
             != self.training_contract_hash
         ):
             raise ValueError("training result contract fields must match")
+        if self.training_outcome not in _TRAINING_OUTCOMES:
+            raise ValueError("unsupported training_outcome")
+        if (
+            self.metadata.get("training_outcome") != self.training_outcome
+            or self.bundle.metadata.get("training_outcome")
+            != self.training_outcome
+        ):
+            raise ValueError("training result outcome fields must match")
 
 
 @dataclass(frozen=True)
@@ -151,6 +211,27 @@ class TrainingContract:
         )
 
 
+@dataclass(frozen=True)
+class FrozenCallableContract:
+    descriptor_json: str
+
+    @classmethod
+    def capture(cls, value: Any) -> "FrozenCallableContract":
+        return cls(_canonical_json(_callable_contract(value)))
+
+    def verify(self, value: Any) -> None:
+        try:
+            current = _canonical_json(_callable_contract(value))
+        except TrainingContractError:
+            raise
+        except Exception as exc:
+            raise TrainingContractError(
+                "factory contract could not be verified"
+            ) from exc
+        if current != self.descriptor_json:
+            raise TrainingContractError("factory contract changed after initialization")
+
+
 def _load_xgb_regressor():
     from xgboost import XGBRegressor
 
@@ -175,6 +256,24 @@ def _metric_values(
         "corrected_mae": float(np.mean(np.abs(corrected_error))),
         "corrected_rmse": float(np.sqrt(np.mean(np.square(corrected_error)))),
     }
+
+
+def _training_outcome(*fallback_reasons: str) -> str:
+    normalized = [
+        part.strip()
+        for reason in fallback_reasons
+        for part in str(reason or "").split(";")
+        if part.strip()
+    ]
+    if any(
+        reason in _OPERATIONAL_FALLBACK_REASONS
+        or reason.startswith(_OPERATIONAL_FALLBACK_PREFIXES)
+        for reason in normalized
+    ):
+        return "operational_fallback"
+    if "constant_residual" in normalized:
+        return "data_fallback"
+    return "trained"
 
 
 def _robust_residual_bounds(residual: np.ndarray) -> tuple[float, float]:
@@ -271,64 +370,422 @@ def _qualified_name(value: Any) -> str:
     return f"{module}.{qualname}"
 
 
-def _contract_value(value: Any) -> Any:
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float):
-        return value if np.isfinite(value) else str(value)
-    if isinstance(value, np.generic):
-        return _contract_value(value.item())
-    if isinstance(value, (list, tuple)):
-        return [_contract_value(item) for item in value]
-    if isinstance(value, (set, frozenset)):
-        normalized = [_contract_value(item) for item in value]
-        return sorted(normalized, key=_canonical_json)
-    if isinstance(value, Mapping):
-        return {
-            str(key): _contract_value(item)
-            for key, item in sorted(value.items(), key=lambda item: str(item[0]))
-        }
-    return {"type": _qualified_name(type(value))}
+def _bounded_contract_items(values, *, label: str) -> list:
+    items = []
+    for item in values:
+        if len(items) >= _MAX_CONTRACT_ITEMS:
+            raise TrainingContractError(f"{label} exceeds contract item limit")
+        items.append(item)
+    return items
 
 
-def _implementation_hash(value: Any) -> str:
-    target = getattr(value, "__func__", value)
+def _factory_state(value: Any) -> dict[str, Any]:
+    state = dict(getattr(value, "__dict__", {}))
+    for owner in type(value).__mro__:
+        slots = owner.__dict__.get("__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for name in slots:
+            if name in {"__dict__", "__weakref__"} or name in state:
+                continue
+            try:
+                state[name] = getattr(value, name)
+            except AttributeError:
+                continue
+    return {str(name): item for name, item in state.items()}
+
+
+def _explicit_contract_descriptor(value: Any) -> Optional[Any]:
+    provider = getattr(value, "training_contract_descriptor", None)
+    if provider is None:
+        return None
+    if not callable(provider):
+        raise TrainingContractError(
+            "training_contract_descriptor must be callable"
+        )
     try:
-        source = inspect.getsource(target)
-    except (OSError, TypeError):
-        source = _qualified_name(target)
-    return hashlib.sha256(source.encode("utf-8")).hexdigest()
-
-
-def _callable_contract(value: Any) -> dict[str, Any]:
-    if isinstance(value, functools.partial):
-        return {
-            "kind": "partial",
-            "callable": _callable_contract(value.func),
-            "args": _contract_value(tuple(value.args)),
-            "keywords": _contract_value(value.keywords or {}),
-        }
-    descriptor = {
-        "kind": "class" if inspect.isclass(value) else "callable",
-        "identity": _qualified_name(value),
-        "implementation_hash": _implementation_hash(value),
-    }
-    defaults = getattr(value, "__defaults__", None)
-    keyword_defaults = getattr(value, "__kwdefaults__", None)
-    if defaults:
-        descriptor["defaults"] = _contract_value(tuple(defaults))
-    if keyword_defaults:
-        descriptor["keyword_defaults"] = _contract_value(keyword_defaults)
-    closure = getattr(value, "__closure__", None)
-    if closure:
-        descriptor["closure"] = [
-            _contract_value(cell.cell_contents) for cell in closure
-        ]
-    if value is default_estimator:
-        descriptor["declared_parameters"] = dict(
-            _DEFAULT_ESTIMATOR_PARAMETERS
+        descriptor = provider()
+    except Exception as exc:
+        raise TrainingContractError(
+            "explicit training contract could not be read"
+        ) from exc
+    if descriptor is None:
+        raise TrainingContractError(
+            "explicit training contract cannot be None"
         )
     return descriptor
+
+
+def _contract_value(
+    value: Any,
+    *,
+    _depth: int = 0,
+    _context: Optional[_FactoryContractContext] = None,
+) -> Any:
+    if _depth > _MAX_CONTRACT_DEPTH:
+        raise TrainingContractError("training contract exceeds recursion limit")
+    _context = _context or _FactoryContractContext()
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if np.isfinite(value) else {"float": str(value)}
+    if isinstance(value, str):
+        if len(value) <= 1024:
+            return value
+        return {
+            "type": "str",
+            "length": len(value),
+            "content_hash": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+        }
+    if isinstance(value, bytes):
+        return {
+            "kind": "bytes",
+            "length": len(value),
+            "content_hash": hashlib.sha256(value).hexdigest(),
+        }
+    if isinstance(value, np.generic):
+        return _contract_value(
+            value.item(), _depth=_depth + 1, _context=_context
+        )
+    if isinstance(value, (np.ndarray, pd.DataFrame, pd.Series, Path)):
+        raise TrainingContractError(
+            "complex factory configuration requires an explicit descriptor"
+        )
+    if isinstance(value, types.ModuleType):
+        return _module_contract(value)
+    if isinstance(value, types.CodeType):
+        return {"kind": "code", "value": _code_contract(value, _context)}
+    if callable(value):
+        return {"kind": "callable", "value": _callable_contract(value, _context)}
+
+    identity = id(value)
+    if identity in _context.active:
+        raise TrainingContractError("cyclic factory configuration is unsupported")
+    _context.active.add(identity)
+    try:
+        if isinstance(value, (list, tuple, frozenset)):
+            items = [
+                _contract_value(item, _depth=_depth + 1, _context=_context)
+                for item in _bounded_contract_items(
+                    value, label=type(value).__name__
+                )
+            ]
+            if isinstance(value, frozenset):
+                items.sort(key=_canonical_json)
+            return {"kind": type(value).__name__, "items": items}
+        if isinstance(value, Mapping):
+            entries = [
+                {"key": _contract_value(key, _depth=_depth + 1, _context=_context),
+                 "value": _contract_value(item, _depth=_depth + 1, _context=_context)}
+                for key, item in _bounded_contract_items(
+                    value.items(), label="mapping"
+                )
+            ]
+            entries.sort(key=lambda item: _canonical_json(item["key"]))
+            return {
+                "kind": "mapping",
+                "type": _qualified_name(type(value)),
+                "entries": entries,
+            }
+        state = _factory_state(value)
+        if not state:
+            raise TrainingContractError(
+                "opaque factory configuration requires an explicit descriptor"
+            )
+        items = _bounded_contract_items(
+            sorted(state.items()), label="object configuration"
+        )
+        return {
+            "kind": "object",
+            "type": _qualified_name(type(value)),
+            "state": {
+                name: _contract_value(item, _depth=_depth + 1, _context=_context)
+                for name, item in items
+            },
+        }
+    finally:
+        _context.active.remove(identity)
+
+
+def _code_contract(
+    code: types.CodeType,
+    context: _FactoryContractContext,
+) -> dict[str, Any]:
+    return {
+        "bytecode_hash": hashlib.sha256(code.co_code).hexdigest(),
+        "exception_table_hash": hashlib.sha256(code.co_exceptiontable).hexdigest(),
+        "constants": _contract_value(tuple(code.co_consts), _context=context),
+    }
+
+
+def _referenced_global_names(code: types.CodeType) -> tuple[str, ...]:
+    names = {
+        str(instruction.argval)
+        for instruction in dis.get_instructions(code)
+        if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"}
+    }
+    for constant in code.co_consts:
+        if isinstance(constant, types.CodeType):
+            names.update(_referenced_global_names(constant))
+    return tuple(sorted(names))
+
+
+def _module_contract(value: types.ModuleType) -> dict[str, Any]:
+    descriptor = {
+        "kind": "module",
+        "identity": str(getattr(value, "__name__", "")),
+    }
+    version = getattr(value, "__version__", None)
+    if isinstance(version, str):
+        descriptor["version"] = (
+            version
+            if len(version) <= 128
+            else hashlib.sha256(version.encode("utf-8")).hexdigest()
+        )
+    return descriptor
+
+
+def _function_core_contract(
+    value: Any,
+    context: _FactoryContractContext,
+) -> tuple[Any, types.CodeType, dict[str, Any]]:
+    target = getattr(value, "__func__", value)
+    code = getattr(target, "__code__", None)
+    if not isinstance(code, types.CodeType):
+        raise TrainingContractError("factory function has no inspectable bytecode")
+    return target, code, {
+        "module": str(getattr(target, "__module__", "")),
+        "qualname": str(getattr(target, "__qualname__", "")),
+        "implementation": _code_contract(code, context),
+        "defaults": _contract_value(
+            tuple(getattr(target, "__defaults__", ()) or ()), _context=context
+        ),
+        "keyword_defaults": _contract_value(
+            getattr(target, "__kwdefaults__", None) or {}, _context=context
+        ),
+    }
+
+
+def _global_contract_value(
+    value: Any,
+    *,
+    _context: _FactoryContractContext,
+) -> Any:
+    if isinstance(value, types.ModuleType):
+        return _module_contract(value)
+    if inspect.isclass(value):
+        return {"kind": "class_reference", "identity": _qualified_name(value)}
+    if inspect.isbuiltin(value) or inspect.ismethoddescriptor(value):
+        return {"kind": "builtin_callable", "identity": _qualified_name(value)}
+    if inspect.isfunction(value) or inspect.ismethod(value):
+        _, _, descriptor = _function_core_contract(value, _context)
+        return {
+            "kind": "function_reference",
+            **descriptor,
+        }
+    if callable(value):
+        explicit = _explicit_contract_descriptor(value)
+        if explicit is None:
+            raise TrainingContractError(
+                "global callable instance requires an explicit descriptor"
+            )
+        return {
+            "kind": "callable_reference",
+            "identity": _qualified_name(type(value)),
+            "declared_configuration": _contract_value(
+                explicit, _context=_context
+            ),
+        }
+    return _contract_value(value, _context=_context)
+
+
+def _function_contract(
+    value: Any,
+    *,
+    _context: _FactoryContractContext,
+) -> dict[str, Any]:
+    target, code, descriptor = _function_core_contract(value, _context)
+    explicit = _explicit_contract_descriptor(value)
+    if explicit is not None:
+        descriptor["declared_configuration"] = _contract_value(
+            explicit, _context=_context
+        )
+    closure = None if explicit is not None else getattr(target, "__closure__", None)
+    if closure:
+        closure_values = []
+        for name, cell in zip(code.co_freevars, closure):
+            try:
+                cell_value = cell.cell_contents
+            except ValueError as exc:
+                raise TrainingContractError("callable has an empty closure cell") from exc
+            if name == "__class__" and inspect.isclass(cell_value):
+                closure_values.append(
+                    {"name": name, "class": _qualified_name(cell_value)}
+                )
+                continue
+            closure_values.append(
+                {
+                    "name": name,
+                    "value": _contract_value(
+                        cell_value,
+                        _context=_context,
+                    ),
+                }
+            )
+        descriptor["closure"] = closure_values
+    global_values = getattr(target, "__globals__", {})
+    builtin_values = getattr(target, "__builtins__", {})
+    if not isinstance(builtin_values, Mapping):
+        builtin_values = vars(builtin_values)
+    references = {}
+    for name in _referenced_global_names(code):
+        if name in global_values:
+            scope, global_value = "global", global_values[name]
+        elif name in builtin_values:
+            if name in _DYNAMIC_GLOBAL_ACCESS_NAMES:
+                raise TrainingContractError(
+                    f"dynamic global access through {name} is unsupported"
+                )
+            scope, global_value = "builtin", builtin_values[name]
+        else:
+            references[name] = {"scope": "unbound"}
+            continue
+        references[name] = {
+            "scope": scope,
+            "value": _global_contract_value(global_value, _context=_context),
+        }
+    if references:
+        descriptor["globals"] = references
+    return descriptor
+
+
+def _class_contract(
+    value: type,
+    *,
+    _context: _FactoryContractContext,
+) -> dict[str, Any]:
+    explicit = _explicit_contract_descriptor(value)
+    if explicit is not None:
+        return {
+            "kind": "class",
+            "identity": _qualified_name(value),
+            "declared_configuration": _contract_value(
+                explicit, _context=_context
+            ),
+        }
+
+    members = {}
+    method_count = 0
+    owners = [owner for owner in reversed(value.__mro__) if owner is not object]
+    for owner in owners:
+        for name, item in sorted(vars(owner).items()):
+            if name in {
+                "__classcell__",
+                "__dict__",
+                "__doc__",
+                "__module__",
+                "__weakref__",
+            }:
+                continue
+            if name.startswith("__") and name not in {"__call__", "__init__"}:
+                continue
+            if isinstance(item, (staticmethod, classmethod)):
+                item = item.__func__
+            if inspect.isfunction(item):
+                _, _, contract = _function_core_contract(item, _context)
+                members[name] = {"kind": "method", **contract}
+                method_count += 1
+            elif not name.startswith("_") and not inspect.isdatadescriptor(item):
+                members[name] = {
+                    "kind": "configuration",
+                    "value": _contract_value(item, _context=_context),
+                }
+    if not method_count:
+        raise TrainingContractError(
+            f"class factory {_qualified_name(value)} has no inspectable methods"
+        )
+    return {
+        "kind": "class",
+        "identity": _qualified_name(value),
+        "mro": [_qualified_name(owner) for owner in reversed(owners)],
+        "members": members,
+    }
+
+
+def _callable_contract(
+    value: Any,
+    _context: Optional[_FactoryContractContext] = None,
+) -> dict[str, Any]:
+    if value is default_estimator:
+        return {
+            "kind": "default_estimator",
+            "symbol": "xgboost.XGBRegressor",
+            "declared_parameters": dict(_DEFAULT_ESTIMATOR_PARAMETERS),
+        }
+    _context = _context or _FactoryContractContext()
+    identity = id(value)
+    if identity in _context.active:
+        raise TrainingContractError("cyclic callable factory is unsupported")
+    _context.active.add(identity)
+    try:
+        if isinstance(value, functools.partial):
+            return {
+                "kind": "partial",
+                "callable": _callable_contract(value.func, _context),
+                "args": _contract_value(tuple(value.args), _context=_context),
+                "keywords": _contract_value(
+                    value.keywords or {}, _context=_context
+                ),
+            }
+        if (
+            inspect.isbuiltin(value)
+            or inspect.ismethoddescriptor(value)
+            or (inspect.isclass(value) and value.__module__ == "builtins")
+        ):
+            return {"kind": "builtin_callable", "identity": _qualified_name(value)}
+        if inspect.isclass(value):
+            return _class_contract(value, _context=_context)
+        if inspect.isfunction(value) or inspect.ismethod(value):
+            descriptor = {
+                "kind": "function",
+                **_function_contract(value, _context=_context),
+            }
+            if inspect.ismethod(value) and not inspect.isclass(value.__self__):
+                descriptor["bound_state"] = _contract_value(
+                    value.__self__, _context=_context
+                )
+            return descriptor
+        if not callable(value):
+            raise TrainingContractError("estimator factory must be callable")
+        explicit = _explicit_contract_descriptor(value)
+        descriptor = {
+            "kind": "callable_instance",
+            "identity": _qualified_name(type(value)),
+        }
+        if explicit is not None:
+            descriptor["declared_configuration"] = _contract_value(
+                explicit, _context=_context
+            )
+        else:
+            descriptor["class"] = _callable_contract(type(value), _context)
+            descriptor["configuration"] = _contract_value(
+                _factory_state(value), _context=_context
+            )
+        return descriptor
+    finally:
+        _context.active.remove(identity)
+
+
+def _trainer_runtime_descriptor(trainer: Any) -> dict[str, Any]:
+    explicit = _explicit_contract_descriptor(trainer)
+    if explicit is None:
+        raise TrainingContractError(
+            "trainer must implement training_contract_descriptor()"
+        )
+    return {
+        "trainer_type": _qualified_name(type(trainer)),
+        "configuration": _contract_value(explicit),
+    }
 
 
 def training_runtime_contract_hash(
@@ -337,17 +794,10 @@ def training_runtime_contract_hash(
 ) -> str:
     if not isinstance(preparation, TrainingPreparation):
         raise TypeError("preparation must be a TrainingPreparation")
-    trainer_type = type(trainer)
-    methods = {}
-    for name in ("prepare_target", "train_prepared", "train_target"):
-        method = getattr(trainer_type, name, None)
-        if method is not None:
-            methods[name] = _callable_contract(method)
     return _stable_json_hash(
         {
             "preparation_contract_hash": preparation.training_contract_hash,
-            "trainer_type": _qualified_name(trainer_type),
-            "methods": methods,
+            "trainer": _trainer_runtime_descriptor(trainer),
         }
     )
 
@@ -382,21 +832,262 @@ def bind_training_result_contract(
     )
 
 
-def _json_safe_training_value(value):
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float):
-        return value if np.isfinite(value) else str(value)
-    if isinstance(value, np.generic):
-        return _json_safe_training_value(value.item())
-    if isinstance(value, dict):
-        return {
-            str(key): _json_safe_training_value(item)
-            for key, item in value.items()
+def _safe_training_type(value: Any) -> str:
+    return _qualified_name(type(value))
+
+
+def _training_digest(value: Any) -> str:
+    if isinstance(value, bytes):
+        payload = value
+    elif isinstance(value, (str, Path)):
+        payload = str(value).encode("utf-8")
+    elif isinstance(value, int) and not isinstance(value, bool):
+        magnitude = abs(value)
+        byte_count = max(1, (magnitude.bit_length() + 7) // 8)
+        payload = (b"-" if value < 0 else b"+") + magnitude.to_bytes(
+            byte_count, "big"
+        )
+    elif value is None or isinstance(value, (bool, float)):
+        scalar = value if not isinstance(value, float) or np.isfinite(value) else str(value)
+        payload = _canonical_json(
+            {"type": _safe_training_type(value), "value": scalar}
+        ).encode()
+    else:
+        payload = _safe_training_type(value).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _pandas_training_summary(
+    value: pd.DataFrame | pd.Series,
+) -> dict[str, Any]:
+    shape = [int(item) for item in value.shape]
+    if isinstance(value, pd.DataFrame):
+        column_count = int(value.shape[1])
+        visible = min(column_count, _MAX_TRAINING_METADATA_ITEMS)
+        schema = {
+            "shape": shape,
+            "column_count": column_count,
+            "column_hashes": [
+                _training_digest(str(column)) for column in value.columns[:visible]
+            ],
+            "dtype_hashes": [
+                _training_digest(str(dtype)) for dtype in value.dtypes.iloc[:visible]
+            ],
         }
-    if isinstance(value, (list, tuple)):
-        return [_json_safe_training_value(item) for item in value]
-    return repr(value)
+        if column_count > visible:
+            schema["truncated"] = "max_columns"
+    else:
+        schema = {
+            "shape": shape,
+            "dtype": str(value.dtype),
+            "name_hash": _training_digest(str(value.name)),
+        }
+    return {
+        "type": _safe_training_type(value),
+        **schema,
+        "content_hash": _training_digest(_canonical_json(schema)),
+    }
+
+
+def _ndarray_training_summary(value: np.ndarray) -> dict[str, Any]:
+    array = np.asarray(value)
+    schema = {
+        "shape": [int(item) for item in array.shape],
+        "dtype": str(array.dtype),
+    }
+    digest = hashlib.sha256(_canonical_json(schema).encode())
+    if not array.dtype.hasobject:
+        digest.update(np.ascontiguousarray(array).tobytes())
+    return {
+        "type": _safe_training_type(value),
+        **schema,
+        "content_hash": digest.hexdigest(),
+    }
+
+
+def _is_sensitive_parameter_name(name: str) -> bool:
+    normalized = "".join(
+        character for character in name.lower() if character.isalnum()
+    )
+    return any(marker in normalized for marker in _SENSITIVE_PARAMETER_MARKERS)
+
+
+def _safe_mapping_key(value: Any) -> str:
+    if isinstance(value, str) and len(value) <= 128:
+        return value
+    if isinstance(value, str):
+        return f"str_sha256:{_training_digest(value)}"
+    return f"{_safe_training_type(value)}_sha256:{_training_digest(value)}"
+
+
+def _sensitive_training_summary(value: Any) -> dict[str, Any]:
+    if isinstance(value, (pd.DataFrame, pd.Series)):
+        return _pandas_training_summary(value)
+    if isinstance(value, np.ndarray):
+        return _ndarray_training_summary(value)
+    summary = {"type": _safe_training_type(value)}
+    try:
+        summary["length"] = len(value)
+    except (TypeError, OverflowError):
+        pass
+    summary["content_hash"] = _training_digest(value)
+    return summary
+
+
+def _json_safe_training_value(
+    value: Any,
+    *,
+    _depth: int = 0,
+    _active: Optional[set[int]] = None,
+    _budget: Optional[list[int]] = None,
+):
+    if _active is None:
+        _active = set()
+    if _budget is None:
+        _budget = [_MAX_TRAINING_METADATA_NODES]
+    if _budget[0] <= 0:
+        return {"type": _safe_training_type(value), "truncated": "max_nodes"}
+    _budget[0] -= 1
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if abs(value).bit_length() <= _MAX_TRAINING_METADATA_INTEGER_BITS:
+            return value
+        return {
+            "type": _safe_training_type(value),
+            "bit_length": abs(value).bit_length(),
+            "content_hash": _training_digest(value),
+        }
+    if isinstance(value, str):
+        if len(value) <= _MAX_TRAINING_METADATA_STRING:
+            return value
+        return {
+            "type": _safe_training_type(value),
+            "length": len(value),
+            "content_hash": _training_digest(value),
+        }
+    if isinstance(value, bytes):
+        return {
+            "type": _safe_training_type(value),
+            "length": len(value),
+            "content_hash": _training_digest(value),
+        }
+    if isinstance(value, float):
+        if np.isfinite(value):
+            return value
+        return {"type": _safe_training_type(value), "value": str(value)}
+    if isinstance(value, np.generic):
+        return _json_safe_training_value(
+            value.item(),
+            _depth=_depth,
+            _active=_active,
+            _budget=_budget,
+        )
+    if isinstance(value, (pd.DataFrame, pd.Series)):
+        return _pandas_training_summary(value)
+    if isinstance(value, np.ndarray):
+        return _ndarray_training_summary(value)
+    if isinstance(value, Path):
+        return {
+            "type": _safe_training_type(value),
+            "content_hash": _training_digest(value),
+        }
+    dataclass_value = is_dataclass(value) and not inspect.isclass(value)
+    container = isinstance(value, (Mapping, list, tuple, set, frozenset))
+    if not dataclass_value and not container:
+        return {"type": _safe_training_type(value)}
+
+    identity = id(value)
+    if identity in _active:
+        return {"type": _safe_training_type(value), "cycle": True}
+    try:
+        size = len(value)
+    except (TypeError, OverflowError):
+        size = None
+    if _depth >= _MAX_TRAINING_METADATA_DEPTH:
+        return {
+            "type": _safe_training_type(value),
+            "length": size,
+            "truncated": "max_depth",
+        }
+    if (
+        type(value) in {dict, list, tuple, set, frozenset}
+        and size is not None
+        and size > _MAX_TRAINING_METADATA_ITEMS
+    ):
+        return {
+            "type": _safe_training_type(value),
+            "length": size,
+            "truncated": "max_items",
+        }
+
+    def sanitize(item):
+        return _json_safe_training_value(
+            item,
+            _depth=_depth + 1,
+            _active=_active,
+            _budget=_budget,
+        )
+
+    _active.add(identity)
+    try:
+        mapping_value = isinstance(value, Mapping)
+        if dataclass_value:
+            source = (
+                (field.name, getattr(value, field.name)) for field in fields(value)
+            )
+        elif mapping_value:
+            source = value.items()
+        else:
+            source = ((None, item) for item in value)
+        result = {} if dataclass_value or mapping_value else []
+        truncated = None
+        try:
+            for index, (key, item) in enumerate(source):
+                if index >= _MAX_TRAINING_METADATA_ITEMS or _budget[0] <= 0:
+                    truncated = (
+                        "max_items"
+                        if index >= _MAX_TRAINING_METADATA_ITEMS
+                        else "max_nodes"
+                    )
+                    break
+                sanitized = (
+                    _sensitive_training_summary(item)
+                    if mapping_value
+                    and isinstance(key, str)
+                    and _is_sensitive_parameter_name(key)
+                    else sanitize(item)
+                )
+                if isinstance(result, dict):
+                    result[
+                        key if dataclass_value else _safe_mapping_key(key)
+                    ] = sanitized
+                else:
+                    result.append(sanitized)
+        except Exception as exc:
+            truncated = f"unreadable_{type(exc).__name__}"
+        if dataclass_value:
+            summary = {
+                "type": _safe_training_type(value),
+                "field_names": list(result),
+                "content_hash": _training_digest(_canonical_json(result)),
+            }
+            if truncated:
+                summary["truncated"] = truncated
+            return summary
+        if mapping_value:
+            if truncated:
+                result["__training_metadata_truncated__"] = truncated
+            return result
+        if truncated:
+            result.append(
+                {"type": _safe_training_type(value), "truncated": truncated}
+            )
+        if isinstance(value, (set, frozenset)):
+            result.sort(key=_canonical_json)
+        return result
+    finally:
+        _active.remove(identity)
 
 
 def _estimator_training_params(estimator: object) -> dict:
@@ -441,22 +1132,52 @@ class ResidualTrainer:
     ):
         self.estimator_factory = estimator_factory or default_estimator
         self.feature_builder = feature_builder or FeatureBuilder()
+        self._factory_contract = FrozenCallableContract.capture(
+            self.estimator_factory
+        )
         dependencies = _dependency_versions()
         trainer_type = type(self)
+        contract_context = _FactoryContractContext()
         trainer_descriptor = {
             "type": _qualified_name(trainer_type),
-            "prepare_target": _callable_contract(trainer_type.prepare_target),
-            "train_prepared": _callable_contract(trainer_type.train_prepared),
+            "prepare_target": _code_contract(
+                trainer_type.prepare_target.__code__, contract_context
+            ),
+            "train_prepared": _code_contract(
+                trainer_type.train_prepared.__code__, contract_context
+            ),
         }
         self.training_contract = TrainingContract(
             version=_TRAINING_CONTRACT_VERSION,
             trainer_descriptor_json=_canonical_json(trainer_descriptor),
-            estimator_descriptor_json=_canonical_json(
-                _callable_contract(self.estimator_factory)
-            ),
+            estimator_descriptor_json=self._factory_contract.descriptor_json,
             dependency_versions=tuple(sorted(dependencies.items())),
             random_seed=42,
         )
+
+    def _assert_factory_contract(self) -> None:
+        self._factory_contract.verify(self.estimator_factory)
+
+    def training_contract_descriptor(self) -> dict[str, Any]:
+        self._assert_factory_contract()
+        return {
+            "version": _TRAINING_CONTRACT_VERSION,
+            "trainer_descriptor_hash": hashlib.sha256(
+                self.training_contract.trainer_descriptor_json.encode("utf-8")
+            ).hexdigest(),
+            "estimator_descriptor_hash": hashlib.sha256(
+                self.training_contract.estimator_descriptor_json.encode("utf-8")
+            ).hexdigest(),
+            "dependencies": dict(self.training_contract.dependency_versions),
+            "random_seed": self.training_contract.random_seed,
+            "feature_builder": {
+                "type": _qualified_name(type(self.feature_builder)),
+                "cadence_minutes": float(self.feature_builder.cadence_minutes),
+                "derived_features": list(
+                    self.feature_builder._DERIVED_FEATURE_COLUMNS
+                ),
+            },
+        }
 
     @staticmethod
     def _target_columns(
@@ -726,6 +1447,7 @@ class ResidualTrainer:
         physical_col: Optional[str] = None,
         truth_col: Optional[str] = None,
     ) -> TrainingPreparation:
+        self._assert_factory_contract()
         working, line_id, tower_id = self._validated_scope(frame)
         physical_col, truth_col = self._target_columns(
             working, target, physical_col, truth_col
@@ -827,48 +1549,20 @@ class ResidualTrainer:
         normalized = []
         for name, positions in zip(("train", "holdout"), split):
             values = np.asarray(positions)
-            if values.ndim != 1 or values.dtype.kind not in "iu":
-                raise ValueError(f"preparation {name} split indices must be integers")
-            if values.size == 0:
-                raise ValueError(f"preparation {name} split cannot be empty")
-            if (values < 0).any() or (values >= row_count).any():
-                raise ValueError(f"preparation {name} split indices are out of bounds")
-            if np.unique(values).size != values.size:
-                raise ValueError(f"preparation {name} split indices must be unique")
+            invalid = (
+                values.ndim != 1
+                or values.dtype.kind not in "iu"
+                or values.size == 0
+                or (values < 0).any()
+                or (values >= row_count).any()
+                or np.unique(values).size != values.size
+            )
+            if invalid:
+                raise ValueError(f"preparation {name} split indices are invalid")
             normalized.append(values.astype(np.int64, copy=False))
         train_positions, holdout_positions = normalized
         if np.intersect1d(train_positions, holdout_positions).size:
             raise ValueError("preparation split indices must be mutually exclusive")
-
-    @staticmethod
-    def _assert_preparation_frame(
-        actual: pd.DataFrame,
-        expected: pd.DataFrame,
-        name: str,
-    ) -> None:
-        if not isinstance(actual, pd.DataFrame):
-            raise ValueError(f"preparation {name} must be a DataFrame")
-        try:
-            pd.testing.assert_frame_equal(
-                actual,
-                expected,
-                check_dtype=True,
-                check_exact=True,
-                check_like=False,
-            )
-        except AssertionError as exc:
-            raise ValueError(f"preparation {name} failed integrity validation") from exc
-
-    @staticmethod
-    def _assert_preparation_array(
-        actual: np.ndarray,
-        expected: np.ndarray,
-        name: str,
-    ) -> None:
-        if not isinstance(actual, np.ndarray):
-            raise ValueError(f"preparation {name} must be an ndarray")
-        if actual.dtype != expected.dtype or not np.array_equal(actual, expected):
-            raise ValueError(f"preparation {name} failed integrity validation")
 
     def _validated_preparation(
         self,
@@ -909,27 +1603,24 @@ class ResidualTrainer:
             if getattr(preparation, field) != getattr(trusted, field):
                 raise ValueError(f"preparation {field} failed integrity validation")
 
-        self._assert_preparation_frame(
-            preparation.working,
-            trusted.working,
-            "working",
-        )
-        self._assert_preparation_frame(
-            preparation.feature_frame,
-            trusted.feature_frame,
-            "feature_frame",
-        )
-        self._assert_preparation_frame(
-            preparation.model_features,
-            trusted.model_features,
-            "model_features",
-        )
+        for field in ("working", "feature_frame", "model_features"):
+            actual, expected = getattr(preparation, field), getattr(trusted, field)
+            if not isinstance(actual, pd.DataFrame):
+                raise ValueError(f"preparation {field} must be a DataFrame")
+            try:
+                pd.testing.assert_frame_equal(actual, expected, check_exact=True)
+            except AssertionError as exc:
+                raise ValueError(
+                    f"preparation {field} failed integrity validation"
+                ) from exc
         for field in ("physical", "truth", "residual"):
-            self._assert_preparation_array(
-                getattr(preparation, field),
-                getattr(trusted, field),
-                field,
-            )
+            actual, expected = getattr(preparation, field), getattr(trusted, field)
+            if (
+                not isinstance(actual, np.ndarray)
+                or actual.dtype != expected.dtype
+                or not np.array_equal(actual, expected)
+            ):
+                raise ValueError(f"preparation {field} failed integrity validation")
 
         if (preparation.split is None) != (trusted.split is None):
             raise ValueError("preparation split failed integrity validation")
@@ -943,6 +1634,7 @@ class ResidualTrainer:
         self,
         preparation: TrainingPreparation,
     ) -> TrainingResult:
+        self._assert_factory_contract()
         preparation = self._validated_preparation(preparation)
 
         target = preparation.target
@@ -1011,7 +1703,10 @@ class ResidualTrainer:
             final_bounds = _robust_residual_bounds(residual)
             full_fit_metrics = None
 
+        self._assert_factory_contract()
+
         timestamp_values = feature_frame["timestamp"]
+        training_outcome = _training_outcome(final_reason, evaluation_reason)
         metadata = {
             "line_id": line_id,
             "tower_id": tower_id,
@@ -1038,6 +1733,7 @@ class ResidualTrainer:
             ),
             "fallback_reason": final_reason,
             "evaluation_fallback_reason": evaluation_reason,
+            "training_outcome": training_outcome,
             "residual_bounds": final_bounds,
         }
         if full_fit_metrics is not None:
@@ -1061,6 +1757,7 @@ class ResidualTrainer:
             metrics=metrics,
             metadata=metadata,
             training_contract_hash=preparation.training_contract_hash,
+            training_outcome=training_outcome,
         )
 
     def train_target(

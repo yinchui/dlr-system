@@ -624,6 +624,16 @@ def test_legacy_metadata_without_training_contract_hash_remains_loadable():
     assert restored.training_contract_hash == "legacy-training-contract-v0"
 
 
+def test_new_metadata_cannot_claim_the_legacy_training_contract():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    with pytest.raises(ValueError, match="legacy.*training contract"):
+        model_metadata(
+            key,
+            training_contract_hash="legacy-training-contract-v0",
+        )
+
+
 @pytest.mark.parametrize(
     "field",
     [
@@ -1455,6 +1465,59 @@ def test_attempt_contract_must_match_candidate_and_bundle(tmp_path):
     assert not registry.attempt_path_for(key).exists()
 
 
+def test_promote_revalidates_bundle_metadata_after_candidate_construction(
+    tmp_path,
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    candidate = model_candidate(
+        key,
+        corrected_mae=WEATHER_METRICS["baseline_mae"],
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+    )
+    attempt = model_attempt(
+        registry,
+        key,
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+    )
+    candidate.bundle.metadata = dict(candidate.bundle.metadata)
+    candidate.bundle.metadata["training_contract_hash"] = "tampered"
+
+    with pytest.raises(ValueError, match="bundle.*contract|candidate.*integrity"):
+        registry.promote(candidate, attempt=attempt)
+
+    assert not registry.path_for(key).exists()
+    assert not registry.attempt_path_for(key).exists()
+
+
+def test_candidate_defensively_copies_and_freezes_bundle_metadata():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    source_metadata = {
+        "training_contract": "task-9",
+        "training_contract_hash": "c" * 64,
+    }
+    metadata = model_metadata(key)
+    bundle = ModelBundle(
+        target_name=key.target,
+        feature_columns=list(metadata.feature_columns),
+        model=ConstantResidualModel(),
+        cadence_minutes=metadata.cadence_minutes,
+        residual_bounds=metadata.residual_bounds,
+        line_id=key.line_id,
+        tower_id=key.tower_id,
+        metadata=source_metadata,
+    )
+    candidate = ModelCandidate(key=key, bundle=bundle, metadata=metadata)
+
+    source_metadata["training_contract_hash"] = "external-tamper"
+
+    assert candidate.bundle.metadata["training_contract_hash"] == "c" * 64
+    with pytest.raises(TypeError):
+        candidate.bundle.metadata["training_contract_hash"] = "direct-tamper"
+
+
 def test_post_replace_permission_probe_cannot_report_unpersisted_attempt(
     tmp_path,
     monkeypatch,
@@ -1496,6 +1559,42 @@ def test_post_replace_permission_probe_cannot_report_unpersisted_attempt(
         real_enforce,
     )
     assert registry.was_rejected(attempt) is True
+
+
+@POSIX_ONLY
+def test_attempt_sidecar_verifies_final_inode_permissions_after_replace(
+    tmp_path,
+    monkeypatch,
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    candidate = model_candidate(
+        key,
+        corrected_mae=WEATHER_METRICS["baseline_mae"],
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+    )
+    attempt = model_attempt(
+        registry,
+        key,
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+    )
+    attempt_path = registry.attempt_path_for(key)
+    real_replace = model_registry.os.replace
+
+    def expose_final_inode(source, destination):
+        result = real_replace(source, destination)
+        if Path(destination) == attempt_path:
+            Path(destination).chmod(0o644)
+        return result
+
+    monkeypatch.setattr(model_registry.os, "replace", expose_final_inode)
+
+    decision = registry.promote(candidate, attempt=attempt)
+
+    assert decision.reason == "candidate_not_better_than_physical"
+    assert private_mode(attempt_path) == 0o600
 
 
 @pytest.mark.parametrize(

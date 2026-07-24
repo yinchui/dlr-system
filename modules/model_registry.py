@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -7,7 +8,7 @@ import os
 import shutil
 import stat
 import uuid
-from dataclasses import asdict, dataclass, replace
+from dataclasses import InitVar, asdict, dataclass, field, replace
 from pathlib import Path, PureWindowsPath
 from typing import Any, Mapping, Optional
 
@@ -31,6 +32,9 @@ _EVALUATION_MODES = frozenset(
 )
 _MODEL_STATUSES = frozenset(
     {"candidate", "active_provisional", "active"}
+)
+_TRAINING_OUTCOMES = frozenset(
+    {"trained", "data_fallback", "operational_fallback", "legacy"}
 )
 _KEY_FIELDS = ("project_id", "line_id", "tower_id", "target")
 _COMPATIBILITY_FIELDS = (
@@ -85,6 +89,51 @@ _DETERMINISTIC_REJECTION_REASONS = frozenset(
     }
 )
 _MAX_ATTEMPT_RECORD_LIMIT = 256
+
+
+class FrozenMetadata(dict):
+    """Pickle-safe immutable mapping used inside persisted model bundles."""
+
+    def __init__(self, source=()):
+        normalized = {
+            copy.deepcopy(key): _freeze_metadata_value(value)
+            for key, value in dict(source).items()
+        }
+        dict.__init__(self, normalized)
+
+    @staticmethod
+    def _immutable(*args, **kwargs):
+        raise TypeError("model metadata is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+    __ior__ = _immutable
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __reduce__(self):
+        return type(self), (dict(self),)
+
+
+def _freeze_metadata_value(value: Any) -> Any:
+    if isinstance(value, FrozenMetadata):
+        return value
+    if isinstance(value, Mapping):
+        return FrozenMetadata(value)
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_metadata_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_metadata_value(item) for item in value)
+    return copy.deepcopy(value)
 
 
 def _validate_identifier(value: str, name: str) -> None:
@@ -185,13 +234,15 @@ class ModelMetadata:
     compatibility: ModelCompatibility
     dependency_versions: Mapping[str, str]
     cadence_minutes: float
+    training_contract_hash: str
+    _allow_legacy_training_contract: InitVar[bool] = False
+    training_outcome: str = "trained"
     checksum: str = ""
     status: str = "candidate"
     metric_domain: str = "weather_vs_truth"
     last_attempted_input_data_hash: Optional[str] = None
-    training_contract_hash: str = _LEGACY_TRAINING_CONTRACT_HASH
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _allow_legacy_training_contract: bool) -> None:
         if not isinstance(self.key, ModelKey):
             raise TypeError("key must be a ModelKey")
         _validate_identifier(self.model_version, "model_version")
@@ -213,7 +264,9 @@ class ModelMetadata:
             json.dumps(training_params, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError("training_params must be JSON serializable") from exc
-        object.__setattr__(self, "training_params", training_params)
+        object.__setattr__(
+            self, "training_params", FrozenMetadata(training_params)
+        )
 
         if self.random_seed is not None and (
             isinstance(self.random_seed, bool)
@@ -244,8 +297,14 @@ class ModelMetadata:
                 raise ValueError("full_fit cannot have evaluation_set_hash")
         elif not metrics:
             raise ValueError("independent evaluation requires weather metrics")
-        object.__setattr__(self, "metrics", metrics or {})
-        object.__setattr__(self, "full_fit_metrics", full_fit_metrics)
+        object.__setattr__(self, "metrics", FrozenMetadata(metrics or {}))
+        object.__setattr__(
+            self,
+            "full_fit_metrics",
+            None
+            if full_fit_metrics is None
+            else FrozenMetadata(full_fit_metrics),
+        )
 
         if len(self.residual_bounds) != 2:
             raise ValueError("residual_bounds must contain lower and upper")
@@ -267,6 +326,13 @@ class ModelMetadata:
             self.training_contract_hash,
             "training_contract_hash",
         )
+        if (
+            self.training_contract_hash == _LEGACY_TRAINING_CONTRACT_HASH
+            and not _allow_legacy_training_contract
+        ):
+            raise ValueError(
+                "legacy training contract is reserved for metadata migration"
+            )
         if self.last_attempted_input_data_hash is not None:
             _require_nonempty_string(
                 self.last_attempted_input_data_hash,
@@ -286,7 +352,9 @@ class ModelMetadata:
         for package, version in dependencies.items():
             _require_nonempty_string(package, "dependency package")
             _require_nonempty_string(version, f"dependency_versions.{package}")
-        object.__setattr__(self, "dependency_versions", dependencies)
+        object.__setattr__(
+            self, "dependency_versions", FrozenMetadata(dependencies)
+        )
         if (
             isinstance(self.cadence_minutes, bool)
             or not isinstance(self.cadence_minutes, (int, float))
@@ -295,6 +363,8 @@ class ModelMetadata:
         ):
             raise ValueError("cadence_minutes must be positive and finite")
         object.__setattr__(self, "cadence_minutes", float(self.cadence_minutes))
+        if self.training_outcome not in _TRAINING_OUTCOMES:
+            raise ValueError("unsupported training_outcome")
         if self.checksum:
             if len(self.checksum) != 64 or any(
                 character not in "0123456789abcdef" for character in self.checksum
@@ -332,11 +402,17 @@ class ModelMetadata:
         values.setdefault("status", "candidate")
         values.setdefault("metric_domain", "weather_vs_truth")
         values.setdefault("last_attempted_input_data_hash", None)
+        values.setdefault("training_outcome", "legacy")
         values.setdefault(
             "training_contract_hash",
             _LEGACY_TRAINING_CONTRACT_HASH,
         )
-        return cls(key=key, compatibility=compatibility, **values)
+        return cls(
+            key=key,
+            compatibility=compatibility,
+            _allow_legacy_training_contract=True,
+            **values,
+        )
 
 
 @dataclass(frozen=True)
@@ -344,6 +420,7 @@ class ModelCandidate:
     key: ModelKey
     bundle: ModelBundle
     metadata: ModelMetadata
+    _integrity_hash: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, ModelKey):
@@ -354,7 +431,30 @@ class ModelCandidate:
             raise TypeError("metadata must be ModelMetadata")
         if self.metadata.key != self.key:
             raise ValueError("candidate metadata scope does not match key")
+        self.bundle.metadata = FrozenMetadata(self.bundle.metadata)
         _validate_bundle(self.key, self.bundle, self.metadata)
+        object.__setattr__(self, "_integrity_hash", self._current_integrity_hash())
+
+    def _current_integrity_hash(self) -> str:
+        payload = {
+            "key": {name: getattr(self.key, name) for name in _KEY_FIELDS},
+            "metadata": self.metadata.to_dict(),
+            "bundle": {
+                "target_name": self.bundle.target_name,
+                "feature_columns": list(self.bundle.feature_columns),
+                "cadence_minutes": self.bundle.cadence_minutes,
+                "residual_bounds": self.bundle.residual_bounds,
+                "line_id": self.bundle.line_id,
+                "tower_id": self.bundle.tower_id,
+                "metadata": dict(self.bundle.metadata),
+            },
+        }
+        return hashlib.sha256(_json_bytes(payload)).hexdigest()
+
+    def validate_integrity(self) -> None:
+        _validate_bundle(self.key, self.bundle, self.metadata)
+        if self._current_integrity_hash() != self._integrity_hash:
+            raise ValueError("candidate integrity validation failed")
 
 
 def candidate_from_training_result(
@@ -384,6 +484,7 @@ def candidate_from_training_result(
     )
     source = result.metadata
     result_contract_hash = getattr(result, "training_contract_hash", None)
+    result_training_outcome = getattr(result, "training_outcome", None)
     source_contract_hash = source.get("training_contract_hash")
     _require_nonempty_string(
         result_contract_hash,
@@ -396,6 +497,13 @@ def candidate_from_training_result(
     )
     if bundle_contract_hash != result_contract_hash:
         raise ValueError("training result and bundle training contracts differ")
+    if (
+        result_training_outcome not in _TRAINING_OUTCOMES - {"legacy"}
+        or source.get("training_outcome") != result_training_outcome
+        or result.bundle.metadata.get("training_outcome")
+        != result_training_outcome
+    ):
+        raise ValueError("training result outcome fields differ")
     metadata = ModelMetadata(
         key=key,
         model_version=model_version,
@@ -415,6 +523,7 @@ def candidate_from_training_result(
         dependency_versions=source["dependency_versions"],
         cadence_minutes=result.bundle.cadence_minutes,
         training_contract_hash=result_contract_hash,
+        training_outcome=result_training_outcome,
     )
     return ModelCandidate(key=key, bundle=result.bundle, metadata=metadata)
 
@@ -500,7 +609,12 @@ def candidate_admission_reason(
     evaluation_set_hash: Optional[str],
     metrics: Mapping[str, float],
     full_fit_metrics: Optional[Mapping[str, float]],
+    training_outcome: str = "trained",
 ) -> str:
+    if training_outcome not in _TRAINING_OUTCOMES:
+        raise ValueError("unsupported training_outcome")
+    if training_outcome == "operational_fallback":
+        return "operational_training_fallback"
     if evaluation_mode != "full_fit" and evaluation_set_hash is None:
         return "missing_evaluation_set_hash"
     candidate_metrics = (
@@ -541,6 +655,12 @@ def _validate_bundle(
         and bundle_contract_hash != metadata.training_contract_hash
     ):
         raise ValueError("bundle training contract does not match metadata")
+    bundle_training_outcome = bundle.metadata.get("training_outcome", "trained")
+    if (
+        metadata.training_outcome != "legacy"
+        and bundle_training_outcome != metadata.training_outcome
+    ):
+        raise ValueError("bundle training outcome does not match metadata")
     if not hasattr(bundle.model, "predict"):
         raise ValueError("bundle model must provide predict")
 
@@ -612,6 +732,29 @@ def _enforce_private_mode(path: Path, expected_mode: int) -> bool:
     if actual_mode != expected_mode:
         raise UnsafeModelPathError("model path permissions are not private")
     return True
+
+
+def _verify_private_regular_file(path: Path, expected_mode: int) -> None:
+    try:
+        _enforce_private_mode(path, expected_mode)
+    except Exception:
+        # A post-commit helper may fail even when the replaced inode is valid.
+        # The direct lstat below remains the authority for the committed path.
+        pass
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise UnsafeModelPathError(
+            "cannot validate replaced model artifact"
+        ) from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or stat.S_IMODE(info.st_mode) != expected_mode
+    ):
+        raise UnsafeModelPathError(
+            "replaced model artifact is not a private regular file"
+        )
 
 
 def _ensure_private_regular_file(path: Path) -> None:
@@ -899,6 +1042,15 @@ class ModelRegistry:
             os.replace(temp_path, path)
             committed = True
             try:
+                _verify_private_regular_file(path, _PRIVATE_FILE_MODE)
+            except Exception:
+                try:
+                    path.unlink()
+                    _fsync_directory(path.parent)
+                except Exception:
+                    pass
+                raise
+            try:
                 _fsync_directory(path.parent)
             except Exception:
                 pass
@@ -1117,10 +1269,10 @@ class ModelRegistry:
         if metadata.checksum != manifest["model_checksum"]:
             return self._fallback("metadata_checksum_mismatch")
 
-        for field, actual in metadata.compatibility.to_dict().items():
-            expected = getattr(expected_compatibility, field)
+        for field_name, actual in metadata.compatibility.to_dict().items():
+            expected = getattr(expected_compatibility, field_name)
             if actual != expected:
-                return self._fallback(f"incompatible_{field}")
+                return self._fallback(f"incompatible_{field_name}")
 
         try:
             model_checksum = _sha256_path(model_path)
@@ -1349,6 +1501,48 @@ class ModelRegistry:
             )
         return PromotionDecision(False, reason, champion)
 
+    def _validate_promotion_contract(
+        self,
+        candidate: ModelCandidate,
+        attempt: Optional[ModelAttempt],
+    ) -> None:
+        candidate.validate_integrity()
+        if (
+            candidate.metadata.training_contract_hash
+            == _LEGACY_TRAINING_CONTRACT_HASH
+        ):
+            raise ValueError("legacy training contract cannot be promoted")
+        bundle_contract_hash = candidate.bundle.metadata.get(
+            "training_contract_hash"
+        )
+        if bundle_contract_hash != candidate.metadata.training_contract_hash:
+            raise ValueError("bundle training contract does not match metadata")
+        if attempt is None:
+            return
+        if not isinstance(attempt, ModelAttempt):
+            raise TypeError("attempt must be a ModelAttempt or None")
+        if (
+            attempt.key != candidate.key
+            or attempt.input_data_hash != candidate.metadata.input_data_hash
+            or attempt.evaluation_set_hash
+            != candidate.metadata.evaluation_set_hash
+            or attempt.training_contract_hash
+            != candidate.metadata.training_contract_hash
+            or attempt.training_contract_hash != bundle_contract_hash
+            or attempt.feature_version
+            != candidate.metadata.compatibility.feature_version
+            or attempt.policy_version != _ATTEMPT_POLICY_VERSION
+            or not math.isclose(
+                attempt.min_mae_improvement,
+                self.min_mae_improvement,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                "attempt contract does not match candidate, bundle, or registry"
+            )
+
     def promote(
         self,
         candidate: ModelCandidate,
@@ -1357,33 +1551,7 @@ class ModelRegistry:
     ) -> PromotionDecision:
         if not isinstance(candidate, ModelCandidate):
             raise TypeError("candidate must be a ModelCandidate")
-        if attempt is not None:
-            if not isinstance(attempt, ModelAttempt):
-                raise TypeError("attempt must be a ModelAttempt or None")
-            if (
-                attempt.key != candidate.key
-                or attempt.input_data_hash != candidate.metadata.input_data_hash
-                or attempt.evaluation_set_hash
-                != candidate.metadata.evaluation_set_hash
-                or attempt.training_contract_hash
-                != candidate.metadata.training_contract_hash
-                or attempt.feature_version
-                != candidate.metadata.compatibility.feature_version
-                or attempt.policy_version != _ATTEMPT_POLICY_VERSION
-                or not math.isclose(
-                    attempt.min_mae_improvement,
-                    self.min_mae_improvement,
-                    rel_tol=0.0,
-                    abs_tol=1e-12,
-                )
-            ):
-                raise ValueError("attempt contract does not match candidate or registry")
-        admission_reason = candidate_admission_reason(
-            evaluation_mode=candidate.metadata.evaluation_mode,
-            evaluation_set_hash=candidate.metadata.evaluation_set_hash,
-            metrics=candidate.metadata.metrics,
-            full_fit_metrics=candidate.metadata.full_fit_metrics,
-        )
+        self._validate_promotion_contract(candidate, attempt)
         try:
             self._safe_directory(
                 self._target_dir(candidate.key).parent, create=False
@@ -1392,6 +1560,14 @@ class ModelRegistry:
         except UnsafeModelPathError:
             return PromotionDecision(False, "unsafe_model_path")
         with lock:
+            self._validate_promotion_contract(candidate, attempt)
+            admission_reason = candidate_admission_reason(
+                evaluation_mode=candidate.metadata.evaluation_mode,
+                evaluation_set_hash=candidate.metadata.evaluation_set_hash,
+                metrics=candidate.metadata.metrics,
+                full_fit_metrics=candidate.metadata.full_fit_metrics,
+                training_outcome=candidate.metadata.training_outcome,
+            )
             try:
                 current = self._load_locked(
                     candidate.key, candidate.metadata.compatibility

@@ -17,6 +17,7 @@ from config.config import DEFAULT_INTERVAL_MINUTES, MODEL_DIR
 from modules.ai_prediction import FeatureBuilder, ResidualPredictor
 from modules.ai_training import (
     ResidualTrainer,
+    TrainingContractError,
     bind_training_result_contract,
     training_runtime_contract_hash,
 )
@@ -1307,6 +1308,16 @@ class DlrPipeline:
                             ):
                                 continue
                             training = trainer.train_prepared(preparation)
+                            if (
+                                training_runtime_contract_hash(
+                                    trainer,
+                                    preparation,
+                                )
+                                != runtime_contract_hash
+                            ):
+                                raise TrainingContractError(
+                                    "trainer runtime contract changed during training"
+                                )
                             training = bind_training_result_contract(
                                 training,
                                 runtime_contract_hash,
@@ -1330,6 +1341,7 @@ class DlrPipeline:
                                 full_fit_metrics=training.metadata.get(
                                     "full_fit_metrics"
                                 ),
+                                training_outcome=training.training_outcome,
                             )
                             if admission_reason:
                                 fallbacks.append(

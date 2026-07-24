@@ -10,6 +10,7 @@ from affine import Affine
 from pyproj import CRS
 from rasterio.coords import BoundingBox
 
+import modules.ai_training as ai_training
 from modules import dlr_pipeline as dlr_pipeline_module
 from modules.ai_prediction import FeatureBuilder, ModelBundle, ResidualPredictor
 from modules.ai_training import ResidualTrainer
@@ -68,6 +69,23 @@ def _conductor() -> dict:
         "longitude": 116.4,
         "line_azimuth": 90.0,
     }
+
+
+class _LinearResidualRegressor:
+    def __init__(self, **kwargs):
+        self.parameters = kwargs
+
+    def fit(self, features, target):
+        physical = np.asarray(features.iloc[:, 0], dtype=float)
+        design = np.column_stack([physical, np.ones(len(physical))])
+        self.coefficients = np.linalg.lstsq(
+            design, np.asarray(target, dtype=float), rcond=None
+        )[0]
+        return self
+
+    def predict(self, features):
+        physical = np.asarray(features.iloc[:, 0], dtype=float)
+        return self.coefficients[0] * physical + self.coefficients[1]
 
 
 def test_derived_line_id_is_stable_across_weather_and_coordinate_order():
@@ -555,6 +573,13 @@ class _CountingTrainer:
         self.calls.append((preparation.tower_id, preparation.target))
         return self.delegate.train_prepared(preparation)
 
+    def training_contract_descriptor(self):
+        return {
+            "type": f"{type(self).__module__}.{type(self).__qualname__}",
+            "delegate": self.delegate.training_contract_descriptor(),
+            "behavior_version": getattr(self, "behavior_version", None),
+        }
+
 
 class _PoorTemporalTrainer(_CountingTrainer):
     def train_prepared(self, preparation):
@@ -589,6 +614,17 @@ class _AlwaysPoorTrainer(_CountingTrainer):
         return self._rejectable(super().train_prepared(preparation))
 
 
+class _RuntimeContractMutatingTrainer(_CountingTrainer):
+    def __init__(self):
+        super().__init__()
+        self.behavior_version = 0
+
+    def train_prepared(self, preparation):
+        result = super().train_prepared(preparation)
+        self.behavior_version += 1
+        return result
+
+
 def test_pipeline_does_not_retrain_loaded_models_when_truth_is_reuploaded(
     tmp_path,
 ):
@@ -612,6 +648,36 @@ def test_pipeline_does_not_retrain_loaded_models_when_truth_is_reuploaded(
     assert second.model_report.loaded_targets == first.model_report.trained_targets
     assert second.model_report.used_targets == first.model_report.trained_targets
     assert second.model_report.trained_targets == ()
+
+
+def test_pipeline_rejects_trainer_runtime_contract_changed_during_training(
+    tmp_path,
+):
+    trainer = _RuntimeContractMutatingTrainer()
+    registry = ModelRegistry(tmp_path)
+
+    result = DlrPipeline(registry=registry, trainer=trainer).run(
+        physical=_weather("physical"),
+        truth=_weather("truth", truth_offset=True),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    expected_keys = tuple(
+        ModelKey("project-a", "line-a", tower_id, target)
+        for tower_id in ("001", "002")
+        for target in ("wind_speed", "ambient_temp")
+    )
+    assert result.model_report.trained_targets == ()
+    assert sum(
+        fallback.reason == "training_failed:TrainingContractError"
+        for fallback in result.model_report.fallbacks
+    ) == 4
+    assert all(not registry.path_for(key).exists() for key in expected_keys)
+    assert all(not registry.attempt_path_for(key).exists() for key in expected_keys)
 
 
 def _weather_with_additional_segment(
@@ -853,6 +919,59 @@ def test_first_rejected_models_use_sidecar_without_duplicate_fallbacks(tmp_path)
         assert {fallback.key for fallback in keyed_fallbacks} == set(expected_keys)
     assert all(registry.attempt_path_for(key).exists() for key in expected_keys)
     assert all(not registry.path_for(key).exists() for key in expected_keys)
+
+
+def test_temporary_import_failure_is_retried_without_rejection_sidecar(
+    tmp_path,
+    monkeypatch,
+):
+    def unavailable():
+        raise ImportError("temporary xgboost outage")
+
+    physical = _weather_with_additional_segment("physical")
+    truth = _weather_with_additional_segment("truth")
+    alternating_residual = np.tile([-1.0, 1.0], len(truth) // 2)
+    truth["wind_speed"] += alternating_residual
+    truth["ambient_temp"] += alternating_residual
+    registry = ModelRegistry(tmp_path)
+    pipeline = DlrPipeline(registry=registry)
+    run_kwargs = {
+        "physical": physical,
+        "truth": truth,
+        "project_id": "project-a",
+        "line_id": "line-a",
+        "terrain_lookup": {},
+        "ai_enabled": True,
+        "conductor": _conductor(),
+        "truth_tolerance": "5min",
+    }
+    expected_keys = tuple(
+        ModelKey("project-a", "line-a", tower_id, target)
+        for tower_id in ("001", "002")
+        for target in ("wind_speed", "ambient_temp")
+    )
+    monkeypatch.setattr(ai_training, "_load_xgb_regressor", unavailable)
+
+    degraded = pipeline.run(**run_kwargs)
+
+    assert all(not registry.attempt_path_for(key).exists() for key in expected_keys)
+    assert all(not registry.path_for(key).exists() for key in expected_keys)
+    assert {
+        decision.reason for decision in degraded.model_report.promotion_decisions
+    } == {"operational_training_fallback"}
+
+    monkeypatch.setattr(
+        ai_training,
+        "_load_xgb_regressor",
+        lambda: _LinearResidualRegressor,
+    )
+
+    recovered = pipeline.run(**run_kwargs)
+
+    assert recovered.model_report.trained_targets == expected_keys
+    assert all(
+        decision.promoted for decision in recovered.model_report.promotion_decisions
+    )
 
 
 def test_rejected_attempt_is_retried_when_trainer_contract_changes(tmp_path):
@@ -1635,6 +1754,12 @@ class _SelectiveFailTrainer:
         if self._must_fail(preparation.tower_id, preparation.target):
             raise RuntimeError("tower target failed")
         return self.delegate.train_prepared(preparation)
+
+    def training_contract_descriptor(self):
+        return {
+            "type": f"{type(self).__module__}.{type(self).__qualname__}",
+            "delegate": self.delegate.training_contract_descriptor(),
+        }
 
 
 class _ZeroResidualModel:

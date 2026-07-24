@@ -1165,7 +1165,7 @@ def _is_sensitive_parameter_name(name: Any) -> bool:
         try:
             lowered = str.lower(bytes.decode(name, "ascii"))
         except UnicodeDecodeError:
-            return False
+            return True
     else:
         return False
     normalized = "".join(

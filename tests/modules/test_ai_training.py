@@ -1305,6 +1305,23 @@ def test_ascii_bytes_sensitive_parameter_key_never_leaks_value():
     assert secret not in serialized
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        b"customer_password_\xff",
+        b"customer_password_" + "\u5bc6\u7801".encode("utf-8"),
+    ],
+    ids=["invalid-utf8", "utf8-nonascii"],
+)
+def test_opaque_bytes_parameter_key_never_leaks_value(key):
+    secret = "VALUE-MUST-NOT-PERSIST"
+
+    value = ai_training._json_safe_training_value({key: secret})
+    serialized = json.dumps(value, allow_nan=False, sort_keys=True)
+
+    assert secret not in serialized
+
+
 def test_unknown_training_parameter_does_not_persist_dtype_content():
     secret = "VALUE-MUST-NOT-PERSIST"
 

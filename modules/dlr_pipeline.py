@@ -15,7 +15,11 @@ from pyproj import CRS
 
 from config.config import DEFAULT_INTERVAL_MINUTES, MODEL_DIR
 from modules.ai_prediction import FeatureBuilder, ResidualPredictor
-from modules.ai_training import ResidualTrainer
+from modules.ai_training import (
+    ResidualTrainer,
+    bind_training_result_contract,
+    training_runtime_contract_hash,
+)
 from modules.model_registry import (
     ModelCompatibility,
     ModelKey,
@@ -1272,15 +1276,19 @@ class DlrPipeline:
                                 physical_col=physical_column,
                                 truth_col=truth_column,
                             )
+                            runtime_contract_hash = (
+                                training_runtime_contract_hash(
+                                    trainer,
+                                    preparation,
+                                )
+                            )
                             attempt = registry.build_attempt(
                                 key,
                                 input_data_hash=preparation.input_data_hash,
                                 evaluation_set_hash=(
                                     preparation.evaluation_set_hash
                                 ),
-                                training_contract_hash=(
-                                    preparation.training_contract_hash
-                                ),
+                                training_contract_hash=runtime_contract_hash,
                                 feature_version=compatibility.feature_version,
                                 champion=(
                                     load_result.metadata
@@ -1299,6 +1307,10 @@ class DlrPipeline:
                             ):
                                 continue
                             training = trainer.train_prepared(preparation)
+                            training = bind_training_result_contract(
+                                training,
+                                runtime_contract_hash,
+                            )
                         else:
                             training = trainer.train_target(
                                 tower_training,

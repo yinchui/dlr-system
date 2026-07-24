@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import copy
+import functools
 import hashlib
 import importlib.metadata
+import inspect
 import json
 import platform
-from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -33,6 +36,23 @@ _TARGET_COLUMNS = {
     },
 }
 _TRAINING_CONTRACT_VERSION = "residual-training-v1"
+_TRAINING_LINEAGE_COLUMNS = (
+    "source_file_hash",
+    "source_file_hash_physical",
+    "source_file_hash_truth",
+    "dataset_id",
+    "dataset_role",
+)
+_DEFAULT_ESTIMATOR_PARAMETERS = (
+    ("objective", "reg:squarederror"),
+    ("n_estimators", 120),
+    ("max_depth", 3),
+    ("learning_rate", 0.05),
+    ("subsample", 0.9),
+    ("colsample_bytree", 0.9),
+    ("random_state", 42),
+    ("n_jobs", 1),
+)
 
 
 class ConstantResidualEstimator:
@@ -54,6 +74,25 @@ class TrainingResult:
     bundle: ModelBundle
     metrics: dict[str, float]
     metadata: dict
+    training_contract_hash: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.training_contract_hash, str)
+            or not self.training_contract_hash.strip()
+        ):
+            raise ValueError("training_contract_hash must be a non-empty string")
+        if not isinstance(self.metadata, Mapping):
+            raise ValueError("training result metadata must be a mapping")
+        if not isinstance(self.bundle.metadata, Mapping):
+            raise ValueError("training bundle metadata must be a mapping")
+        if (
+            self.metadata.get("training_contract_hash")
+            != self.training_contract_hash
+            or self.bundle.metadata.get("training_contract_hash")
+            != self.training_contract_hash
+        ):
+            raise ValueError("training result contract fields must match")
 
 
 @dataclass(frozen=True)
@@ -76,6 +115,40 @@ class TrainingPreparation:
     evaluation_set_hash: Optional[str]
     cadence_minutes: float
     training_contract_hash: str
+    snapshot_hash: str
+
+
+@dataclass(frozen=True)
+class TrainingContract:
+    version: str
+    trainer_descriptor_json: str
+    estimator_descriptor_json: str
+    dependency_versions: tuple[tuple[str, str], ...]
+    random_seed: int
+
+    def scoped_hash(
+        self,
+        *,
+        target: str,
+        physical_col: str,
+        truth_col: str,
+        feature_columns: Sequence[str],
+        cadence_minutes: float,
+    ) -> str:
+        return _stable_json_hash(
+            {
+                "version": self.version,
+                "trainer": json.loads(self.trainer_descriptor_json),
+                "estimator": json.loads(self.estimator_descriptor_json),
+                "dependencies": dict(self.dependency_versions),
+                "random_seed": self.random_seed,
+                "target": target,
+                "physical_col": physical_col,
+                "truth_col": truth_col,
+                "feature_columns": list(feature_columns),
+                "cadence_minutes": float(cadence_minutes),
+            }
+        )
 
 
 def _load_xgb_regressor():
@@ -86,16 +159,7 @@ def _load_xgb_regressor():
 
 def default_estimator():
     estimator_class = _load_xgb_regressor()
-    return estimator_class(
-        objective="reg:squarederror",
-        n_estimators=120,
-        max_depth=3,
-        learning_rate=0.05,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        random_state=42,
-        n_jobs=1,
-    )
+    return estimator_class(**dict(_DEFAULT_ESTIMATOR_PARAMETERS))
 
 
 def _metric_values(
@@ -164,31 +228,158 @@ def _stable_training_data_hash(
     return digest.hexdigest()
 
 
-def _training_contract_hash(
+def _ordered_training_snapshot_hash(
+    frame: pd.DataFrame,
+    columns: Sequence[str],
     *,
     target: str,
-    physical_col: str,
-    truth_col: str,
-    feature_columns: Sequence[str],
-    cadence_minutes: float,
 ) -> str:
-    payload = {
-        "version": _TRAINING_CONTRACT_VERSION,
-        "target": target,
-        "physical_col": physical_col,
-        "truth_col": truth_col,
-        "feature_columns": list(feature_columns),
-        "cadence_minutes": float(cadence_minutes),
-    }
-    return hashlib.sha256(
-        json.dumps(
-            payload,
-            ensure_ascii=True,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
+    selected_columns = list(dict.fromkeys(columns))
+    ordered = frame.loc[:, selected_columns].copy(deep=True)
+    row_hashes = pd.util.hash_pandas_object(
+        ordered,
+        index=False,
+        categorize=False,
+    ).to_numpy(dtype=np.uint64)
+    digest = hashlib.sha256()
+    digest.update(
+        _canonical_json(
+            {"target": target, "columns": selected_columns, "ordered": True}
         ).encode("utf-8")
-    ).hexdigest()
+    )
+    digest.update(row_hashes.tobytes())
+    return digest.hexdigest()
+
+
+def _canonical_json(payload: Any) -> str:
+    return json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _stable_json_hash(payload: Any) -> str:
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _qualified_name(value: Any) -> str:
+    module = getattr(value, "__module__", type(value).__module__)
+    qualname = getattr(value, "__qualname__", type(value).__qualname__)
+    return f"{module}.{qualname}"
+
+
+def _contract_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if np.isfinite(value) else str(value)
+    if isinstance(value, np.generic):
+        return _contract_value(value.item())
+    if isinstance(value, (list, tuple)):
+        return [_contract_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        normalized = [_contract_value(item) for item in value]
+        return sorted(normalized, key=_canonical_json)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _contract_value(item)
+            for key, item in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    return {"type": _qualified_name(type(value))}
+
+
+def _implementation_hash(value: Any) -> str:
+    target = getattr(value, "__func__", value)
+    try:
+        source = inspect.getsource(target)
+    except (OSError, TypeError):
+        source = _qualified_name(target)
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def _callable_contract(value: Any) -> dict[str, Any]:
+    if isinstance(value, functools.partial):
+        return {
+            "kind": "partial",
+            "callable": _callable_contract(value.func),
+            "args": _contract_value(tuple(value.args)),
+            "keywords": _contract_value(value.keywords or {}),
+        }
+    descriptor = {
+        "kind": "class" if inspect.isclass(value) else "callable",
+        "identity": _qualified_name(value),
+        "implementation_hash": _implementation_hash(value),
+    }
+    defaults = getattr(value, "__defaults__", None)
+    keyword_defaults = getattr(value, "__kwdefaults__", None)
+    if defaults:
+        descriptor["defaults"] = _contract_value(tuple(defaults))
+    if keyword_defaults:
+        descriptor["keyword_defaults"] = _contract_value(keyword_defaults)
+    closure = getattr(value, "__closure__", None)
+    if closure:
+        descriptor["closure"] = [
+            _contract_value(cell.cell_contents) for cell in closure
+        ]
+    if value is default_estimator:
+        descriptor["declared_parameters"] = dict(
+            _DEFAULT_ESTIMATOR_PARAMETERS
+        )
+    return descriptor
+
+
+def training_runtime_contract_hash(
+    trainer: Any,
+    preparation: TrainingPreparation,
+) -> str:
+    if not isinstance(preparation, TrainingPreparation):
+        raise TypeError("preparation must be a TrainingPreparation")
+    trainer_type = type(trainer)
+    methods = {}
+    for name in ("prepare_target", "train_prepared", "train_target"):
+        method = getattr(trainer_type, name, None)
+        if method is not None:
+            methods[name] = _callable_contract(method)
+    return _stable_json_hash(
+        {
+            "preparation_contract_hash": preparation.training_contract_hash,
+            "trainer_type": _qualified_name(trainer_type),
+            "methods": methods,
+        }
+    )
+
+
+def bind_training_result_contract(
+    result: TrainingResult,
+    training_contract_hash: str,
+) -> TrainingResult:
+    if not isinstance(result, TrainingResult):
+        raise TypeError("result must be a TrainingResult")
+    if (
+        not isinstance(training_contract_hash, str)
+        or not training_contract_hash.strip()
+    ):
+        raise ValueError("training_contract_hash must be a non-empty string")
+    metadata = {
+        **dict(result.metadata),
+        "training_contract_hash": training_contract_hash,
+    }
+    bundle = replace(
+        result.bundle,
+        metadata={
+            **dict(result.bundle.metadata),
+            "training_contract_hash": training_contract_hash,
+        },
+    )
+    return replace(
+        result,
+        bundle=bundle,
+        metadata=metadata,
+        training_contract_hash=training_contract_hash,
+    )
 
 
 def _json_safe_training_value(value):
@@ -250,6 +441,22 @@ class ResidualTrainer:
     ):
         self.estimator_factory = estimator_factory or default_estimator
         self.feature_builder = feature_builder or FeatureBuilder()
+        dependencies = _dependency_versions()
+        trainer_type = type(self)
+        trainer_descriptor = {
+            "type": _qualified_name(trainer_type),
+            "prepare_target": _callable_contract(trainer_type.prepare_target),
+            "train_prepared": _callable_contract(trainer_type.train_prepared),
+        }
+        self.training_contract = TrainingContract(
+            version=_TRAINING_CONTRACT_VERSION,
+            trainer_descriptor_json=_canonical_json(trainer_descriptor),
+            estimator_descriptor_json=_canonical_json(
+                _callable_contract(self.estimator_factory)
+            ),
+            dependency_versions=tuple(sorted(dependencies.items())),
+            random_seed=42,
+        )
 
     @staticmethod
     def _target_columns(
@@ -326,6 +533,67 @@ class ResidualTrainer:
                     "train_target accepts a single line and single tower only"
                 )
         return working, working["line_id"].iloc[0], working["tower_id"].iloc[0]
+
+    def _canonicalize_working(
+        self,
+        frame: pd.DataFrame,
+        *,
+        physical_col: str,
+        truth_col: str,
+    ) -> pd.DataFrame:
+        working = frame.copy(deep=True)
+        original_attrs = copy.deepcopy(frame.attrs)
+        working["timestamp"] = self.feature_builder._timestamps(working)
+        for column in _TRAINING_LINEAGE_COLUMNS:
+            if column not in working.columns:
+                continue
+            if working[column].isna().any():
+                raise ValueError(f"{column} cannot contain missing values")
+            working[column] = working[column].map(
+                lambda value: str(value).strip()
+            )
+        try:
+            working["__canonical_row_hash__"] = (
+                pd.util.hash_pandas_object(
+                    working.loc[
+                        :,
+                        [
+                            "line_id",
+                            "tower_id",
+                            *(
+                                column
+                                for column in _TRAINING_LINEAGE_COLUMNS
+                                if column in working.columns
+                            ),
+                            "timestamp",
+                            physical_col,
+                            truth_col,
+                        ],
+                    ],
+                    index=False,
+                    categorize=False,
+                ).to_numpy(dtype=np.uint64)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("training rows must contain stable scalar values") from exc
+        sort_columns = [
+            "line_id",
+            "tower_id",
+            *(
+                column
+                for column in _TRAINING_LINEAGE_COLUMNS
+                if column in working.columns
+            ),
+            "timestamp",
+            "__canonical_row_hash__",
+        ]
+        working = (
+            working.sort_values(sort_columns, kind="mergesort")
+            .drop(columns="__canonical_row_hash__")
+            .reset_index(drop=True)
+        )
+        working.attrs = original_attrs
+        return working
 
     @staticmethod
     def _finite_values(frame: pd.DataFrame, column: str) -> np.ndarray:
@@ -462,6 +730,11 @@ class ResidualTrainer:
         physical_col, truth_col = self._target_columns(
             working, target, physical_col, truth_col
         )
+        working = self._canonicalize_working(
+            working,
+            physical_col=physical_col,
+            truth_col=truth_col,
+        )
         physical = self._finite_values(working, physical_col).copy()
         truth = self._finite_values(working, truth_col).copy()
         residual = (truth - physical).copy()
@@ -483,13 +756,7 @@ class ResidualTrainer:
             split = tuple(np.array(indices, dtype=np.int64, copy=True) for indices in split)
         lineage_columns = [
             column
-            for column in (
-                "source_file_hash",
-                "source_file_hash_physical",
-                "source_file_hash_truth",
-                "dataset_id",
-                "dataset_role",
-            )
+            for column in _TRAINING_LINEAGE_COLUMNS
             if column in feature_frame.columns
         ]
         hash_columns = (
@@ -514,12 +781,17 @@ class ResidualTrainer:
                 hash_columns,
                 target=target,
             )
-        training_contract_hash = _training_contract_hash(
+        training_contract_hash = self.training_contract.scoped_hash(
             target=target,
             physical_col=physical_col,
             truth_col=truth_col,
             feature_columns=feature_columns,
             cadence_minutes=self.feature_builder.cadence_minutes,
+        )
+        snapshot_hash = _ordered_training_snapshot_hash(
+            feature_frame,
+            hash_columns,
+            target=target,
         )
         return TrainingPreparation(
             target=target,
@@ -540,6 +812,7 @@ class ResidualTrainer:
             evaluation_set_hash=evaluation_set_hash,
             cadence_minutes=self.feature_builder.cadence_minutes,
             training_contract_hash=training_contract_hash,
+            snapshot_hash=snapshot_hash,
         )
 
     @staticmethod
@@ -630,6 +903,7 @@ class ResidualTrainer:
             "evaluation_set_hash",
             "cadence_minutes",
             "training_contract_hash",
+            "snapshot_hash",
         )
         for field in scalar_fields:
             if getattr(preparation, field) != getattr(trusted, field):
@@ -756,9 +1030,12 @@ class ResidualTrainer:
             "feature_columns": list(feature_columns),
             "cadence_minutes": self.feature_builder.cadence_minutes,
             "training_contract_hash": preparation.training_contract_hash,
+            "training_snapshot_hash": preparation.snapshot_hash,
             "random_state": 42,
             "training_params": _estimator_training_params(final_estimator),
-            "dependency_versions": _dependency_versions(),
+            "dependency_versions": dict(
+                self.training_contract.dependency_versions
+            ),
             "fallback_reason": final_reason,
             "evaluation_fallback_reason": evaluation_reason,
             "residual_bounds": final_bounds,
@@ -783,6 +1060,7 @@ class ResidualTrainer:
             bundle=bundle,
             metrics=metrics,
             metadata=metadata,
+            training_contract_hash=preparation.training_contract_hash,
         )
 
     def train_target(

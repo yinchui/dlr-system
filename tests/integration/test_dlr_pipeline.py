@@ -855,6 +855,34 @@ def test_first_rejected_models_use_sidecar_without_duplicate_fallbacks(tmp_path)
     assert all(not registry.path_for(key).exists() for key in expected_keys)
 
 
+def test_rejected_attempt_is_retried_when_trainer_contract_changes(tmp_path):
+    poor_trainer = _AlwaysPoorTrainer()
+    registry = ModelRegistry(tmp_path)
+    run_kwargs = {
+        "physical": _weather("physical"),
+        "truth": _weather("truth", truth_offset=True),
+        "project_id": "project-a",
+        "line_id": "line-a",
+        "terrain_lookup": {},
+        "ai_enabled": True,
+        "conductor": _conductor(),
+    }
+    DlrPipeline(registry=registry, trainer=poor_trainer).run(**run_kwargs)
+    normal_trainer = _CountingTrainer()
+
+    retried = DlrPipeline(
+        registry=ModelRegistry(tmp_path),
+        trainer=normal_trainer,
+    ).run(**run_kwargs)
+
+    assert len(poor_trainer.calls) == 4
+    assert len(normal_trainer.calls) == 4
+    assert len(retried.model_report.trained_targets) == 4
+    assert all(
+        decision.promoted for decision in retried.model_report.promotion_decisions
+    )
+
+
 def test_attempt_cache_is_invalidated_when_mae_threshold_changes(tmp_path):
     trainer = _CountingTrainer()
     high_registry = ModelRegistry(tmp_path, min_mae_improvement=999.0)

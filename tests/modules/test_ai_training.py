@@ -1,4 +1,5 @@
 from dataclasses import replace
+from functools import partial
 
 import numpy as np
 import pandas as pd
@@ -57,6 +58,23 @@ class HoldoutNonFiniteEstimator:
         if self.predict_calls == 1:
             return np.zeros(len(features))
         return np.full(len(features), np.nan)
+
+
+class OrderSensitiveEstimator:
+    def __init__(self, offset=0.0):
+        self.offset = float(offset)
+
+    def fit(self, features, target):
+        values = np.asarray(target, dtype=float)
+        weights = np.arange(1.0, len(values) + 1.0)
+        self.value = float(np.average(values, weights=weights) + self.offset)
+        return self
+
+    def predict(self, features):
+        return np.full(len(features), self.value)
+
+    def get_params(self, deep=False):
+        return {"offset": self.offset}
 
 
 def make_training_frame(
@@ -190,6 +208,69 @@ def test_training_preparation_reports_full_fit_for_one_continuous_block():
     assert preparation.evaluation_set_hash is None
 
 
+def test_training_is_canonical_for_reversed_input_rows():
+    frame = make_training_frame(residuals=(0.0, 4.0, -2.0, 3.0))
+    trainer = ResidualTrainer(
+        estimator_factory=partial(OrderSensitiveEstimator, offset=0.25)
+    )
+
+    forward_preparation = trainer.prepare_target(frame, target="wind_speed")
+    reversed_preparation = trainer.prepare_target(
+        frame.iloc[::-1], target="wind_speed"
+    )
+    forward = trainer.train_prepared(forward_preparation)
+    reversed_rows = trainer.train_prepared(reversed_preparation)
+
+    assert forward.metadata["input_data_hash"] == reversed_rows.metadata[
+        "input_data_hash"
+    ]
+    assert forward.metadata["evaluation_set_hash"] == reversed_rows.metadata[
+        "evaluation_set_hash"
+    ]
+    pd.testing.assert_frame_equal(
+        forward_preparation.working,
+        reversed_preparation.working,
+    )
+    assert forward.metrics == reversed_rows.metrics
+    assert forward.bundle.model.value == pytest.approx(
+        reversed_rows.bundle.model.value
+    )
+
+
+def test_training_contract_changes_with_estimator_parameters():
+    frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
+    first = ResidualTrainer(
+        estimator_factory=partial(OrderSensitiveEstimator, offset=0.0)
+    ).prepare_target(frame, target="wind_speed")
+    changed = ResidualTrainer(
+        estimator_factory=partial(OrderSensitiveEstimator, offset=1.0)
+    ).prepare_target(frame, target="wind_speed")
+
+    assert first.training_contract_hash != changed.training_contract_hash
+
+
+def test_training_contract_changes_with_dependency_versions(monkeypatch):
+    frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
+    monkeypatch.setattr(
+        ai_training,
+        "_dependency_versions",
+        lambda: {"python": "3.11", "xgboost": "2.0"},
+    )
+    first = ResidualTrainer(
+        estimator_factory=constant_factory
+    ).prepare_target(frame, target="wind_speed")
+    monkeypatch.setattr(
+        ai_training,
+        "_dependency_versions",
+        lambda: {"python": "3.11", "xgboost": "3.0"},
+    )
+    changed = ResidualTrainer(
+        estimator_factory=constant_factory
+    ).prepare_target(frame, target="wind_speed")
+
+    assert first.training_contract_hash != changed.training_contract_hash
+
+
 def _temporal_preparation():
     trainer = ResidualTrainer(estimator_factory=constant_factory)
     frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
@@ -226,6 +307,15 @@ def test_train_prepared_rejects_mutated_residual():
         trainer.train_prepared(preparation)
 
 
+@pytest.mark.parametrize("field", ["physical", "truth"])
+def test_train_prepared_rejects_mutated_source_arrays(field):
+    trainer, _, preparation = _temporal_preparation()
+    getattr(preparation, field)[0] += 100.0
+
+    with pytest.raises(ValueError, match="preparation|snapshot|integrity"):
+        trainer.train_prepared(preparation)
+
+
 def test_train_prepared_rejects_mutated_model_features():
     trainer, _, preparation = _temporal_preparation()
     preparation.model_features.iloc[0, 0] += 100.0
@@ -256,6 +346,7 @@ def test_train_prepared_rejects_invalid_split_indices(split):
     [
         ("input_data_hash", "0" * 64),
         ("evaluation_set_hash", "1" * 64),
+        ("training_contract_hash", "2" * 64),
     ],
 )
 def test_train_prepared_rejects_forged_preparation_hashes(field, value):
@@ -264,6 +355,33 @@ def test_train_prepared_rejects_forged_preparation_hashes(field, value):
 
     with pytest.raises(ValueError, match="hash|preparation|integrity"):
         trainer.train_prepared(tampered)
+
+
+def test_temporal_split_may_exclude_rows_to_prevent_time_leakage():
+    frame = make_training_frame(
+        residuals=(0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
+        timestamps=pd.to_datetime(
+            [
+                "2025-01-01 00:00",
+                "2025-01-01 00:30",
+                "2025-01-01 01:00",
+                "2025-01-01 00:30",
+                "2025-01-01 01:00",
+                "2025-01-01 01:30",
+            ],
+            utc=True,
+        ),
+    )
+    frame["source_file_hash"] = ["a", "a", "a", "b", "b", "b"]
+    trainer = ResidualTrainer(estimator_factory=constant_factory)
+
+    preparation = trainer.prepare_target(frame, target="wind_speed")
+    train_positions, holdout_positions = preparation.split
+
+    assert len(set(train_positions) | set(holdout_positions)) < len(frame)
+    assert trainer.train_prepared(preparation).metadata[
+        "evaluation_mode"
+    ] == "temporal_holdout"
 
 
 def test_training_preparation_isolated_from_later_source_frame_changes():

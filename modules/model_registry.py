@@ -55,6 +55,7 @@ _MANIFEST_FIELDS = frozenset(
 _GENERATION_ARTIFACTS = ("model.joblib", "metadata.json", "manifest.json")
 _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
+_LEGACY_TRAINING_CONTRACT_HASH = "legacy-training-contract-v0"
 _ATTEMPT_POLICY_VERSION = "weather-promotion-v1"
 _ATTEMPT_LEDGER_FIELDS = frozenset(
     {"schema_version", *_KEY_FIELDS, "entries"}
@@ -188,6 +189,7 @@ class ModelMetadata:
     status: str = "candidate"
     metric_domain: str = "weather_vs_truth"
     last_attempted_input_data_hash: Optional[str] = None
+    training_contract_hash: str = _LEGACY_TRAINING_CONTRACT_HASH
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, ModelKey):
@@ -261,6 +263,10 @@ class ModelMetadata:
         object.__setattr__(self, "residual_bounds", (float(lower), float(upper)))
 
         _require_nonempty_string(self.input_data_hash, "input_data_hash")
+        _require_nonempty_string(
+            self.training_contract_hash,
+            "training_contract_hash",
+        )
         if self.last_attempted_input_data_hash is not None:
             _require_nonempty_string(
                 self.last_attempted_input_data_hash,
@@ -326,6 +332,10 @@ class ModelMetadata:
         values.setdefault("status", "candidate")
         values.setdefault("metric_domain", "weather_vs_truth")
         values.setdefault("last_attempted_input_data_hash", None)
+        values.setdefault(
+            "training_contract_hash",
+            _LEGACY_TRAINING_CONTRACT_HASH,
+        )
         return cls(key=key, compatibility=compatibility, **values)
 
 
@@ -373,6 +383,19 @@ def candidate_from_training_result(
         target=str(result.target),
     )
     source = result.metadata
+    result_contract_hash = getattr(result, "training_contract_hash", None)
+    source_contract_hash = source.get("training_contract_hash")
+    _require_nonempty_string(
+        result_contract_hash,
+        "training result training_contract_hash",
+    )
+    if source_contract_hash != result_contract_hash:
+        raise ValueError("training result and metadata contracts differ")
+    bundle_contract_hash = result.bundle.metadata.get(
+        "training_contract_hash"
+    )
+    if bundle_contract_hash != result_contract_hash:
+        raise ValueError("training result and bundle training contracts differ")
     metadata = ModelMetadata(
         key=key,
         model_version=model_version,
@@ -391,6 +414,7 @@ def candidate_from_training_result(
         compatibility=compatibility,
         dependency_versions=source["dependency_versions"],
         cadence_minutes=result.bundle.cadence_minutes,
+        training_contract_hash=result_contract_hash,
     )
     return ModelCandidate(key=key, bundle=result.bundle, metadata=metadata)
 
@@ -509,6 +533,14 @@ def _validate_bundle(
         metadata.residual_bounds
     ):
         raise ValueError("bundle residual bounds do not match metadata")
+    if not isinstance(bundle.metadata, Mapping):
+        raise ValueError("bundle metadata must be a mapping")
+    bundle_contract_hash = bundle.metadata.get("training_contract_hash")
+    if (
+        metadata.training_contract_hash != _LEGACY_TRAINING_CONTRACT_HASH
+        and bundle_contract_hash != metadata.training_contract_hash
+    ):
+        raise ValueError("bundle training contract does not match metadata")
     if not hasattr(bundle.model, "predict"):
         raise ValueError("bundle model must provide predict")
 
@@ -761,6 +793,7 @@ class ModelRegistry:
             "full_fit_metrics": champion.full_fit_metrics,
             "input_data_hash": champion.input_data_hash,
             "evaluation_set_hash": champion.evaluation_set_hash,
+            "training_contract_hash": champion.training_contract_hash,
             "compatibility": champion.compatibility.to_dict(),
         }
         return hashlib.sha256(_json_bytes(payload)).hexdigest()
@@ -865,7 +898,6 @@ class ModelRegistry:
             _write_bytes(temp_path, _json_bytes(payload))
             os.replace(temp_path, path)
             committed = True
-            _enforce_private_mode(path, _PRIVATE_FILE_MODE)
             try:
                 _fsync_directory(path.parent)
             except Exception:
@@ -1333,6 +1365,8 @@ class ModelRegistry:
                 or attempt.input_data_hash != candidate.metadata.input_data_hash
                 or attempt.evaluation_set_hash
                 != candidate.metadata.evaluation_set_hash
+                or attempt.training_contract_hash
+                != candidate.metadata.training_contract_hash
                 or attempt.feature_version
                 != candidate.metadata.compatibility.feature_version
                 or attempt.policy_version != _ATTEMPT_POLICY_VERSION

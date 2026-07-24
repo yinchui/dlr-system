@@ -57,6 +57,7 @@ def model_metadata(
     corrected_mae=1.0,
     evaluation_set_hash="evaluation-a",
     input_data_hash="input-a",
+    training_contract_hash="c" * 64,
     compatibility=None,
 ):
     metrics = dict(WEATHER_METRICS, corrected_mae=corrected_mae)
@@ -88,6 +89,7 @@ def model_metadata(
         compatibility=compatibility or compatible_hashes(),
         dependency_versions={"python": "3.11", "joblib": "1.5.3"},
         cadence_minutes=30.0,
+        training_contract_hash=training_contract_hash,
     )
 
 
@@ -118,7 +120,10 @@ def model_candidate(key, *, model_value=0.5, **metadata_options):
         residual_bounds=metadata.residual_bounds,
         line_id=key.line_id,
         tower_id=key.tower_id,
-        metadata={"training_contract": "task-9"},
+        metadata={
+            "training_contract": "task-9",
+            "training_contract_hash": metadata.training_contract_hash,
+        },
     )
     return ModelCandidate(key=key, bundle=bundle, metadata=metadata)
 
@@ -609,6 +614,16 @@ def test_required_training_metadata_mappings_cannot_be_empty(field):
         ModelMetadata.from_dict(values)
 
 
+def test_legacy_metadata_without_training_contract_hash_remains_loadable():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    payload = model_metadata(key).to_dict()
+    payload.pop("training_contract_hash")
+
+    restored = ModelMetadata.from_dict(payload)
+
+    assert restored.training_contract_hash == "legacy-training-contract-v0"
+
+
 @pytest.mark.parametrize(
     "field",
     [
@@ -762,6 +777,7 @@ def test_persisted_metadata_contains_required_scope_hashes_and_checksum(tmp_path
     assert payload["metrics"] == {}
     assert payload["full_fit_metrics"] == WEATHER_METRICS
     assert payload["status"] == "active_provisional"
+    assert payload["training_contract_hash"] == "c" * 64
     assert len(payload["checksum"]) == 64
     assert payload["dem_hash"] == "dem-a"
     assert payload["correction_config_hash"] == "correction-a"
@@ -1415,6 +1431,73 @@ def test_corrupt_attempt_sidecar_does_not_affect_champion_loading(tmp_path):
     assert registry.was_rejected(attempt) is False
 
 
+def test_attempt_contract_must_match_candidate_and_bundle(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    candidate = model_candidate(
+        key,
+        corrected_mae=WEATHER_METRICS["baseline_mae"],
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+    )
+    attempt = model_attempt(
+        registry,
+        key,
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+        training_contract_hash="different-contract",
+    )
+
+    with pytest.raises(ValueError, match="training contract|attempt contract"):
+        registry.promote(candidate, attempt=attempt)
+
+    assert not registry.path_for(key).exists()
+    assert not registry.attempt_path_for(key).exists()
+
+
+def test_post_replace_permission_probe_cannot_report_unpersisted_attempt(
+    tmp_path,
+    monkeypatch,
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    candidate = model_candidate(
+        key,
+        corrected_mae=WEATHER_METRICS["baseline_mae"],
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+    )
+    attempt = model_attempt(
+        registry,
+        key,
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+    )
+    attempt_path = registry.attempt_path_for(key)
+    real_enforce = model_registry._enforce_private_mode
+
+    def fail_only_after_replace(path, expected_mode):
+        if Path(path) == attempt_path:
+            raise model_registry.UnsafeModelPathError("late permission failure")
+        return real_enforce(path, expected_mode)
+
+    monkeypatch.setattr(
+        model_registry,
+        "_enforce_private_mode",
+        fail_only_after_replace,
+    )
+
+    decision = registry.promote(candidate, attempt=attempt)
+
+    assert decision.reason == "candidate_not_better_than_physical"
+    monkeypatch.setattr(
+        model_registry,
+        "_enforce_private_mode",
+        real_enforce,
+    )
+    assert registry.was_rejected(attempt) is True
+
+
 @pytest.mark.parametrize(
     "field",
     [
@@ -1642,6 +1725,15 @@ def test_training_result_adapter_preserves_temporal_holdout_contract():
     assert candidate.metadata.input_data_hash == result.metadata[
         "input_data_hash"
     ]
+    assert candidate.metadata.training_contract_hash == result.metadata[
+        "training_contract_hash"
+    ]
+    assert result.training_contract_hash == result.metadata[
+        "training_contract_hash"
+    ]
+    assert candidate.bundle.metadata["training_contract_hash"] == (
+        candidate.metadata.training_contract_hash
+    )
     assert candidate.metadata.cadence_minutes == result.bundle.cadence_minutes
 
 

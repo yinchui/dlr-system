@@ -53,6 +53,8 @@ _MANIFEST_FIELDS = frozenset(
     }
 )
 _GENERATION_ARTIFACTS = ("model.joblib", "metadata.json", "manifest.json")
+_PRIVATE_DIRECTORY_MODE = 0o700
+_PRIVATE_FILE_MODE = 0o600
 
 
 def _validate_identifier(value: str, name: str) -> None:
@@ -419,10 +421,19 @@ def _json_bytes(payload: Mapping[str, Any]) -> bytes:
 
 
 def _write_bytes(path: Path, payload: bytes) -> None:
-    with path.open("xb") as stream:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, _PRIVATE_FILE_MODE)
+    try:
+        stream = os.fdopen(descriptor, "wb")
+    except Exception:
+        os.close(descriptor)
+        raise
+    with stream:
         stream.write(payload)
         stream.flush()
         os.fsync(stream.fileno())
+    _enforce_private_mode(path, _PRIVATE_FILE_MODE)
 
 
 def _fsync_directory(path: Path) -> bool:
@@ -439,6 +450,42 @@ def _fsync_directory(path: Path) -> bool:
 
 class UnsafeModelPathError(OSError):
     pass
+
+
+def _enforce_private_mode(path: Path, expected_mode: int) -> bool:
+    if os.name != "posix":
+        return False
+    try:
+        os.chmod(path, expected_mode)
+    except Exception:
+        pass
+    try:
+        actual_mode = stat.S_IMODE(path.lstat().st_mode)
+    except OSError as exc:
+        raise UnsafeModelPathError("cannot validate private permissions") from exc
+    if actual_mode != expected_mode:
+        raise UnsafeModelPathError("model path permissions are not private")
+    return True
+
+
+def _ensure_private_regular_file(path: Path) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, _PRIVATE_FILE_MODE)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise UnsafeModelPathError("cannot create private model file") from exc
+    else:
+        os.close(descriptor)
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise UnsafeModelPathError("cannot validate private model file") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise UnsafeModelPathError("model file must be a regular file")
+    _enforce_private_mode(path, _PRIVATE_FILE_MODE)
 
 
 class ModelRegistry:
@@ -458,13 +505,23 @@ class ModelRegistry:
         configured_root = Path(model_dir).expanduser()
         try:
             canonical_root = configured_root.resolve(strict=False)
-            canonical_root.mkdir(parents=True, exist_ok=True)
+            canonical_root.mkdir(
+                mode=_PRIVATE_DIRECTORY_MODE,
+                parents=True,
+                exist_ok=True,
+            )
             canonical_root = canonical_root.resolve(strict=True)
         except OSError as exc:
             raise ValueError("model_dir must resolve to a writable directory") from exc
         if not canonical_root.is_dir():
             raise ValueError("model_dir must resolve to a directory")
         self.model_dir = canonical_root
+        try:
+            self._safe_directory(self.model_dir, create=False)
+        except UnsafeModelPathError as exc:
+            raise ValueError(
+                "model_dir must resolve to a private directory"
+            ) from exc
         if (
             isinstance(min_mae_improvement, bool)
             or not isinstance(min_mae_improvement, (int, float))
@@ -488,6 +545,10 @@ class ModelRegistry:
                 raise UnsafeModelPathError("canonical model root is unsafe")
             if self.model_dir.resolve(strict=True) != self.model_dir:
                 raise UnsafeModelPathError("canonical model root changed")
+            _enforce_private_mode(
+                self.model_dir,
+                _PRIVATE_DIRECTORY_MODE,
+            )
 
             current = self.model_dir
             for component in relative.parts:
@@ -498,7 +559,7 @@ class ModelRegistry:
                     if not create:
                         return False
                     try:
-                        current.mkdir()
+                        current.mkdir(mode=_PRIVATE_DIRECTORY_MODE)
                     except FileExistsError:
                         pass
                     info = current.lstat()
@@ -510,6 +571,7 @@ class ModelRegistry:
                     raise UnsafeModelPathError(
                         f"model directory component escaped root: {component}"
                     )
+                _enforce_private_mode(current, _PRIVATE_DIRECTORY_MODE)
         except UnsafeModelPathError:
             raise
         except OSError as exc:
@@ -550,7 +612,8 @@ class ModelRegistry:
             / f"{key.target}.lock"
         )
         self._safe_directory(lock_path.parent, create=True)
-        return FileLock(lock_path)
+        _ensure_private_regular_file(lock_path)
+        return FileLock(lock_path, mode=_PRIVATE_FILE_MODE)
 
     @staticmethod
     def _fallback(reason: str) -> ModelLoadResult:
@@ -564,15 +627,16 @@ class ModelRegistry:
             return False
         try:
             info = generation_dir.lstat()
-            if (
-                generation_dir.parent != generation_root
-                or stat.S_ISLNK(info.st_mode)
-                or not stat.S_ISDIR(info.st_mode)
-                or generation_dir.resolve(strict=True) != generation_dir
-            ):
-                return False
-        except (FileNotFoundError, OSError):
+        except OSError:
             return False
+        if (
+            generation_dir.parent != generation_root
+            or stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or generation_dir.resolve(strict=True) != generation_dir
+        ):
+            return False
+        _enforce_private_mode(generation_dir, _PRIVATE_DIRECTORY_MODE)
         return True
 
     def _active_generation(self, key: ModelKey) -> Path:
@@ -653,12 +717,20 @@ class ModelRegistry:
             self._remove_generation_entry(key, obsolete)
 
     @staticmethod
-    def _reject_artifact_symlink(path: Path) -> None:
+    def _validate_artifact_path(path: Path) -> None:
         try:
-            if stat.S_ISLNK(path.lstat().st_mode):
-                raise UnsafeModelPathError("model artifact cannot be a symlink")
+            info = path.lstat()
         except FileNotFoundError:
             return
+        except OSError as exc:
+            raise UnsafeModelPathError(
+                "model artifact cannot be validated"
+            ) from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise UnsafeModelPathError(
+                "model artifact must be a regular file"
+            )
+        _enforce_private_mode(path, _PRIVATE_FILE_MODE)
 
     def _read_generation(
         self,
@@ -672,7 +744,7 @@ class ModelRegistry:
         metadata_path = generation_dir / "metadata.json"
         model_path = generation_dir / "model.joblib"
         for artifact_path in (manifest_path, metadata_path, model_path):
-            self._reject_artifact_symlink(artifact_path)
+            self._validate_artifact_path(artifact_path)
         try:
             manifest_bytes = manifest_path.read_bytes()
             manifest = json.loads(manifest_bytes.decode("utf-8"))
@@ -830,7 +902,8 @@ class ModelRegistry:
         token = uuid.uuid4().hex
         generation_name = f"{candidate.metadata.model_version}-{token}"
         generation_dir = generation_root / generation_name
-        generation_dir.mkdir()
+        generation_dir.mkdir(mode=_PRIVATE_DIRECTORY_MODE)
+        _enforce_private_mode(generation_dir, _PRIVATE_DIRECTORY_MODE)
         temp_model = generation_dir / f".model.{token}.tmp"
         temp_metadata = generation_dir / f".metadata.{token}.tmp"
         temp_manifest = generation_dir / f".manifest.{token}.tmp"
@@ -838,9 +911,11 @@ class ModelRegistry:
         final_metadata = generation_dir / "metadata.json"
         final_manifest = generation_dir / "manifest.json"
         temp_link = target_parent / f".{key.target}.{token}.tmp"
-        published = False
+        committed = False
         try:
+            _ensure_private_regular_file(temp_model)
             joblib.dump(candidate.bundle, temp_model, compress=3)
+            _enforce_private_mode(temp_model, _PRIVATE_FILE_MODE)
             with temp_model.open("rb") as stream:
                 os.fsync(stream.fileno())
             model_checksum = _sha256_path(temp_model)
@@ -879,24 +954,27 @@ class ModelRegistry:
             )
             os.symlink(relative_generation, temp_link, target_is_directory=True)
             os.replace(temp_link, target_dir)
-            published = True
+            committed = True
             try:
                 _fsync_directory(target_parent)
-            except OSError:
+            except Exception:
                 pass
             try:
                 self._prune_generations(key, generation_dir)
                 _fsync_directory(generation_root)
-            except OSError:
+            except Exception:
                 pass
             return active_metadata
         finally:
-            if temp_link.is_symlink() or temp_link.exists():
-                temp_link.unlink()
-            if not published:
+            try:
+                if temp_link.is_symlink() or temp_link.exists():
+                    temp_link.unlink()
+            except Exception:
+                pass
+            if not committed:
                 try:
                     self._remove_generation_entry(key, generation_dir)
-                except OSError:
+                except Exception:
                     pass
 
     def _publish_decision(

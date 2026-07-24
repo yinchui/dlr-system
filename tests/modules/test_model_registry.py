@@ -1,5 +1,7 @@
 import json
 import multiprocessing
+import os
+import stat
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -26,6 +28,14 @@ WEATHER_METRICS = {
     "corrected_mae": 1.0,
     "corrected_rmse": 1.5,
 }
+
+POSIX_ONLY = pytest.mark.skipif(
+    os.name != "posix", reason="POSIX permission semantics required"
+)
+
+
+def private_mode(path):
+    return stat.S_IMODE(Path(path).lstat().st_mode)
 
 
 def compatible_hashes(suffix="a"):
@@ -282,6 +292,7 @@ def test_registry_root_is_resolved_without_changing_key_layout(tmp_path):
 def test_configured_model_root_symlink_is_canonicalized_and_allowed(tmp_path):
     actual_root = tmp_path / "actual-models"
     actual_root.mkdir()
+    actual_root.chmod(0o777)
     configured_root = tmp_path / "configured-models"
     configured_root.symlink_to(actual_root, target_is_directory=True)
     registry = ModelRegistry(configured_root)
@@ -292,8 +303,138 @@ def test_configured_model_root_symlink_is_canonicalized_and_allowed(tmp_path):
     )
 
     assert registry.model_dir == actual_root.resolve()
+    if os.name == "posix":
+        assert private_mode(actual_root) == 0o700
     assert decision.promoted is True
     assert registry.path_for(key).is_relative_to(actual_root.resolve())
+
+
+@POSIX_ONLY
+def test_registry_persists_models_and_locks_with_private_permissions(
+    tmp_path,
+):
+    model_root = tmp_path / "models"
+    model_tower = model_root / "project-a" / "line-a" / "001"
+    generation_root = model_tower / ".wind_speed.generations"
+    lock_tower = model_root / ".locks" / "project-a" / "line-a" / "001"
+    generation_root.mkdir(parents=True)
+    lock_tower.mkdir(parents=True)
+    existing_directories = [
+        model_root,
+        model_root / "project-a",
+        model_root / "project-a" / "line-a",
+        model_tower,
+        generation_root,
+        model_root / ".locks",
+        model_root / ".locks" / "project-a",
+        model_root / ".locks" / "project-a" / "line-a",
+        lock_tower,
+    ]
+    for directory in existing_directories:
+        directory.chmod(0o777)
+
+    previous_umask = os.umask(0)
+    try:
+        registry = ModelRegistry(model_root)
+        key = ModelKey("project-a", "line-a", "001", "wind_speed")
+        decision = registry.promote(
+            model_candidate(key, evaluation_mode="full_fit")
+        )
+    finally:
+        os.umask(previous_umask)
+
+    assert decision.promoted is True
+    generation_dir = registry.path_for(key).parent.resolve(strict=True)
+    directories = [*existing_directories, generation_dir]
+    assert {private_mode(path) for path in directories} == {0o700}
+    artifacts = [
+        generation_dir / "model.joblib",
+        generation_dir / "metadata.json",
+        generation_dir / "manifest.json",
+    ]
+    assert {private_mode(path) for path in artifacts} == {0o600}
+    lock_path = lock_tower / "wind_speed.lock"
+    with registry._lock_for(key):
+        assert private_mode(lock_path) == 0o600
+
+
+@POSIX_ONLY
+def test_registry_rejects_public_root_when_permissions_cannot_be_tightened(
+    tmp_path, monkeypatch
+):
+    model_root = tmp_path / "models"
+    model_root.mkdir()
+    model_root.chmod(0o777)
+    real_chmod = model_registry.os.chmod
+
+    def leave_model_root_public(path, mode, *args, **kwargs):
+        if Path(path) == model_root:
+            return None
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(model_registry.os, "chmod", leave_model_root_public)
+
+    with pytest.raises(ValueError, match="model_dir"):
+        ModelRegistry(model_root)
+
+
+@POSIX_ONLY
+def test_promote_rejects_symlinked_lock_file_without_external_writes(
+    tmp_path,
+):
+    model_root = tmp_path / "models"
+    registry = ModelRegistry(model_root)
+    lock_tower = model_root / ".locks" / "project-a" / "line-a" / "001"
+    lock_tower.mkdir(parents=True)
+    outside_lock = tmp_path / "outside.lock"
+    outside_lock.write_text("must survive", encoding="utf-8")
+    (lock_tower / "wind_speed.lock").symlink_to(outside_lock)
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    decision = registry.promote(
+        model_candidate(key, evaluation_mode="full_fit")
+    )
+
+    assert decision.promoted is False
+    assert decision.reason == "unsafe_model_path"
+    assert outside_lock.read_text("utf-8") == "must survive"
+
+
+@POSIX_ONLY
+@pytest.mark.parametrize(
+    "entry_name",
+    ["generation_dir", "model.joblib", "metadata.json", "manifest.json"],
+)
+def test_load_rejects_public_generation_entry_when_mode_cannot_be_tightened(
+    tmp_path, monkeypatch, entry_name
+):
+    registry = ModelRegistry(tmp_path / "models")
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry.promote(model_candidate(key, evaluation_mode="full_fit"))
+    generation_dir = registry.path_for(key).parent.resolve(strict=True)
+    unsafe_path = (
+        generation_dir
+        if entry_name == "generation_dir"
+        else generation_dir / entry_name
+    )
+    unsafe_path.chmod(0o777 if unsafe_path.is_dir() else 0o666)
+    real_chmod = model_registry.os.chmod
+
+    def leave_generation_entry_public(path, mode, *args, **kwargs):
+        if Path(path) == unsafe_path:
+            return None
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(
+        model_registry.os, "chmod", leave_generation_entry_public
+    )
+
+    loaded = registry.load(
+        key, expected_compatibility=compatible_hashes()
+    )
+
+    assert loaded.bundle is None
+    assert loaded.fallback_reason == "unsafe_model_path"
 
 
 @pytest.mark.parametrize("symlink_component", ["project", "line", "tower"])
@@ -888,6 +1029,120 @@ def test_post_commit_parent_fsync_failure_keeps_new_active_generation(
     assert loaded.fallback_reason == ""
     assert loaded.metadata.model_version == "version-2"
     assert loaded.bundle.model.predict(np.zeros((1, 2))).tolist() == [0.9]
+
+
+@pytest.mark.parametrize("failure_point", ["prune", "parent_fsync"])
+def test_post_commit_runtime_error_still_reports_new_active_metadata(
+    tmp_path, monkeypatch, failure_point
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(
+        model_candidate(key, model_version="version-1", corrected_mae=1.0)
+    )
+    target_parent = registry.path_for(key).parent.parent
+
+    if failure_point == "prune":
+        def fail_prune(*args, **kwargs):
+            raise RuntimeError("simulated post-commit prune failure")
+
+        monkeypatch.setattr(registry, "_prune_generations", fail_prune)
+    else:
+        real_fsync = model_registry._fsync_directory
+
+        def fail_parent_fsync(path):
+            if Path(path) == target_parent:
+                raise RuntimeError("simulated post-commit fsync failure")
+            return real_fsync(path)
+
+        monkeypatch.setattr(model_registry, "_fsync_directory", fail_parent_fsync)
+
+    decision = registry.promote(
+        model_candidate(
+            key,
+            model_version="version-2",
+            corrected_mae=0.5,
+            model_value=0.9,
+        )
+    )
+
+    assert decision.promoted is True
+    assert decision.metadata.model_version == "version-2"
+    loaded = registry.load(
+        key, expected_compatibility=compatible_hashes()
+    )
+    assert loaded.fallback_reason == ""
+    assert loaded.metadata.model_version == "version-2"
+    assert loaded.bundle.model.predict(np.zeros((1, 2))).tolist() == [0.9]
+
+
+def test_post_commit_temp_cleanup_runtime_error_does_not_override_success(
+    tmp_path, monkeypatch
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(
+        model_candidate(key, model_version="version-1", corrected_mae=1.0)
+    )
+    real_exists = Path.exists
+    real_unlink = Path.unlink
+
+    def force_temp_link_exists(path):
+        if path.name.startswith(".wind_speed.") and path.name.endswith(".tmp"):
+            return True
+        return real_exists(path)
+
+    def fail_temp_link_cleanup(path, *args, **kwargs):
+        if path.name.startswith(".wind_speed.") and path.name.endswith(".tmp"):
+            raise RuntimeError("simulated post-commit temp cleanup failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", force_temp_link_exists)
+    monkeypatch.setattr(Path, "unlink", fail_temp_link_cleanup)
+
+    decision = registry.promote(
+        model_candidate(key, model_version="version-2", corrected_mae=0.5)
+    )
+
+    assert decision.promoted is True
+    assert decision.metadata.model_version == "version-2"
+    loaded = registry.load(
+        key, expected_compatibility=compatible_hashes()
+    )
+    assert loaded.metadata.model_version == "version-2"
+
+
+def test_pre_commit_runtime_error_fails_and_keeps_old_champion(
+    tmp_path, monkeypatch
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(
+        model_candidate(key, model_version="version-1", corrected_mae=1.0)
+    )
+    real_fsync = model_registry._fsync_directory
+
+    def fail_candidate_generation_fsync(path):
+        if Path(path).name.startswith("version-2-"):
+            raise RuntimeError("simulated pre-commit fsync failure")
+        return real_fsync(path)
+
+    monkeypatch.setattr(
+        model_registry,
+        "_fsync_directory",
+        fail_candidate_generation_fsync,
+    )
+
+    decision = registry.promote(
+        model_candidate(key, model_version="version-2", corrected_mae=0.5)
+    )
+
+    assert decision.promoted is False
+    assert decision.reason == "publish_failed:RuntimeError"
+    loaded = registry.load(
+        key, expected_compatibility=compatible_hashes()
+    )
+    assert loaded.metadata.model_version == "version-1"
 
 
 def test_first_candidate_must_improve_over_physical_baseline(tmp_path):

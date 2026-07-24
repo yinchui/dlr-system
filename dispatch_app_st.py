@@ -4,12 +4,13 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import requests
-from datetime import datetime, timedelta, date
+from datetime import datetime
 from thermal_functions import ThermalCalculator, EnvironmentGenerator, LineAnalyzer
 from modules.data_processor import normalize_weather_input_dataframe
+from modules.dlr_pipeline import DlrPipeline
 from modules import terrain as terrain_module
 from modules.weather_correction import CorrectionOptions, WeatherCorrectionService
+from modules.weather_upload import normalize_uploaded_weather_files
 import os
 
 
@@ -374,7 +375,7 @@ def convert_to_analysis_format(weather_data: dict, terrain_data: dict = None, nu
             winds_matrix[i, :] = np.clip(np.interp(times_new, times_to_use, wind_data), 0.1, 20)
             angles_matrix[i, :] = np.interp(times_new, times_to_use, angle_data) % 360
             elevations[i] = np.mean(elev_data)
-        except Exception as e:
+        except Exception:
             temps_matrix[i, :] = np.mean(temp_data)
             winds_matrix[i, :] = np.mean(wind_data)
             angles_matrix[i, :] = np.mean(angle_data)
@@ -387,7 +388,7 @@ def convert_to_analysis_format(weather_data: dict, terrain_data: dict = None, nu
             solar_array = np.clip(np.interp(times_new, times_orig, solar_orig), 0, 1500)
         else:
             solar_array = np.zeros(num_times)
-    except:
+    except Exception:
         solar_array = np.zeros(num_times)
 
     # 简单计算日出日落 (仅用于辅助逻辑)
@@ -399,7 +400,7 @@ def convert_to_analysis_format(weather_data: dict, terrain_data: dict = None, nu
             hours_only = times_new % 24
             sunrise = hours_only[day_mask][0]
             sunset = hours_only[day_mask][-1]
-    except:
+    except Exception:
         pass
 
     return {
@@ -416,6 +417,38 @@ def convert_to_analysis_format(weather_data: dict, terrain_data: dict = None, nu
         'sunrise': sunrise,
         'sunset': sunset
     }
+
+
+def calculate_legacy_line_data(
+    line_data, correction_config, conductor_params, progress_bar
+):
+    """保留旧矩阵调用兼容性；主页面计算按钮不再使用此入口。"""
+    # 应用气象修正
+    line_data = apply_weather_corrections(
+        line_data, correction_config, conductor_params
+    )
+    if any(
+        correction_config.get(key)
+        for key in ("vertical", "terrain", "desert", "wind_dir")
+    ):
+        progress_bar.progress(65)
+    progress_bar.progress(70)
+    calc_results = st.session_state.analyzer.calculate_max_current_for_points(
+        line_data['points_km'],
+        line_data['elevations'],
+        line_data['temps'],
+        line_data['winds'],
+        line_data['angles'],
+        line_data['solar'],
+        line_data['times'],
+        conductor_params['max_allow_temp'],
+        base_params=conductor_params,
+        terrain_data=None,
+    )
+    line_data['max_currents'] = calc_results['max_currents']
+    line_data['corrected_winds'] = calc_results['corrected_winds']
+    line_data['local_temps'] = calc_results['local_temps']
+    return line_data
 
 
 # ==============================================================================
@@ -552,6 +585,11 @@ with st.sidebar:
         if enable_ai_prediction:
             ai_confidence = st.slider("预测置信区间 (%)", 80, 99, 95)
             ai_lookback = st.number_input("历史回溯窗口（小时）", value=6, min_value=1, max_value=24)
+        truth_weather_files = st.file_uploader(
+            "上传真实气象数据",
+            type=["xlsx", "csv"],
+            accept_multiple_files=True,
+        )
 
     # 保存修正配置到 session_state
     st.session_state.correction_config = {
@@ -575,7 +613,7 @@ with st.sidebar:
 # 主界面
 # ==============================================================================
 st.title("DLR线路调度与分析系统 ")
-st.markdown("**数据源**: 实测气象数据 + SRTM地形修正 | **标准**: IEEE 738-2013")
+st.markdown("**数据源**: 实测气象数据 + SRTM地形修正 | **标准**: IEEE 738-2023")
 
 tab_line, tab_correction = st.tabs([
     " 1. 线路全景分析",
@@ -615,92 +653,89 @@ with tab_line:
         progress_bar = st.progress(0)
 
         try:
-            status_text.text("正在读取气象数据文件...")
-            df_weather = load_weather_data_from_files(weather_files)
+            status_text.text("正在规范化物理气象数据...")
+            physical_snapshot = normalize_uploaded_weather_files(
+                weather_files, role="physical"
+            )
+            truth_snapshot = (
+                normalize_uploaded_weather_files(
+                    truth_weather_files, role="truth"
+                )
+                if truth_weather_files
+                else None
+            )
 
-            if df_weather is None:
-                st.error("未能成功读取任何文件")
+            progress_bar.progress(30)
+            status_text.text("正在构建地形修正表...")
+            terrain_data = {}
+            if (
+                st.session_state.dem_data is not None
+                and st.session_state.tower_coords
+            ):
+                weather_positions = sorted(
+                    physical_snapshot.frame["tower_id"].astype(str).unique()
+                )
+                terrain_data = build_terrain_lookup(
+                    st.session_state.dem_data,
+                    st.session_state.tower_coords,
+                    weather_positions,
+                )
             else:
-                progress_bar.progress(20)
-                status_text.text("正在处理气象数据...")
+                st.warning("⚠️ 未加载地形数据，将使用气象文件海拔")
 
-                weather_data = process_weather_data(df_weather)
+            corr_cfg = st.session_state.get('correction_config', {})
+            options = CorrectionOptions(
+                enable_vertical=bool(corr_cfg.get('vertical', False)),
+                enable_terrain=bool(corr_cfg.get('terrain', False)),
+                enable_desert=bool(corr_cfg.get('desert', False)),
+                enable_wind_direction=bool(corr_cfg.get('wind_dir', False)),
+                ref_height_m=corr_cfg.get('anemometer_height', 10.0),
+                line_height_m=corr_cfg.get('conductor_height', 20.0),
+                roughness_alpha=corr_cfg.get('roughness_alpha', 0.15),
+                ground_albedo=corr_cfg.get('desert_albedo', 0.35),
+                ground_temp_offset=corr_cfg.get('ground_temp_offset', 15.0),
+                line_azimuth_deg=st.session_state.conductor_params.get(
+                    'line_azimuth', 90.0
+                ),
+            )
 
-                if weather_data:
-                    progress_bar.progress(40)
-                    status_text.text("正在构建地形修正表...")
+            progress_bar.progress(60)
+            status_text.text("正在修正气象并进行热平衡计算...")
+            pipeline = DlrPipeline()
+            result = pipeline.run(
+                physical=physical_snapshot,
+                truth=truth_snapshot,
+                project_id="shagehuang-dlr",
+                line_id="main-line",
+                interval_minutes=int(time_res),
+                terrain_lookup=terrain_data,
+                correction_options=options,
+                ai_enabled=bool(corr_cfg.get('ai_enabled', False)),
+                conductor=st.session_state.conductor_params,
+                truth_tolerance=pd.Timedelta(minutes=float(time_res)),
+            )
+            line_data = result.to_legacy_line_data()
+            if not any(
+                corr_cfg.get(key)
+                for key in ('vertical', 'terrain', 'desert', 'wind_dir')
+            ):
+                line_data['correction_details'] = None
 
-                    # 构建地形数据
-                    terrain_data = {}
-                    if st.session_state.dem_data and st.session_state.tower_coords:
-                        weather_positions = list(weather_data['positions'])
-                        terrain_data = build_terrain_lookup(
-                            st.session_state.dem_data,
-                            st.session_state.tower_coords,
-                            weather_positions
-                        )
-                        st.success(f"✓ 已应用地形修正 ({len(terrain_data)} 个杆塔)")
-                    else:
-                        st.warning("⚠️ 未加载地形数据，将使用无修正计算")
+            st.session_state.physical_weather_snapshot = physical_snapshot
+            st.session_state.truth_weather_snapshot = truth_snapshot
+            st.session_state.line_data = line_data
 
-                    progress_bar.progress(55)
-                    status_text.text("正在转换为分析格式...")
-
-                    num_times = int(24 * 60 / time_res) + 1
-                    line_data = convert_to_analysis_format(
-                        weather_data,
-                        terrain_data=terrain_data,
-                        num_times=num_times
-                    )
-
-                    if line_data:
-                        progress_bar.progress(65)
-                        status_text.text("正在应用气象修正...")
-
-                        # 应用气象修正
-                        corr_cfg = st.session_state.get('correction_config', {})
-                        line_data = apply_weather_corrections(
-                            line_data, corr_cfg, st.session_state.conductor_params
-                        )
-                        if any(corr_cfg.get(k) for k in ['vertical', 'terrain', 'desert', 'wind_dir']):
-                            enabled = [n for k, n in [
-                                ('vertical', '垂直'), ('terrain', '地形'),
-                                ('desert', '沙漠'), ('wind_dir', '风向')
-                            ] if corr_cfg.get(k)]
-                            st.success(f"✓ 已应用气象修正: {', '.join(enabled)}")
-                        else:
-                            line_data.pop('correction_details', None)
-
-                        progress_bar.progress(70)
-                        status_text.text("正在进行热平衡计算...")
-
-                        calc_results = st.session_state.analyzer.calculate_max_current_for_points(
-                            line_data['points_km'],
-                            line_data['elevations'],
-                            line_data['temps'],
-                            line_data['winds'],
-                            line_data['angles'],
-                            line_data['solar'],
-                            line_data['times'],  # 物理计算使用浮点小时
-                            st.session_state.conductor_params['max_allow_temp'],
-                            terrain_data=None
-                        )
-
-                        line_data['max_currents'] = calc_results['max_currents']
-                        line_data['corrected_winds'] = calc_results['corrected_winds']
-                        line_data['local_temps'] = calc_results['local_temps']
-
-                        st.session_state.line_data = line_data
-
-                        progress_bar.progress(100)
-                        status_text.text("计算完成！")
-
-                        if terrain_data:
-                            st.success(f"✓ 已应用SRTM地形修正，计算 {len(line_data['positions'])} 个杆塔")
-                        else:
-                            st.info(f"✓ 已完成计算 {len(line_data['positions'])} 个杆塔")
-
-                        progress_bar.empty()
+            progress_bar.progress(100)
+            status_text.text("计算完成！")
+            if terrain_data:
+                st.success(
+                    f"✓ 已应用SRTM地形修正，计算 {len(line_data['positions'])} 个杆塔"
+                )
+            else:
+                st.info(f"✓ 已完成计算 {len(line_data['positions'])} 个杆塔")
+            if corr_cfg.get('ai_enabled') and result.model_report.fallbacks:
+                st.warning("部分气象模型不可用，相关杆塔已回退到物理气象。")
+            progress_bar.empty()
 
         except Exception as e:
             st.error(f"处理流程出错: {e}")
@@ -928,17 +963,22 @@ with tab_correction:
                 st.divider()
                 st.markdown("##### 沙漠环境辐射修正")
 
+                selected_solar_orig = corr_details['solar_orig'][sel_corr_idx]
+                selected_solar = data['solar'][sel_corr_idx]
+                selected_solar_delta = corr_details['desert_solar_delta'][
+                    sel_corr_idx
+                ]
                 fig_solar_cmp = go.Figure()
                 fig_solar_cmp.add_trace(go.Scatter(
-                    x=plot_times, y=corr_details['solar_orig'],
+                    x=plot_times, y=selected_solar_orig,
                     name='原始太阳辐射', line=dict(color='orange', dash='dot', width=1)
                 ))
                 fig_solar_cmp.add_trace(go.Scatter(
-                    x=plot_times, y=data['solar'],
+                    x=plot_times, y=selected_solar,
                     name='修正后辐射（含反射+长波）', line=dict(color='red', width=2)
                 ))
                 fig_solar_cmp.add_trace(go.Scatter(
-                    x=plot_times, y=corr_details['desert_solar_delta'],
+                    x=plot_times, y=selected_solar_delta,
                     name='辐射增量', fill='tozeroy',
                     fillcolor='rgba(255,165,0,0.2)', line=dict(color='orange', width=1)
                 ))
@@ -951,9 +991,9 @@ with tab_correction:
                 st.plotly_chart(fig_solar_cmp, use_container_width=True)
 
                 sc1, sc2, sc3 = st.columns(3)
-                sc1.metric("原始平均辐射", f"{np.mean(corr_details['solar_orig']):.1f} W/m²")
-                sc2.metric("修正后平均辐射", f"{np.mean(data['solar']):.1f} W/m²")
-                sc3.metric("平均辐射增量", f"{np.mean(corr_details['desert_solar_delta']):.1f} W/m²")
+                sc1.metric("原始平均辐射", f"{np.mean(selected_solar_orig):.1f} W/m²")
+                sc2.metric("修正后平均辐射", f"{np.mean(selected_solar):.1f} W/m²")
+                sc3.metric("平均辐射增量", f"{np.mean(selected_solar_delta):.1f} W/m²")
 
             # ---- 修正因子热力图 ----
             st.divider()
@@ -1007,62 +1047,83 @@ with tab_correction:
         if not corr_cfg.get('ai_enabled', False):
             st.info('AI预测未启用。请在侧边栏「AI预测配置」中开启。')
         else:
-            st.caption(f"置信区间: {corr_cfg['ai_confidence']}% | 回溯窗口: {corr_cfg['ai_lookback']}小时")
+            comparison = data.get('comparison_weather')
+            metrics = data.get('weather_metrics')
+            model_report = data.get('model_report')
+            if isinstance(comparison, pd.DataFrame) and not comparison.empty:
+                tower_index = int(
+                    st.session_state.get("corr_tower_select", 0)
+                )
+                tower_index = min(tower_index, len(data['positions']) - 1)
+                tower_id = str(data['positions'][tower_index])
+                tower_weather = comparison.loc[
+                    comparison['tower_id'].astype(str) == tower_id
+                ].sort_values('timestamp', kind='mergesort')
+                tower_weather = tower_weather.loc[
+                    tower_weather['timestamp'].isin(plot_times)
+                ]
 
-            if 'max_currents' in data:
-                # 简化的AI残差预测演示
-                # 基于历史数据的统计特征生成预测区间
-                line_rating = np.min(data['max_currents'], axis=0)
-                n = len(line_rating)
-
-                # 滑动窗口统计
-                window = max(3, n // 10)
-                rating_series = pd.Series(line_rating)
-                rolling_mean = rating_series.rolling(window, center=True, min_periods=1).mean().values
-                rolling_std = rating_series.rolling(window, center=True, min_periods=1).std().fillna(0).values
-
-                # 置信区间
-                # 用查表法替代scipy.stats.norm.ppf
-                _z_table = {80: 1.282, 85: 1.440, 90: 1.645, 95: 1.960, 99: 2.576}
-                z_score = _z_table.get(int(corr_cfg['ai_confidence']), 1.960)
-                upper = rolling_mean + z_score * rolling_std
-                lower = rolling_mean - z_score * rolling_std
-
-                # 模拟残差预测修正
-                np.random.seed(42)
-                residual = np.random.normal(0, rolling_std * 0.3)
-                predicted = rolling_mean + residual
-
-                fig_ai = go.Figure()
+                fig_ai = make_subplots(specs=[[{"secondary_y": True}]])
                 fig_ai.add_trace(go.Scatter(
-                    x=plot_times, y=line_rating,
-                    name='物理模型计算值', line=dict(color='blue', width=2)
-                ))
+                    x=tower_weather['timestamp'],
+                    y=tower_weather['wind_speed_physical'],
+                    name='物理风速', line=dict(color='gray', dash='dot')
+                ), secondary_y=False)
                 fig_ai.add_trace(go.Scatter(
-                    x=plot_times, y=predicted,
-                    name='AI修正预测值', line=dict(color='green', width=2, dash='dash')
-                ))
+                    x=tower_weather['timestamp'],
+                    y=tower_weather['wind_speed_ai'],
+                    name='AI修正风速', line=dict(color='blue', width=2)
+                ), secondary_y=False)
+                if tower_weather['wind_speed_truth'].notna().any():
+                    fig_ai.add_trace(go.Scatter(
+                        x=tower_weather['timestamp'],
+                        y=tower_weather['wind_speed_truth'],
+                        name='真实风速', line=dict(color='green', width=2)
+                    ), secondary_y=False)
+
                 fig_ai.add_trace(go.Scatter(
-                    x=np.concatenate([plot_times, plot_times[::-1]]),
-                    y=np.concatenate([upper, lower[::-1]]),
-                    fill='toself', fillcolor='rgba(0,176,80,0.15)',
-                    line=dict(color='rgba(0,0,0,0)'),
-                    name=f'{corr_cfg["ai_confidence"]}% 置信区间'
-                ))
+                    x=tower_weather['timestamp'],
+                    y=tower_weather['ambient_temp_physical'],
+                    name='物理温度', line=dict(color='orange', dash='dot')
+                ), secondary_y=True)
+                fig_ai.add_trace(go.Scatter(
+                    x=tower_weather['timestamp'],
+                    y=tower_weather['ambient_temp_ai'],
+                    name='AI修正温度', line=dict(color='red', width=2)
+                ), secondary_y=True)
+                if tower_weather['ambient_temp_truth'].notna().any():
+                    fig_ai.add_trace(go.Scatter(
+                        x=tower_weather['timestamp'],
+                        y=tower_weather['ambient_temp_truth'],
+                        name='真实温度', line=dict(color='purple', width=2)
+                    ), secondary_y=True)
                 fig_ai.update_layout(
-                    title="AI残差预测 - 物理模型对比AI修正",
-                    xaxis_title="日期时间", yaxis_title="载流量 (A)",
-                    height=400, hovermode='x unified',
-                    xaxis=dict(tickformat="%Y-%m-%d\n%H:%M")
+                    title=f"塔位 {tower_id} - 气象物理值、AI修正值与真实值",
+                    height=400,
+                    hovermode='x unified',
+                    xaxis=dict(tickformat="%Y-%m-%d\n%H:%M"),
+                    legend=dict(orientation="h", y=1.12),
+                )
+                fig_ai.update_yaxes(
+                    title_text="风速 (m/s)", secondary_y=False
+                )
+                fig_ai.update_yaxes(
+                    title_text="温度 (°C)", secondary_y=True
                 )
                 st.plotly_chart(fig_ai, use_container_width=True)
 
-                # 预测精度统计
-                mae = np.mean(np.abs(predicted - line_rating))
-                rmse = np.sqrt(np.mean((predicted - line_rating) ** 2))
+                wind_mae = getattr(metrics, 'wind_speed_mae', None)
+                temp_mae = getattr(metrics, 'ambient_temp_mae', None)
+                active_models = getattr(model_report, 'active_model_count', 0)
                 ai1, ai2, ai3 = st.columns(3)
-                ai1.metric("平均绝对误差 (MAE)", f"{mae:.1f} A")
-                ai2.metric("均方根误差 (RMSE)", f"{rmse:.1f} A")
-                ai3.metric("平均置信区间宽度", f"{np.mean(upper - lower):.1f} A")
+                ai1.metric(
+                    "风速 MAE",
+                    f"{wind_mae:.3f} m/s" if wind_mae is not None else "--",
+                )
+                ai2.metric(
+                    "温度 MAE",
+                    f"{temp_mae:.3f} °C" if temp_mae is not None else "--",
+                )
+                ai3.metric("已启用模型数", str(active_models))
             else:
-                st.warning("请先完成线路全景分析计算。")
+                st.warning("当前结果没有可展示的气象对比数据。")

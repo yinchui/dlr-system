@@ -409,12 +409,8 @@ class ResidualPredictor:
         physical: np.ndarray,
         reason: str,
     ) -> pd.DataFrame:
-        final = physical.copy()
-        if target_name in PHYSICAL_BOUNDS:
-            lower, upper = PHYSICAL_BOUNDS[target_name]
-            final = np.clip(final, lower, upper)
         output[f"{target_name}_residual"] = np.zeros(len(output), dtype=float)
-        output[f"{target_name}_final"] = final
+        output[f"{target_name}_final"] = physical.copy()
         output["used_ai"] = False
         output["fallback_reason"] = reason
         return output

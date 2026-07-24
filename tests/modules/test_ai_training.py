@@ -243,6 +243,36 @@ def test_non_finite_holdout_prediction_is_recorded_and_uses_baseline():
     assert result.metrics["corrected_mae"] == result.metrics["baseline_mae"]
 
 
+def test_out_of_bounds_holdout_candidate_uses_physical_baseline_metrics():
+    frame = pd.DataFrame(
+        {
+            "line_id": ["line-a"] * 3,
+            "tower_id": ["001"] * 3,
+            "timestamp": pd.to_datetime(
+                [
+                    "2025-01-01 00:00",
+                    "2025-01-01 00:30",
+                    "2025-01-02 00:00",
+                ],
+                utc=True,
+            ),
+            "source_file_hash": ["physical-a"] * 3,
+            "wind_speed_local": [10.0, 11.0, 74.0],
+            "wind_speed_truth": [14.0, 17.0, 74.0],
+        }
+    )
+
+    result = ResidualTrainer(
+        estimator_factory=lambda: FixedResidualEstimator(5.0)
+    ).train_target(frame, target="wind_speed")
+
+    assert result.metadata["evaluation_fallback_reason"] == (
+        "physical_bounds_exceeded"
+    )
+    assert result.metrics["baseline_mae"] == 0.0
+    assert result.metrics["corrected_mae"] == 0.0
+
+
 def test_trained_bundle_clips_residual_and_weather_per_tower():
     frame = make_training_frame(
         residuals=(-2.0, -1.0, 1.0, 2.0),

@@ -447,6 +447,34 @@ def test_predictor_returns_valid_physical_value_after_prediction_fallback():
     assert predicted.loc[0, "wind_speed_final"] == 70.0
 
 
+def test_all_fallback_paths_return_the_exact_input_physical_value():
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2025-12-10 00:00"]),
+            "wind_speed_local": [80.0],
+        }
+    )
+    unavailable = ResidualPredictor().predict(
+        frame, target_name="wind_speed", physical_col="wind_speed_local"
+    )
+    non_finite = ResidualPredictor(
+        {
+            "wind_speed": ModelBundle(
+                target_name="wind_speed",
+                feature_columns=["wind_speed_local"],
+                model=SequenceModel([np.nan]),
+            )
+        }
+    ).predict(
+        frame, target_name="wind_speed", physical_col="wind_speed_local"
+    )
+
+    assert unavailable.loc[0, "wind_speed_final"] == 80.0
+    assert non_finite.loc[0, "wind_speed_final"] == 80.0
+    assert unavailable.loc[0, "used_ai"] == False
+    assert non_finite.loc[0, "used_ai"] == False
+
+
 def test_predictor_rejects_invalid_timestamp_before_model_fallback():
     frame = pd.DataFrame(
         {"timestamp": ["not-a-time"], "wind_speed_local": [3.0]}

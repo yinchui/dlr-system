@@ -279,9 +279,19 @@ class ResidualTrainer:
         with np.errstate(over="ignore", invalid="ignore"):
             corrected = physical + residual
         valid = finite & np.isfinite(corrected)
-        corrected[~valid] = physical[~valid]
         lower, upper = PHYSICAL_BOUNDS[target]
-        corrected = np.clip(corrected, lower, upper)
+        bounds_exceeded = valid & (
+            (corrected < lower) | (corrected > upper)
+        )
+        valid &= ~bounds_exceeded
+        corrected[~valid] = physical[~valid]
+        if bounds_exceeded.any():
+            if fallback_reason:
+                fallback_reason = (
+                    f"{fallback_reason};physical_bounds_exceeded"
+                )
+            else:
+                fallback_reason = "physical_bounds_exceeded"
         return corrected, fallback_reason
 
     @staticmethod

@@ -1178,8 +1178,18 @@ class ModelRegistry:
             raise TypeError("attempt must be a ModelAttempt")
         try:
             with self._lock_for(attempt.key):
+                current = self._load_current_locked(attempt.key)
+                champion = (
+                    current.metadata if current.bundle is not None else None
+                )
+                current_attempt = replace(
+                    attempt,
+                    champion_context_hash=self._champion_context_hash(
+                        champion
+                    ),
+                )
                 return any(
-                    entry["fingerprint"] == attempt.fingerprint
+                    entry["fingerprint"] == current_attempt.fingerprint
                     for entry in self._read_attempt_ledger_locked(attempt.key)
                 )
         except Exception:

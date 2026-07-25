@@ -2813,6 +2813,42 @@ def test_cross_contract_candidate_cannot_replace_better_locked_champion(tmp_path
     assert loaded.metadata.metrics["corrected_mae"] == 0.5
 
 
+def test_cross_contract_rejection_cache_uses_locked_champion_context(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    better = model_candidate(
+        key,
+        model_version="better-contract-a",
+        corrected_mae=0.5,
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+        training_contract_hash="a" * 64,
+    )
+    worse = model_candidate(
+        key,
+        model_version="worse-contract-b",
+        corrected_mae=1.5,
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+        training_contract_hash="b" * 64,
+    )
+    attempt = model_attempt(
+        registry,
+        key,
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+        training_contract_hash="b" * 64,
+        champion=None,
+    )
+    assert registry.promote(better).promoted is True
+
+    decision = registry.promote(worse, attempt=attempt)
+
+    assert decision.promoted is False
+    assert decision.reason == "insufficient_mae_improvement"
+    assert registry.was_rejected(attempt) is True
+
+
 def test_file_lock_serializes_competing_promotions_across_processes(tmp_path):
     key = ModelKey("project-a", "line-a", "001", "wind_speed")
     registry = ModelRegistry(tmp_path)

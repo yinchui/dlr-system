@@ -9,6 +9,7 @@ import pytest
 from affine import Affine
 from pyproj import CRS
 from rasterio.coords import BoundingBox
+from xgboost import XGBRegressor
 
 import modules.ai_training as ai_training
 from modules import dlr_pipeline as dlr_pipeline_module
@@ -975,6 +976,196 @@ def _weather_with_additional_segment(
         kind="mergesort",
         ignore_index=True,
     )
+
+
+def _sealed_poor_generalization_run_kwargs():
+    physical = _weather_with_additional_segment(
+        "physical",
+        segment_count=3,
+    )
+    truth = _weather_with_additional_segment(
+        "truth",
+        segment_count=3,
+    )
+    residual_patterns = {
+        "wind_speed": np.array([1.0, 2.0, 1.5, 2.5]),
+        "ambient_temp": np.array([2.0, 3.0, 1.0, 2.5]),
+    }
+    for segment_index in range(3):
+        segment_rows = truth["source_file_hash"].eq(
+            f"truth-source-{segment_index}"
+        )
+        direction = 1.0 if segment_index < 2 else -1.0
+        for target, pattern in residual_patterns.items():
+            truth.loc[segment_rows, target] = (
+                truth.loc[segment_rows, target].to_numpy(dtype=float)
+                + direction * pattern
+            )
+    return {
+        "physical": physical,
+        "truth": truth,
+        "project_id": "project-a",
+        "line_id": "line-a",
+        "terrain_lookup": {},
+        "correction_options": CorrectionOptions(
+            enable_vertical=False,
+            enable_terrain=False,
+            enable_desert=False,
+            enable_wind_direction=False,
+        ),
+        "ai_enabled": True,
+        "conductor": _conductor(),
+        "truth_tolerance": "5min",
+    }
+
+
+def _assert_one_physical_fallback_per_key(result, expected_keys):
+    assert result.model_report.trained_targets == ()
+    assert result.model_report.used_targets == ()
+    assert tuple(
+        fallback.key for fallback in result.model_report.fallbacks
+    ) == expected_keys
+    assert not result.comparison_weather[
+        ["wind_speed_used_ai", "ambient_temp_used_ai"]
+    ].to_numpy(dtype=bool).any()
+    assert result.max_currents.size > 0
+    assert np.isfinite(result.max_currents).all()
+
+
+def test_nonpersistent_sealed_xgboost_rejects_poor_generalization(tmp_path):
+    model_root = tmp_path / "models"
+    pipeline = DlrPipeline(model_root=model_root)
+
+    result = pipeline.run(
+        **_sealed_poor_generalization_run_kwargs(),
+        model_persistence_allowed=False,
+    )
+
+    expected_keys = _expected_pipeline_model_keys()
+    _assert_one_physical_fallback_per_key(result, expected_keys)
+    assert tuple(
+        fallback.reason for fallback in result.model_report.fallbacks
+    ) == ("candidate_not_better_than_physical",) * 4
+    assert result.model_report.promotion_decisions == ()
+    assert pipeline.registry is None
+    assert not model_root.exists()
+
+
+def test_first_sealed_xgboost_rejection_is_cached_without_duplicate_fallbacks(
+    tmp_path,
+    monkeypatch,
+):
+    registry = ModelRegistry(tmp_path / "models")
+    promoted_candidates = []
+    original_promote = registry.promote
+
+    def recording_promote(candidate, *, attempt=None):
+        promoted_candidates.append(candidate)
+        return original_promote(candidate, attempt=attempt)
+
+    monkeypatch.setattr(registry, "promote", recording_promote)
+    pipeline = DlrPipeline(registry=registry)
+    run_kwargs = _sealed_poor_generalization_run_kwargs()
+    expected_keys = _expected_pipeline_model_keys()
+
+    first = pipeline.run(**run_kwargs)
+
+    assert [
+        (decision.key, decision.promoted, decision.reason)
+        for decision in first.model_report.promotion_decisions
+    ] == [
+        (key, False, "candidate_not_better_than_physical")
+        for key in expected_keys
+    ]
+    _assert_one_physical_fallback_per_key(first, expected_keys)
+    assert len(promoted_candidates) == 4
+    assert all(
+        type(candidate.bundle.model) is XGBRegressor
+        for candidate in promoted_candidates
+    )
+    assert all(
+        candidate.metadata.training_outcome == "trained"
+        for candidate in promoted_candidates
+    )
+    assert all(
+        candidate.metadata.metrics["corrected_mae"]
+        >= candidate.metadata.metrics["baseline_mae"]
+        for candidate in promoted_candidates
+    )
+    sidecar_bytes = {}
+    for key in expected_keys:
+        sidecar = registry.attempt_path_for(key)
+        entries = json.loads(sidecar.read_text(encoding="utf-8"))["entries"]
+        assert len(entries) == 1
+        assert entries[0]["reason"] == "candidate_not_better_than_physical"
+        assert not registry.path_for(key).exists()
+        sidecar_bytes[key] = sidecar.read_bytes()
+
+    repeated = pipeline.run(**run_kwargs)
+
+    _assert_one_physical_fallback_per_key(repeated, expected_keys)
+    assert repeated.model_report.promotion_decisions == ()
+    assert len(promoted_candidates) == 4
+    assert all(
+        registry.attempt_path_for(key).read_bytes() == sidecar_bytes[key]
+        for key in expected_keys
+    )
+
+
+def test_sealed_rejection_cache_invalidates_when_estimator_contract_changes(
+    tmp_path,
+    monkeypatch,
+):
+    registry = ModelRegistry(tmp_path / "models")
+    run_kwargs = _sealed_poor_generalization_run_kwargs()
+    expected_keys = _expected_pipeline_model_keys()
+
+    first = DlrPipeline(registry=registry).run(**run_kwargs)
+    first_sidecars = {
+        key: registry.attempt_path_for(key).read_bytes()
+        for key in expected_keys
+    }
+    first_entries = {
+        key: json.loads(first_sidecars[key].decode("utf-8"))["entries"][0]
+        for key in expected_keys
+    }
+    changed_parameters = tuple(
+        (
+            name,
+            value + 1 if name == "n_estimators" else value,
+        )
+        for name, value in ai_training._DEFAULT_ESTIMATOR_PARAMETERS
+    )
+    monkeypatch.setattr(
+        ai_training,
+        "_DEFAULT_ESTIMATOR_PARAMETERS",
+        changed_parameters,
+    )
+
+    retried = DlrPipeline(registry=registry).run(**run_kwargs)
+
+    assert [
+        (decision.key, decision.promoted, decision.reason)
+        for decision in retried.model_report.promotion_decisions
+    ] == [
+        (key, False, "candidate_not_better_than_physical")
+        for key in expected_keys
+    ]
+    _assert_one_physical_fallback_per_key(first, expected_keys)
+    _assert_one_physical_fallback_per_key(retried, expected_keys)
+    for key in expected_keys:
+        sidecar = registry.attempt_path_for(key)
+        entries = json.loads(sidecar.read_text(encoding="utf-8"))["entries"]
+        assert len(entries) == 2
+        assert sidecar.read_bytes() != first_sidecars[key]
+        assert entries[0] == first_entries[key]
+        assert entries[1]["reason"] == "candidate_not_better_than_physical"
+        assert entries[1]["fingerprint"] != entries[0]["fingerprint"]
+        assert (
+            entries[1]["training_contract_hash"]
+            != entries[0]["training_contract_hash"]
+        )
+        assert not registry.path_for(key).exists()
 
 
 def test_custom_trainer_does_not_taint_compatible_sealed_models(tmp_path):

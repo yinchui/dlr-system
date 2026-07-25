@@ -71,6 +71,44 @@ class SagValidationSnapshot:
             raise ValueError("source_run_id must be a non-empty string")
         if not self.tower_ids or not self.timestamps:
             raise ValueError("snapshot axes cannot be empty")
+        tower_ids = tuple(str(value) for value in self.tower_ids)
+        timestamps = tuple(_deep_freeze(value) for value in self.timestamps)
+        if len(set(tower_ids)) != len(tower_ids):
+            raise ValueError("snapshot tower IDs must be unique")
+        object.__setattr__(self, "tower_ids", tower_ids)
+        object.__setattr__(self, "timestamps", timestamps)
+        object.__setattr__(self, "coordinates", _deep_freeze(self.coordinates))
+        object.__setattr__(
+            self, "conductor_params", _deep_freeze(self.conductor_params)
+        )
+        expected_shape = (len(tower_ids), len(timestamps))
+        for name in (
+            "original_currents",
+            "ambient_temperatures",
+            "wind_speeds",
+            "wind_angles",
+            "solar_radiation",
+            "elevations",
+        ):
+            array = np.asarray(getattr(self, name), dtype=float)
+            if array.shape != expected_shape or not np.isfinite(array).all():
+                raise ValueError(f"{name} must be a finite snapshot matrix")
+            if name == "original_currents" and (array < 0.0).any():
+                raise ValueError("original_currents must be non-negative")
+            object.__setattr__(self, name, _frozen_matrix(array.copy()))
+        if self.operating_currents is not None:
+            operating = np.asarray(self.operating_currents, dtype=float)
+            if (
+                operating.shape != expected_shape
+                or not np.isfinite(operating).all()
+                or (operating < 0.0).any()
+            ):
+                raise ValueError(
+                    "operating_currents must be a finite non-negative matrix"
+                )
+            object.__setattr__(
+                self, "operating_currents", _frozen_matrix(operating.copy())
+            )
 
 
 @dataclass(frozen=True)
@@ -198,13 +236,16 @@ def normalize_inclination_dataframe(
     if timestamp_column is None:
         if len(output) == len(snapshot.timestamps):
             output["timestamp"] = list(snapshot.timestamps)
+            output["timestamp_source"] = "snapshot"
         else:
             output["timestamp"] = output["sample_index"]
+            output["timestamp_source"] = "sequence"
     else:
         timezone = _snapshot_timezone(snapshot)
         output["timestamp"] = output[timestamp_column].map(
             lambda value: _parse_timestamp(value, timezone)
         )
+        output["timestamp_source"] = "measured"
     return output
 
 
@@ -454,6 +495,8 @@ def _sample_indices(
     for index, candidate in enumerate(snapshot.timestamps):
         if timestamp == candidate:
             return tower_index, index
+    if row.get("timestamp_source") == "measured":
+        return tower_index, None
     sample_index = row.get("sample_index")
     if isinstance(sample_index, (int, np.integer)) and 0 <= int(sample_index) < len(
         snapshot.timestamps
@@ -463,7 +506,7 @@ def _sample_indices(
         snapshot.timestamps
     ):
         return tower_index, int(timestamp)
-    return tower_index, 0
+    return tower_index, None
 
 
 def _weather_at(

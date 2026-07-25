@@ -6,6 +6,7 @@ import pytest
 
 from modules.sag_validation import (
     ParameterSource,
+    SagValidationSnapshot,
     build_sag_snapshot,
     normalize_inclination_dataframe,
     resolve_sag_parameters,
@@ -56,6 +57,27 @@ def test_explicit_tower_and_timestamp_are_preserved():
 
     assert result.loc[0, "tower_id"] == "002"
     assert result.loc[0, "timestamp"] == expected_time
+
+
+def test_explicit_timestamp_outside_snapshot_is_not_reassigned_by_row_position():
+    normalized = normalize_inclination_dataframe(
+        pd.DataFrame(
+            {
+                "杆塔": ["001号"],
+                "时间": ["2026-07-24 00:00+08:00"],
+                "倾角": [1.0],
+            }
+        ),
+        selected_tower_id="001",
+        snapshot=_snapshot(),
+    )
+
+    with pytest.raises(ValueError, match="does not match"):
+        resolve_sag_parameters(
+            inclination_row=normalized.iloc[0],
+            snapshot=_snapshot(),
+            conductor=drake_conductor(),
+        )
 
 
 def test_missing_timestamp_with_different_length_uses_stable_sample_index():
@@ -226,6 +248,36 @@ def test_snapshot_does_not_alias_main_arrays_or_nested_mappings():
         snapshot.conductor_params["area_m2"] = 0.0
     with pytest.raises(FrozenInstanceError):
         snapshot.source_run_id = "changed"
+
+
+def test_direct_snapshot_constructor_freezes_mutable_inputs():
+    coordinates = {"001": {"lon": 120.0, "lat": 40.0}}
+    conductor = {"area_m2": 4.685e-4, "materials": [{"mass": 1.0}]}
+    currents = [[1000.0]]
+    common_matrix = ((1.0,),)
+
+    snapshot = SagValidationSnapshot(
+        source_run_id="run-direct",
+        tower_ids=("001",),
+        timestamps=(0,),
+        coordinates=coordinates,
+        conductor_params=conductor,
+        original_currents=currents,
+        ambient_temperatures=common_matrix,
+        wind_speeds=common_matrix,
+        wind_angles=common_matrix,
+        solar_radiation=common_matrix,
+        elevations=common_matrix,
+    )
+    coordinates["001"]["lon"] = -1.0
+    conductor["materials"][0]["mass"] = -1.0
+    currents[0][0] = -1.0
+
+    assert snapshot.coordinates["001"]["lon"] == 120.0
+    assert snapshot.conductor_params["materials"][0]["mass"] == 1.0
+    assert snapshot.original_currents[0][0] == 1000.0
+    with pytest.raises(TypeError):
+        snapshot.coordinates["001"]["lon"] = 0.0
 
 
 def test_snapshot_rejects_mismatched_rating_shape():

@@ -1,9 +1,11 @@
+import hashlib
 import json
 import multiprocessing
 import os
 import stat
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -28,6 +30,9 @@ WEATHER_METRICS = {
     "corrected_mae": 1.0,
     "corrected_rmse": 1.5,
 }
+SEALED_BACKEND_ID = "xgboost-residual-v1"
+LEGACY_BACKEND_ID = "legacy-training-backend-v0"
+DEFAULT_TRAINING_CONTRACT_HASH = "c" * 64
 
 POSIX_ONLY = pytest.mark.skipif(
     os.name != "posix", reason="POSIX permission semantics required"
@@ -57,7 +62,8 @@ def model_metadata(
     corrected_mae=1.0,
     evaluation_set_hash="evaluation-a",
     input_data_hash="input-a",
-    training_contract_hash="c" * 64,
+    training_contract_hash=DEFAULT_TRAINING_CONTRACT_HASH,
+    backend_id=SEALED_BACKEND_ID,
     compatibility=None,
 ):
     metrics = dict(WEATHER_METRICS, corrected_mae=corrected_mae)
@@ -90,6 +96,7 @@ def model_metadata(
         dependency_versions={"python": "3.11", "joblib": "1.5.3"},
         cadence_minutes=30.0,
         training_contract_hash=training_contract_hash,
+        backend_id=backend_id,
     )
 
 
@@ -123,6 +130,7 @@ def model_candidate(key, *, model_value=0.5, **metadata_options):
         metadata={
             "training_contract": "task-9",
             "training_contract_hash": metadata.training_contract_hash,
+            "backend_id": metadata.backend_id,
         },
     )
     return ModelCandidate(key=key, bundle=bundle, metadata=metadata)
@@ -146,6 +154,34 @@ def model_attempt(
         feature_version=feature_version,
         champion=champion,
     )
+
+
+def load_model(
+    registry,
+    key,
+    *,
+    compatibility=None,
+    training_contract_hash=DEFAULT_TRAINING_CONTRACT_HASH,
+    backend_id=SEALED_BACKEND_ID,
+):
+    return registry.load(
+        key,
+        expected_compatibility=compatibility or compatible_hashes(),
+        expected_training_contract_hash=training_contract_hash,
+        expected_backend_id=backend_id,
+    )
+
+
+def rewrite_persisted_metadata(registry, key, transform):
+    metadata_path = registry.metadata_path_for(key)
+    manifest_path = registry.manifest_path_for(key)
+    payload = json.loads(metadata_path.read_text("utf-8"))
+    transform(payload)
+    metadata_bytes = model_registry._json_bytes(payload)
+    metadata_path.write_bytes(metadata_bytes)
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    manifest["metadata_checksum"] = hashlib.sha256(metadata_bytes).hexdigest()
+    manifest_path.write_bytes(model_registry._json_bytes(manifest))
 
 
 def training_frame():
@@ -195,9 +231,7 @@ def _process_promote_worker(
 
 def _loaded_model_snapshot(model_dir):
     key = ModelKey("project-a", "line-a", "001", "wind_speed")
-    loaded = ModelRegistry(model_dir).load(
-        key, expected_compatibility=compatible_hashes()
-    )
+    loaded = load_model(ModelRegistry(model_dir), key)
     if loaded.bundle is None:
         return (None, None, loaded.fallback_reason)
     prediction = loaded.bundle.model.predict(np.zeros((1, 2))).item()
@@ -455,9 +489,7 @@ def test_load_rejects_public_generation_entry_when_mode_cannot_be_tightened(
         model_registry.os, "chmod", leave_generation_entry_public
     )
 
-    loaded = registry.load(
-        key, expected_compatibility=compatible_hashes()
-    )
+    loaded = load_model(registry, key)
 
     assert loaded.bundle is None
     assert loaded.fallback_reason == "unsafe_model_path"
@@ -545,9 +577,7 @@ def test_load_rejects_key_ancestor_symlink_to_external_bundle(tmp_path):
     project_dir.rename(moved_project)
     project_dir.symlink_to(moved_project, target_is_directory=True)
 
-    loaded = registry.load(
-        key, expected_compatibility=compatible_hashes()
-    )
+    loaded = load_model(registry, key)
 
     assert loaded.bundle is None
     assert loaded.fallback_reason == "unsafe_model_path"
@@ -567,9 +597,7 @@ def test_load_rejects_generation_root_symlink_to_external_bundle(tmp_path):
     generation_root.rmdir()
     generation_root.symlink_to(outside, target_is_directory=True)
 
-    loaded = registry.load(
-        key, expected_compatibility=compatible_hashes()
-    )
+    loaded = load_model(registry, key)
 
     assert loaded.bundle is None
     assert loaded.fallback_reason == "unsafe_model_path"
@@ -622,6 +650,32 @@ def test_legacy_metadata_without_training_contract_hash_remains_loadable():
     restored = ModelMetadata.from_dict(payload)
 
     assert restored.training_contract_hash == "legacy-training-contract-v0"
+
+
+def test_legacy_metadata_without_backend_id_receives_migration_sentinel():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    payload = model_metadata(key).to_dict()
+    payload.pop("backend_id")
+
+    restored = ModelMetadata.from_dict(payload)
+
+    assert restored.backend_id == LEGACY_BACKEND_ID
+
+
+def test_serialized_metadata_cannot_claim_the_legacy_backend_id():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    payload = model_metadata(key).to_dict()
+    payload["backend_id"] = LEGACY_BACKEND_ID
+
+    with pytest.raises(ValueError, match="legacy.*backend"):
+        ModelMetadata.from_dict(payload)
+
+
+def test_new_metadata_cannot_claim_the_legacy_backend_id():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    with pytest.raises(ValueError, match="legacy.*backend"):
+        model_metadata(key, backend_id=LEGACY_BACKEND_ID)
 
 
 def test_new_metadata_cannot_claim_the_legacy_training_contract():
@@ -678,9 +732,7 @@ def test_first_full_fit_candidate_is_saved_as_provisional_and_reloads(tmp_path):
     assert registry.metadata_path_for(key).is_file()
     assert registry.manifest_path_for(key).is_file()
 
-    loaded = ModelRegistry(tmp_path).load(
-        key, expected_compatibility=compatible_hashes()
-    )
+    loaded = load_model(ModelRegistry(tmp_path), key)
     assert loaded.fallback_reason == ""
     assert loaded.bundle is not None
     assert loaded.metadata is not None
@@ -722,9 +774,7 @@ def test_independent_candidate_promotes_from_full_fit_provisional(
     assert decision.promoted is True
     assert decision.reason == "promoted_from_provisional"
     assert decision.metadata.status == "active"
-    loaded = registry.load(
-        key, expected_compatibility=compatible_hashes()
-    )
+    loaded = load_model(registry, key)
     assert loaded.fallback_reason == ""
     assert loaded.metadata.model_version == "version-2"
     assert loaded.metadata.status == "active"
@@ -779,6 +829,40 @@ def test_provisional_replacement_rejects_model_version_conflict(tmp_path):
     assert decision.reason == "model_version_conflict"
 
 
+def test_promote_replaces_champion_outside_candidate_sealed_contract(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(
+        model_candidate(
+            key,
+            model_version="same-version",
+            input_data_hash="same-input",
+            training_contract_hash="a" * 64,
+            backend_id="xgboost-residual-v0",
+            model_value=0.5,
+        )
+    )
+
+    decision = registry.promote(
+        model_candidate(
+            key,
+            model_version="same-version",
+            input_data_hash="same-input",
+            training_contract_hash="b" * 64,
+            backend_id=SEALED_BACKEND_ID,
+            model_value=0.9,
+        )
+    )
+
+    assert decision.promoted is True
+    loaded = load_model(
+        registry,
+        key,
+        training_contract_hash="b" * 64,
+    )
+    assert loaded.bundle.model.predict(np.zeros((1, 2))).tolist() == [0.9]
+
+
 def test_persisted_metadata_contains_required_scope_hashes_and_checksum(tmp_path):
     key = ModelKey("project-a", "line-a", "001", "ambient_temp")
     registry = ModelRegistry(tmp_path)
@@ -797,6 +881,7 @@ def test_persisted_metadata_contains_required_scope_hashes_and_checksum(tmp_path
     assert payload["full_fit_metrics"] == WEATHER_METRICS
     assert payload["status"] == "active_provisional"
     assert payload["training_contract_hash"] == "c" * 64
+    assert payload["backend_id"] == SEALED_BACKEND_ID
     assert len(payload["checksum"]) == 64
     assert payload["dem_hash"] == "dem-a"
     assert payload["correction_config_hash"] == "correction-a"
@@ -826,9 +911,7 @@ def test_full_fit_cannot_replace_existing_champion(tmp_path):
 
     assert decision.promoted is False
     assert decision.reason == "full_fit_cannot_replace_champion"
-    loaded = registry.load(
-        key, expected_compatibility=compatible_hashes()
-    )
+    loaded = load_model(registry, key)
     assert loaded.metadata.model_version == "version-1"
 
 
@@ -926,9 +1009,7 @@ def test_candidate_with_same_evaluation_set_and_enough_improvement_is_active(
     assert decision.promoted is True
     assert decision.reason == "promoted"
     assert decision.metadata.status == "active"
-    loaded = registry.load(
-        key, expected_compatibility=compatible_hashes()
-    )
+    loaded = load_model(registry, key)
     assert loaded.metadata.model_version == "version-2"
     assert loaded.metadata.metrics["corrected_mae"] == 0.7
 
@@ -1079,9 +1160,7 @@ def test_post_commit_parent_fsync_failure_keeps_new_active_generation(
     )
 
     assert decision.promoted is True
-    loaded = registry.load(
-        key, expected_compatibility=compatible_hashes()
-    )
+    loaded = load_model(registry, key)
     assert loaded.fallback_reason == ""
     assert loaded.metadata.model_version == "version-2"
     assert loaded.bundle.model.predict(np.zeros((1, 2))).tolist() == [0.9]
@@ -1124,9 +1203,7 @@ def test_post_commit_runtime_error_still_reports_new_active_metadata(
 
     assert decision.promoted is True
     assert decision.metadata.model_version == "version-2"
-    loaded = registry.load(
-        key, expected_compatibility=compatible_hashes()
-    )
+    loaded = load_model(registry, key)
     assert loaded.fallback_reason == ""
     assert loaded.metadata.model_version == "version-2"
     assert loaded.bundle.model.predict(np.zeros((1, 2))).tolist() == [0.9]
@@ -1162,9 +1239,7 @@ def test_post_commit_temp_cleanup_runtime_error_does_not_override_success(
 
     assert decision.promoted is True
     assert decision.metadata.model_version == "version-2"
-    loaded = registry.load(
-        key, expected_compatibility=compatible_hashes()
-    )
+    loaded = load_model(registry, key)
     assert loaded.metadata.model_version == "version-2"
 
 
@@ -1195,9 +1270,7 @@ def test_pre_commit_runtime_error_fails_and_keeps_old_champion(
 
     assert decision.promoted is False
     assert decision.reason == "publish_failed:RuntimeError"
-    loaded = registry.load(
-        key, expected_compatibility=compatible_hashes()
-    )
+    loaded = load_model(registry, key)
     assert loaded.metadata.model_version == "version-1"
 
 
@@ -1300,7 +1373,7 @@ def test_rejection_sidecar_preserves_active_and_historical_generations(tmp_path)
     registry.promote(
         model_candidate(key, model_version="version-2", corrected_mae=0.5)
     )
-    loaded = registry.load(key, expected_compatibility=compatible_hashes())
+    loaded = load_model(registry, key)
     target_dir = registry.path_for(key).parent
     generation_root = target_dir.parent / ".wind_speed.generations"
     generations_before = {path.name for path in generation_root.iterdir()}
@@ -1330,7 +1403,7 @@ def test_rejection_sidecar_preserves_active_and_historical_generations(tmp_path)
         decision = registry.promote(candidate, attempt=attempt)
         assert decision.reason == "candidate_not_better_than_physical"
 
-    reloaded = registry.load(key, expected_compatibility=compatible_hashes())
+    reloaded = load_model(registry, key)
     assert {path.name for path in generation_root.iterdir()} == generations_before
     assert os.readlink(target_dir) == active_pointer_before
     assert {
@@ -1382,7 +1455,7 @@ def test_operational_rejection_and_attempt_write_failure_remain_retryable(
     registry.promote(
         model_candidate(key, model_version="version-1", corrected_mae=1.0)
     )
-    champion = registry.load(key, expected_compatibility=compatible_hashes()).metadata
+    champion = load_model(registry, key).metadata
     conflict = model_candidate(
         key,
         model_version="version-1",
@@ -1436,14 +1509,12 @@ def test_corrupt_attempt_sidecar_does_not_affect_champion_loading(tmp_path):
         registry,
         key,
         evaluation_set_hash=None,
-        champion=registry.load(
-            key, expected_compatibility=compatible_hashes()
-        ).metadata,
+        champion=load_model(registry, key).metadata,
     )
     attempt_path = registry.attempt_path_for(key)
     attempt_path.write_bytes(b"not-json")
 
-    loaded = registry.load(key, expected_compatibility=compatible_hashes())
+    loaded = load_model(registry, key)
 
     assert loaded.bundle is not None
     assert loaded.fallback_reason == ""
@@ -1506,6 +1577,7 @@ def test_candidate_defensively_copies_and_freezes_bundle_metadata():
     source_metadata = {
         "training_contract": "task-9",
         "training_contract_hash": "c" * 64,
+        "backend_id": SEALED_BACKEND_ID,
     }
     metadata = model_metadata(key)
     bundle = ModelBundle(
@@ -1525,6 +1597,27 @@ def test_candidate_defensively_copies_and_freezes_bundle_metadata():
     assert candidate.bundle.metadata["training_contract_hash"] == "c" * 64
     with pytest.raises(TypeError):
         candidate.bundle.metadata["training_contract_hash"] = "direct-tamper"
+
+
+def test_candidate_rejects_bundle_backend_mismatch():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    metadata = model_metadata(key)
+    bundle = ModelBundle(
+        target_name=key.target,
+        feature_columns=list(metadata.feature_columns),
+        model=ConstantResidualModel(),
+        cadence_minutes=metadata.cadence_minutes,
+        residual_bounds=metadata.residual_bounds,
+        line_id=key.line_id,
+        tower_id=key.tower_id,
+        metadata={
+            "training_contract_hash": metadata.training_contract_hash,
+            "backend_id": "different-backend",
+        },
+    )
+
+    with pytest.raises(ValueError, match="backend"):
+        ModelCandidate(key=key, bundle=bundle, metadata=metadata)
 
 
 def test_post_replace_permission_probe_cannot_report_unpersisted_attempt(
@@ -1624,13 +1717,165 @@ def test_load_rejects_each_incompatible_runtime_hash(tmp_path, field):
     expected_values = compatible_hashes().__dict__.copy()
     expected_values[field] = f"changed-{field}"
 
-    loaded = registry.load(
+    loaded = load_model(
+        registry,
         key,
-        expected_compatibility=ModelCompatibility(**expected_values),
+        compatibility=ModelCompatibility(**expected_values),
     )
 
     assert loaded.bundle is None
     assert loaded.fallback_reason == f"incompatible_{field}"
+
+
+def test_load_rejects_model_from_different_training_contract(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(
+        model_candidate(
+            key,
+            evaluation_mode="full_fit",
+            training_contract_hash="a" * 64,
+        )
+    )
+
+    loaded = registry.load(
+        key,
+        expected_compatibility=compatible_hashes(),
+        expected_training_contract_hash="b" * 64,
+        expected_backend_id=SEALED_BACKEND_ID,
+    )
+
+    assert loaded.bundle is None
+    assert loaded.fallback_reason == "incompatible_training_contract_hash"
+
+
+def test_load_rejects_model_from_different_backend(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(
+        model_candidate(
+            key,
+            evaluation_mode="full_fit",
+            backend_id="xgboost-residual-v0",
+        )
+    )
+
+    loaded = registry.load(
+        key,
+        expected_compatibility=compatible_hashes(),
+        expected_training_contract_hash=DEFAULT_TRAINING_CONTRACT_HASH,
+        expected_backend_id=SEALED_BACKEND_ID,
+    )
+
+    assert loaded.bundle is None
+    assert loaded.fallback_reason == "incompatible_backend_id"
+
+
+def test_legacy_model_missing_both_contract_fields_reports_hash_first(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(model_candidate(key, evaluation_mode="full_fit"))
+    rewrite_persisted_metadata(
+        registry,
+        key,
+        lambda payload: (
+            payload.pop("training_contract_hash"),
+            payload.pop("backend_id"),
+        ),
+    )
+
+    loaded = load_model(registry, key)
+
+    assert loaded.bundle is None
+    assert loaded.fallback_reason == "incompatible_training_contract_hash"
+
+
+def test_legacy_model_missing_only_backend_reports_backend_mismatch(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(model_candidate(key, evaluation_mode="full_fit"))
+    rewrite_persisted_metadata(
+        registry,
+        key,
+        lambda payload: payload.pop("backend_id"),
+    )
+
+    loaded = load_model(registry, key)
+
+    assert loaded.bundle is None
+    assert loaded.fallback_reason == "incompatible_backend_id"
+
+
+def test_contract_mismatch_does_not_deserialize_model(tmp_path, monkeypatch):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(model_candidate(key, evaluation_mode="full_fit"))
+    load_calls = []
+    monkeypatch.setattr(
+        model_registry.joblib,
+        "load",
+        lambda path: load_calls.append(path),
+    )
+
+    loaded = load_model(
+        registry,
+        key,
+        training_contract_hash="different-contract",
+    )
+
+    assert loaded.fallback_reason == "incompatible_training_contract_hash"
+    assert load_calls == []
+
+
+def test_load_many_isolates_training_contract_mismatch_per_key(tmp_path):
+    stale_key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    current_key = ModelKey("project-a", "line-a", "002", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(
+        model_candidate(
+            stale_key,
+            evaluation_mode="full_fit",
+            training_contract_hash="a" * 64,
+        )
+    )
+    registry.promote(model_candidate(current_key, evaluation_mode="full_fit"))
+
+    loaded = registry.load_many(
+        [stale_key, current_key],
+        expected_compatibility={
+            stale_key: compatible_hashes(),
+            current_key: compatible_hashes(),
+        },
+        expected_training_contract_hash={
+            stale_key: DEFAULT_TRAINING_CONTRACT_HASH,
+            current_key: DEFAULT_TRAINING_CONTRACT_HASH,
+        },
+        expected_backend_id={
+            stale_key: SEALED_BACKEND_ID,
+            current_key: SEALED_BACKEND_ID,
+        },
+    )
+
+    assert loaded[stale_key].fallback_reason == (
+        "incompatible_training_contract_hash"
+    )
+    assert loaded[current_key].bundle is not None
+
+
+def test_corrupt_metadata_precedes_training_contract_mismatch(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(model_candidate(key, evaluation_mode="full_fit"))
+    registry.metadata_path_for(key).write_bytes(b"{broken")
+
+    loaded = load_model(
+        registry,
+        key,
+        training_contract_hash="different-contract",
+        backend_id="different-backend",
+    )
+
+    assert loaded.fallback_reason == "corrupt_metadata"
 
 
 def test_load_requires_explicit_compatibility_expectation(tmp_path):
@@ -1638,6 +1883,27 @@ def test_load_requires_explicit_compatibility_expectation(tmp_path):
 
     with pytest.raises(TypeError, match="expected_compatibility"):
         ModelRegistry(tmp_path).load(key)
+
+
+def test_load_requires_explicit_training_contract_expectation(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    with pytest.raises(TypeError, match="expected_training_contract_hash"):
+        ModelRegistry(tmp_path).load(
+            key,
+            expected_compatibility=compatible_hashes(),
+        )
+
+
+def test_load_requires_explicit_backend_expectation(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    with pytest.raises(TypeError, match="expected_backend_id"):
+        ModelRegistry(tmp_path).load(
+            key,
+            expected_compatibility=compatible_hashes(),
+            expected_training_contract_hash=DEFAULT_TRAINING_CONTRACT_HASH,
+        )
 
 
 def test_corrupt_model_falls_back_only_for_affected_tower(tmp_path):
@@ -1653,6 +1919,14 @@ def test_corrupt_model_falls_back_only_for_affected_tower(tmp_path):
         expected_compatibility={
             first_key: compatible_hashes(),
             second_key: compatible_hashes(),
+        },
+        expected_training_contract_hash={
+            first_key: DEFAULT_TRAINING_CONTRACT_HASH,
+            second_key: DEFAULT_TRAINING_CONTRACT_HASH,
+        },
+        expected_backend_id={
+            first_key: SEALED_BACKEND_ID,
+            second_key: SEALED_BACKEND_ID,
         },
     )
 
@@ -1689,6 +1963,14 @@ def test_corrupt_metadata_or_manifest_is_isolated_per_key(
         expected_compatibility={
             first_key: compatible_hashes(),
             second_key: compatible_hashes(),
+        },
+        expected_training_contract_hash={
+            first_key: DEFAULT_TRAINING_CONTRACT_HASH,
+            second_key: DEFAULT_TRAINING_CONTRACT_HASH,
+        },
+        expected_backend_id={
+            first_key: SEALED_BACKEND_ID,
+            second_key: SEALED_BACKEND_ID,
         },
     )
 
@@ -1810,9 +2092,9 @@ def test_training_result_records_estimator_parameters_and_dependencies():
 
 
 def test_training_result_adapter_preserves_temporal_holdout_contract():
-    result = ResidualTrainer(
-        estimator_factory=MeanResidualModel
-    ).train_target(training_frame(), target="wind_speed")
+    result = ResidualTrainer().train_target(
+        training_frame(), target="wind_speed"
+    )
 
     candidate = candidate_from_training_result(
         result,
@@ -1842,15 +2124,54 @@ def test_training_result_adapter_preserves_temporal_holdout_contract():
     assert candidate.bundle.metadata["training_contract_hash"] == (
         candidate.metadata.training_contract_hash
     )
+    assert candidate.metadata.backend_id == result.backend_id
+    assert candidate.bundle.metadata["backend_id"] == result.backend_id
     assert candidate.metadata.cadence_minutes == result.bundle.cadence_minutes
+
+
+@pytest.mark.parametrize("mismatch_location", ["result", "metadata", "bundle"])
+def test_training_result_adapter_rejects_backend_field_mismatch(
+    mismatch_location,
+):
+    result = ResidualTrainer().train_target(
+        training_frame(), target="wind_speed"
+    )
+    if mismatch_location == "result":
+        result = SimpleNamespace(
+            **{**result.__dict__, "backend_id": "different-backend"}
+        )
+    elif mismatch_location == "metadata":
+        result.metadata["backend_id"] = "different-backend"
+    else:
+        result.bundle.metadata["backend_id"] = "different-backend"
+
+    with pytest.raises(ValueError, match="backend"):
+        candidate_from_training_result(
+            result,
+            project_id="project-a",
+            model_version="training-run-1",
+            compatibility=compatible_hashes(),
+        )
+
+
+def test_training_result_adapter_rejects_nonproduction_backend():
+    result = ResidualTrainer(
+        estimator_factory=MeanResidualModel
+    ).train_target(training_frame(), target="wind_speed")
+
+    with pytest.raises(ValueError, match="production|sealed|backend"):
+        candidate_from_training_result(
+            result,
+            project_id="project-a",
+            model_version="training-run-1",
+            compatibility=compatible_hashes(),
+        )
 
 
 def test_training_result_adapter_keeps_full_fit_metrics_non_independent():
     frame = training_frame().iloc[[0]].copy()
     frame["wind_speed_truth"] = frame["wind_speed_local"] + 2.0
-    result = ResidualTrainer(
-        estimator_factory=MeanResidualModel
-    ).train_target(frame, target="wind_speed")
+    result = ResidualTrainer().train_target(frame, target="wind_speed")
 
     candidate = candidate_from_training_result(
         result,
@@ -1891,9 +2212,7 @@ def test_publish_failure_preserves_champion_and_leaves_no_temporary_files(
 
     assert decision.promoted is False
     assert decision.reason == "publish_failed:OSError"
-    loaded = registry.load(
-        key, expected_compatibility=compatible_hashes()
-    )
+    loaded = load_model(registry, key)
     assert loaded.fallback_reason == ""
     assert loaded.metadata.model_version == "version-1"
     assert not [path for path in tmp_path.rglob("*") if path.name.endswith(".tmp")]
@@ -1920,9 +2239,7 @@ def test_concurrent_candidates_recheck_champion_inside_key_lock(tmp_path):
         decisions = list(executor.map(registry.promote, candidates))
 
     assert any(decision.promoted for decision in decisions)
-    loaded = registry.load(
-        key, expected_compatibility=compatible_hashes()
-    )
+    loaded = load_model(registry, key)
     assert loaded.fallback_reason == ""
     assert loaded.metadata.model_version == "version-3"
     assert loaded.metadata.metrics["corrected_mae"] == 0.6
@@ -1963,9 +2280,7 @@ def test_file_lock_serializes_competing_promotions_across_processes(tmp_path):
     result_queue.join_thread()
 
     assert any(promoted for _, promoted, _ in results)
-    loaded = registry.load(
-        key, expected_compatibility=compatible_hashes()
-    )
+    loaded = load_model(registry, key)
     assert loaded.fallback_reason == ""
     assert loaded.metadata.model_version == "version-3"
     assert loaded.bundle.model.predict(np.zeros((1, 2))).tolist() == [0.9]

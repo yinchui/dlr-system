@@ -16,6 +16,7 @@ import joblib
 from filelock import FileLock
 
 from modules.ai_prediction import ModelBundle
+from modules.ai_training import SEALED_XGBOOST_BACKEND_ID
 
 
 _ALLOWED_TARGETS = frozenset({"wind_speed", "ambient_temp"})
@@ -60,6 +61,7 @@ _GENERATION_ARTIFACTS = ("model.joblib", "metadata.json", "manifest.json")
 _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
 _LEGACY_TRAINING_CONTRACT_HASH = "legacy-training-contract-v0"
+_LEGACY_BACKEND_ID = "legacy-training-backend-v0"
 _ATTEMPT_POLICY_VERSION = "weather-promotion-v1"
 _ATTEMPT_LEDGER_FIELDS = frozenset(
     {"schema_version", *_KEY_FIELDS, "entries"}
@@ -235,14 +237,20 @@ class ModelMetadata:
     dependency_versions: Mapping[str, str]
     cadence_minutes: float
     training_contract_hash: str
+    backend_id: str
     _allow_legacy_training_contract: InitVar[bool] = False
+    _allow_legacy_backend: InitVar[bool] = False
     training_outcome: str = "trained"
     checksum: str = ""
     status: str = "candidate"
     metric_domain: str = "weather_vs_truth"
     last_attempted_input_data_hash: Optional[str] = None
 
-    def __post_init__(self, _allow_legacy_training_contract: bool) -> None:
+    def __post_init__(
+        self,
+        _allow_legacy_training_contract: bool,
+        _allow_legacy_backend: bool,
+    ) -> None:
         if not isinstance(self.key, ModelKey):
             raise TypeError("key must be a ModelKey")
         _validate_identifier(self.model_version, "model_version")
@@ -333,6 +341,9 @@ class ModelMetadata:
             raise ValueError(
                 "legacy training contract is reserved for metadata migration"
             )
+        _require_nonempty_string(self.backend_id, "backend_id")
+        if self.backend_id == _LEGACY_BACKEND_ID and not _allow_legacy_backend:
+            raise ValueError("legacy backend is reserved for metadata migration")
         if self.last_attempted_input_data_hash is not None:
             _require_nonempty_string(
                 self.last_attempted_input_data_hash,
@@ -406,10 +417,14 @@ class ModelMetadata:
         missing_training_contract = "training_contract_hash" not in values
         if missing_training_contract:
             values["training_contract_hash"] = _LEGACY_TRAINING_CONTRACT_HASH
+        missing_backend = "backend_id" not in values
+        if missing_backend:
+            values["backend_id"] = _LEGACY_BACKEND_ID
         return cls(
             key=key,
             compatibility=compatibility,
             _allow_legacy_training_contract=missing_training_contract,
+            _allow_legacy_backend=missing_backend,
             **values,
         )
 
@@ -470,6 +485,7 @@ def candidate_from_training_result(
         "bundle",
         "metrics",
         "metadata",
+        "backend_id",
     ):
         if not hasattr(result, attribute):
             raise TypeError(f"training result is missing {attribute}")
@@ -483,6 +499,7 @@ def candidate_from_training_result(
     )
     source = result.metadata
     result_contract_hash = getattr(result, "training_contract_hash", None)
+    result_backend_id = getattr(result, "backend_id", None)
     result_training_outcome = getattr(result, "training_outcome", None)
     source_contract_hash = source.get("training_contract_hash")
     _require_nonempty_string(
@@ -496,6 +513,14 @@ def candidate_from_training_result(
     )
     if bundle_contract_hash != result_contract_hash:
         raise ValueError("training result and bundle training contracts differ")
+    _require_nonempty_string(result_backend_id, "training result backend_id")
+    if (
+        source.get("backend_id") != result_backend_id
+        or result.bundle.metadata.get("backend_id") != result_backend_id
+    ):
+        raise ValueError("training result backend fields differ")
+    if result_backend_id != SEALED_XGBOOST_BACKEND_ID:
+        raise ValueError("training result is not from the sealed production backend")
     if (
         result_training_outcome not in _TRAINING_OUTCOMES - {"legacy"}
         or source.get("training_outcome") != result_training_outcome
@@ -522,6 +547,7 @@ def candidate_from_training_result(
         dependency_versions=source["dependency_versions"],
         cadence_minutes=result.bundle.cadence_minutes,
         training_contract_hash=result_contract_hash,
+        backend_id=result_backend_id,
         training_outcome=result_training_outcome,
     )
     return ModelCandidate(key=key, bundle=result.bundle, metadata=metadata)
@@ -654,6 +680,12 @@ def _validate_bundle(
         and bundle_contract_hash != metadata.training_contract_hash
     ):
         raise ValueError("bundle training contract does not match metadata")
+    bundle_backend_id = bundle.metadata.get("backend_id")
+    if (
+        metadata.backend_id != _LEGACY_BACKEND_ID
+        and bundle_backend_id != metadata.backend_id
+    ):
+        raise ValueError("bundle backend does not match metadata")
     bundle_training_outcome = bundle.metadata.get("training_outcome", "trained")
     if (
         metadata.training_outcome != "legacy"
@@ -1215,6 +1247,8 @@ class ModelRegistry:
         key: ModelKey,
         generation_dir: Path,
         expected_compatibility: ModelCompatibility,
+        expected_training_contract_hash: str,
+        expected_backend_id: str,
     ) -> ModelLoadResult:
         if not self._validate_generation_location(key, generation_dir):
             return self._fallback("corrupt_manifest")
@@ -1273,6 +1307,11 @@ class ModelRegistry:
             if actual != expected:
                 return self._fallback(f"incompatible_{field_name}")
 
+        if metadata.training_contract_hash != expected_training_contract_hash:
+            return self._fallback("incompatible_training_contract_hash")
+        if metadata.backend_id != expected_backend_id:
+            return self._fallback("incompatible_backend_id")
+
         try:
             model_checksum = _sha256_path(model_path)
         except OSError:
@@ -1295,6 +1334,8 @@ class ModelRegistry:
         self,
         key: ModelKey,
         expected_compatibility: ModelCompatibility,
+        expected_training_contract_hash: str,
+        expected_backend_id: str,
     ) -> ModelLoadResult:
         target_dir = self._target_dir(key)
         if not self._safe_directory(target_dir.parent, create=False):
@@ -1304,13 +1345,21 @@ class ModelRegistry:
                 return self._fallback("corrupt_manifest")
             return self._fallback("model_not_found")
         generation_dir = self._active_generation(key)
-        return self._read_generation(key, generation_dir, expected_compatibility)
+        return self._read_generation(
+            key,
+            generation_dir,
+            expected_compatibility,
+            expected_training_contract_hash,
+            expected_backend_id,
+        )
 
     def load(
         self,
         key: ModelKey,
         *,
         expected_compatibility: ModelCompatibility,
+        expected_training_contract_hash: str,
+        expected_backend_id: str,
     ) -> ModelLoadResult:
         if not isinstance(key, ModelKey):
             raise TypeError("key must be a ModelKey")
@@ -1318,9 +1367,19 @@ class ModelRegistry:
             raise TypeError(
                 "expected_compatibility must be provided as ModelCompatibility"
             )
+        _require_nonempty_string(
+            expected_training_contract_hash,
+            "expected_training_contract_hash",
+        )
+        _require_nonempty_string(expected_backend_id, "expected_backend_id")
         try:
             with self._lock_for(key):
-                return self._load_locked(key, expected_compatibility)
+                return self._load_locked(
+                    key,
+                    expected_compatibility,
+                    expected_training_contract_hash,
+                    expected_backend_id,
+                )
         except UnsafeModelPathError:
             return self._fallback("unsafe_model_path")
 
@@ -1329,9 +1388,17 @@ class ModelRegistry:
         keys,
         *,
         expected_compatibility: Mapping[ModelKey, ModelCompatibility],
+        expected_training_contract_hash: Mapping[ModelKey, str],
+        expected_backend_id: Mapping[ModelKey, str],
     ) -> dict[ModelKey, ModelLoadResult]:
         if not isinstance(expected_compatibility, Mapping):
             raise TypeError("expected_compatibility must map every ModelKey")
+        if not isinstance(expected_training_contract_hash, Mapping):
+            raise TypeError(
+                "expected_training_contract_hash must map every ModelKey"
+            )
+        if not isinstance(expected_backend_id, Mapping):
+            raise TypeError("expected_backend_id must map every ModelKey")
         normalized_keys = list(keys)
         if len(set(normalized_keys)) != len(normalized_keys):
             raise ValueError("keys cannot contain duplicates")
@@ -1346,6 +1413,20 @@ class ModelRegistry:
                 raise TypeError(
                     "each compatibility expectation must be ModelCompatibility"
                 )
+            if key not in expected_training_contract_hash:
+                raise ValueError(
+                    f"missing training contract expectation for {key}"
+                )
+            _require_nonempty_string(
+                expected_training_contract_hash[key],
+                f"expected_training_contract_hash[{key}]",
+            )
+            if key not in expected_backend_id:
+                raise ValueError(f"missing backend expectation for {key}")
+            _require_nonempty_string(
+                expected_backend_id[key],
+                f"expected_backend_id[{key}]",
+            )
 
         loaded = {}
         for key in normalized_keys:
@@ -1353,6 +1434,10 @@ class ModelRegistry:
                 loaded[key] = self.load(
                     key,
                     expected_compatibility=expected_compatibility[key],
+                    expected_training_contract_hash=(
+                        expected_training_contract_hash[key]
+                    ),
+                    expected_backend_id=expected_backend_id[key],
                 )
             except Exception as exc:
                 loaded[key] = self._fallback(
@@ -1415,7 +1500,11 @@ class ModelRegistry:
             _fsync_directory(generation_root)
 
             validated = self._read_generation(
-                key, generation_dir, active_metadata.compatibility
+                key,
+                generation_dir,
+                active_metadata.compatibility,
+                active_metadata.training_contract_hash,
+                active_metadata.backend_id,
             )
             if validated.bundle is None or validated.metadata != active_metadata:
                 raise ValueError(
@@ -1569,7 +1658,10 @@ class ModelRegistry:
             )
             try:
                 current = self._load_locked(
-                    candidate.key, candidate.metadata.compatibility
+                    candidate.key,
+                    candidate.metadata.compatibility,
+                    candidate.metadata.training_contract_hash,
+                    candidate.metadata.backend_id,
                 )
             except UnsafeModelPathError:
                 return PromotionDecision(False, "unsafe_model_path")

@@ -724,6 +724,104 @@ def test_runtime_contract_accepts_builtin_residual_trainer():
     assert len(contract_hash) == 64
 
 
+def test_runtime_contract_scope_can_be_derived_without_training_rows():
+    trainer = ResidualTrainer(
+        feature_builder=FeatureBuilder(cadence_minutes=30)
+    )
+    physical_col = "wind_speed_local"
+
+    contract_hash = ai_training.training_runtime_contract_hash_for_scope(
+        trainer,
+        target="wind_speed",
+        physical_col=physical_col,
+        truth_col="wind_speed_truth",
+        feature_columns=trainer.feature_builder.feature_columns(physical_col),
+        cadence_minutes=30,
+    )
+
+    assert len(contract_hash) == 64
+
+
+@pytest.mark.parametrize(
+    ("target", "physical_col", "truth_col", "cadence_minutes"),
+    [
+        ("wind_speed", "wind_speed_local", "wind_speed_truth", 30),
+        ("ambient_temp", "ambient_temp_local", "ambient_temp_truth", 60),
+    ],
+)
+def test_runtime_contract_scope_matches_preparation_hash(
+    target,
+    physical_col,
+    truth_col,
+    cadence_minutes,
+):
+    trainer = ResidualTrainer(
+        feature_builder=FeatureBuilder(cadence_minutes=cadence_minutes)
+    )
+    preparation = trainer.prepare_target(
+        make_training_frame(target=target),
+        target=target,
+        physical_col=physical_col,
+        truth_col=truth_col,
+    )
+
+    preload_hash = ai_training.training_runtime_contract_hash_for_scope(
+        trainer,
+        target=target,
+        physical_col=physical_col,
+        truth_col=truth_col,
+        feature_columns=preparation.feature_columns,
+        cadence_minutes=cadence_minutes,
+    )
+
+    assert preload_hash == ai_training.training_runtime_contract_hash(
+        trainer, preparation
+    )
+
+
+@pytest.mark.parametrize(
+    "package",
+    ["python", "numpy", "pandas", "joblib", "xgboost"],
+)
+def test_runtime_contract_scope_tracks_each_runtime_dependency(
+    monkeypatch,
+    package,
+):
+    physical_col = "wind_speed_local"
+    original_trainer = ResidualTrainer()
+    original_hash = ai_training.training_runtime_contract_hash_for_scope(
+        original_trainer,
+        target="wind_speed",
+        physical_col=physical_col,
+        truth_col="wind_speed_truth",
+        feature_columns=original_trainer.feature_builder.feature_columns(
+            physical_col
+        ),
+        cadence_minutes=30,
+    )
+    changed_versions = ai_training._dependency_versions()
+    changed_versions[package] = f"{changed_versions[package]}-changed"
+    monkeypatch.setattr(
+        ai_training,
+        "_dependency_versions",
+        lambda: changed_versions,
+    )
+    changed_trainer = ResidualTrainer()
+
+    changed_hash = ai_training.training_runtime_contract_hash_for_scope(
+        changed_trainer,
+        target="wind_speed",
+        physical_col=physical_col,
+        truth_col="wind_speed_truth",
+        feature_columns=changed_trainer.feature_builder.feature_columns(
+            physical_col
+        ),
+        cadence_minutes=30,
+    )
+
+    assert changed_hash != original_hash
+
+
 def test_runtime_contract_tracks_builtin_training_dependencies(monkeypatch):
     trainer, _, preparation = _temporal_preparation()
     original_hash = ai_training.training_runtime_contract_hash(
@@ -1228,6 +1326,19 @@ def test_default_trainer_has_sealed_xgboost_spec():
     assert len(spec.implementation_sha256) == 64
     assert spec.policy_version == "weather-residual-training-v1"
     assert len(spec.digest()) == 64
+
+
+def test_sealed_training_result_backend_fields_match():
+    trainer = ResidualTrainer()
+
+    result = trainer.train_target(
+        make_training_frame(residuals=(1.0, 1.0, 1.0, 1.0)),
+        target="wind_speed",
+    )
+
+    assert result.backend_id == trainer.sealed_estimator_spec.backend_id
+    assert result.metadata["backend_id"] == result.backend_id
+    assert result.bundle.metadata["backend_id"] == result.backend_id
 
 
 def test_sealed_xgboost_implementation_hash_matches_source_file():

@@ -1,3 +1,4 @@
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -1360,6 +1361,290 @@ def test_custom_trainer_does_not_taint_compatible_sealed_models(tmp_path):
     )
 
 
+class _ContractCaptureRegistry:
+    def __init__(self):
+        self.calls = []
+
+    def load_many(
+        self,
+        keys,
+        *,
+        expected_compatibility,
+        expected_training_contract_hash,
+        expected_backend_id,
+    ):
+        keys = tuple(keys)
+        self.calls.append(
+            (
+                keys,
+                expected_compatibility,
+                expected_training_contract_hash,
+                expected_backend_id,
+            )
+        )
+        return {
+            key: ModelLoadResult(None, None, "model_not_found") for key in keys
+        }
+
+
+def test_pipeline_loads_with_target_scoped_sealed_contracts(tmp_path):
+    registry = _ContractCaptureRegistry()
+
+    DlrPipeline(model_root=tmp_path, registry=registry).run(
+        physical=_weather("physical"),
+        project_id="project-a",
+        line_id="line-a",
+        interval_minutes=60,
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    assert len(registry.calls) == 1
+    keys, _, expected_hashes, expected_backends = registry.calls[0]
+    trainer = ResidualTrainer(
+        feature_builder=FeatureBuilder(cadence_minutes=60)
+    )
+    for key in keys:
+        physical_col = (
+            "wind_speed_local"
+            if key.target == "wind_speed"
+            else "ambient_temp_local"
+        )
+        assert expected_hashes[key] == (
+            ai_training.training_runtime_contract_hash_for_scope(
+                trainer,
+                target=key.target,
+                physical_col=physical_col,
+                truth_col=f"{key.target}_truth",
+                feature_columns=trainer.feature_builder.feature_columns(
+                    physical_col
+                ),
+                cadence_minutes=60,
+            )
+        )
+        assert expected_backends[key] == trainer.sealed_estimator_spec.backend_id
+
+
+def _active_sealed_pipeline(model_root):
+    pipeline = DlrPipeline(model_root=model_root)
+    run_kwargs = {
+        "project_id": "project-a",
+        "line_id": "line-a",
+        "terrain_lookup": {},
+        "ai_enabled": True,
+        "conductor": _conductor(),
+        "truth_tolerance": "5min",
+    }
+    pipeline.run(
+        **run_kwargs,
+        physical=_weather("physical"),
+        truth=_weather("truth", truth_offset=True),
+    )
+    physical = _weather_with_additional_segment("physical")
+    truth = _weather_with_additional_segment("truth", truth_offset=True)
+    promoted = pipeline.run(
+        **run_kwargs,
+        physical=physical,
+        truth=truth,
+    )
+    assert promoted.model_report.trained_targets == _expected_pipeline_model_keys()
+    return pipeline, run_kwargs, physical, truth
+
+
+def _changed_dependency_versions(package):
+    versions = ai_training._dependency_versions()
+    versions[package] = f"{versions[package]}-changed"
+    return versions
+
+
+def test_dependency_version_change_without_truth_uses_physical_weather(
+    tmp_path,
+    monkeypatch,
+):
+    pipeline, run_kwargs, physical, _ = _active_sealed_pipeline(
+        tmp_path / "models"
+    )
+    changed_versions = _changed_dependency_versions("joblib")
+    monkeypatch.setattr(
+        ai_training,
+        "_dependency_versions",
+        lambda: changed_versions,
+    )
+
+    degraded = pipeline.run(
+        **run_kwargs,
+        physical=physical,
+        truth=None,
+    )
+
+    assert degraded.model_report.loaded_targets == ()
+    assert degraded.model_report.used_targets == ()
+    assert {
+        fallback.reason for fallback in degraded.model_report.fallbacks
+    } == {"incompatible_training_contract_hash"}
+    assert not degraded.comparison_weather[
+        ["wind_speed_used_ai", "ambient_temp_used_ai"]
+    ].to_numpy(dtype=bool).any()
+
+
+def test_dependency_change_retrains_replaces_and_reuses_same_input_model(
+    tmp_path,
+    monkeypatch,
+):
+    pipeline, run_kwargs, physical, truth = _active_sealed_pipeline(
+        tmp_path / "models"
+    )
+    changed_versions = _changed_dependency_versions("joblib")
+    monkeypatch.setattr(
+        ai_training,
+        "_dependency_versions",
+        lambda: changed_versions,
+    )
+    expected_keys = _expected_pipeline_model_keys()
+
+    retrained = pipeline.run(
+        **run_kwargs,
+        physical=physical,
+        truth=truth,
+    )
+    reused = pipeline.run(
+        **run_kwargs,
+        physical=physical,
+        truth=None,
+    )
+
+    assert retrained.model_report.trained_targets == expected_keys
+    assert all(
+        decision.promoted
+        for decision in retrained.model_report.promotion_decisions
+    )
+    assert reused.model_report.loaded_targets == expected_keys
+    assert reused.model_report.used_targets == expected_keys
+    assert reused.model_report.trained_targets == ()
+
+
+def test_one_stale_training_contract_is_isolated_in_pipeline(tmp_path):
+    pipeline, run_kwargs, physical, _ = _active_sealed_pipeline(
+        tmp_path / "models"
+    )
+    expected_keys = _expected_pipeline_model_keys()
+    stale_key = expected_keys[0]
+    metadata_path = pipeline.registry.metadata_path_for(stale_key)
+    manifest_path = pipeline.registry.manifest_path_for(stale_key)
+    metadata = json.loads(metadata_path.read_text("utf-8"))
+    metadata["training_contract_hash"] = "0" * 64
+    metadata_bytes = (
+        json.dumps(
+            metadata,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    metadata_path.write_bytes(metadata_bytes)
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    manifest["metadata_checksum"] = hashlib.sha256(metadata_bytes).hexdigest()
+    manifest_path.write_text(
+        json.dumps(
+            manifest,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    isolated = pipeline.run(
+        **run_kwargs,
+        physical=physical,
+        truth=None,
+    )
+
+    compatible_keys = tuple(key for key in expected_keys if key != stale_key)
+    assert isolated.model_report.loaded_targets == compatible_keys
+    assert isolated.model_report.used_targets == compatible_keys
+    assert any(
+        fallback.key == stale_key
+        and fallback.reason == "incompatible_training_contract_hash"
+        for fallback in isolated.model_report.fallbacks
+    )
+
+
+def test_sealed_spec_failure_never_accesses_existing_models_and_can_recover(
+    tmp_path,
+    monkeypatch,
+):
+    pipeline, run_kwargs, physical, _ = _active_sealed_pipeline(
+        tmp_path / "models"
+    )
+    registry = pipeline.registry
+    expected_keys = _expected_pipeline_model_keys()
+    artifacts = {
+        path: path.read_bytes()
+        for key in expected_keys
+        for path in (
+            registry.path_for(key),
+            registry.metadata_path_for(key),
+            registry.manifest_path_for(key),
+        )
+    }
+    sidecars = {
+        registry.attempt_path_for(key): (
+            registry.attempt_path_for(key).read_bytes()
+            if registry.attempt_path_for(key).exists()
+            else None
+        )
+        for key in expected_keys
+    }
+    original_loader = ai_training._load_xgb_regressor
+    original_load_many = registry.load_many
+    load_calls = []
+
+    def unavailable():
+        raise ImportError("temporary xgboost outage")
+
+    def forbidden_load(*args, **kwargs):
+        load_calls.append((args, kwargs))
+        raise AssertionError("registry must not be read without a sealed spec")
+
+    monkeypatch.setattr(ai_training, "_load_xgb_regressor", unavailable)
+    monkeypatch.setattr(registry, "load_many", forbidden_load)
+
+    degraded = pipeline.run(
+        **run_kwargs,
+        physical=physical,
+        truth=None,
+    )
+
+    assert load_calls == []
+    assert degraded.model_report.loaded_targets == ()
+    assert degraded.model_report.used_targets == ()
+    assert not degraded.comparison_weather[
+        ["wind_speed_used_ai", "ambient_temp_used_ai"]
+    ].to_numpy(dtype=bool).any()
+    assert all(path.read_bytes() == payload for path, payload in artifacts.items())
+    assert all(
+        (path.read_bytes() if path.exists() else None) == payload
+        for path, payload in sidecars.items()
+    )
+
+    monkeypatch.setattr(ai_training, "_load_xgb_regressor", original_loader)
+    monkeypatch.setattr(registry, "load_many", original_load_many)
+    recovered = pipeline.run(
+        **run_kwargs,
+        physical=physical,
+        truth=None,
+    )
+
+    assert recovered.model_report.loaded_targets == expected_keys
+    assert recovered.model_report.used_targets == expected_keys
+
+
 def test_provisional_models_train_on_new_holdout_then_active_models_stop(
     tmp_path,
 ):
@@ -2362,7 +2647,16 @@ class _PredictionContractRegistry:
     def __init__(self, *, missing_feature=True):
         self.missing_feature = missing_feature
 
-    def load_many(self, keys, *, expected_compatibility):
+    def load_many(
+        self,
+        keys,
+        *,
+        expected_compatibility,
+        expected_training_contract_hash,
+        expected_backend_id,
+    ):
+        assert set(expected_training_contract_hash) == set(keys)
+        assert set(expected_backend_id) == set(keys)
         loaded = {}
         for key in keys:
             physical_column = (

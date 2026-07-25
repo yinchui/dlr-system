@@ -20,6 +20,7 @@ from modules.ai_training import (
     TrainingContractError,
     bind_training_result_contract,
     training_runtime_contract_hash,
+    training_runtime_contract_hash_for_scope,
 )
 from modules.model_registry import (
     ModelCompatibility,
@@ -947,6 +948,37 @@ class DlrPipeline:
         )
 
     @staticmethod
+    def _sealed_load_contracts(
+        keys: list[ModelKey],
+        interval_minutes: float,
+    ) -> tuple[ResidualTrainer, dict[ModelKey, str], dict[ModelKey, str]]:
+        trainer = ResidualTrainer(
+            feature_builder=FeatureBuilder(
+                cadence_minutes=float(interval_minutes)
+            )
+        )
+        spec = trainer.sealed_estimator_spec
+        if not trainer.production_eligible or spec is None:
+            raise TrainingContractError("sealed training backend is unavailable")
+
+        contract_hashes = {}
+        backend_ids = {}
+        for key in keys:
+            physical_column = _LOCAL_COLUMNS[key.target]
+            contract_hashes[key] = training_runtime_contract_hash_for_scope(
+                trainer,
+                target=key.target,
+                physical_col=physical_column,
+                truth_col=f"{key.target}_truth",
+                feature_columns=trainer.feature_builder.feature_columns(
+                    physical_column
+                ),
+                cadence_minutes=float(interval_minutes),
+            )
+            backend_ids[key] = spec.backend_id
+        return trainer, contract_hashes, backend_ids
+
+    @staticmethod
     def _weather_frame(value, *, role: str) -> pd.DataFrame:
         if isinstance(value, WeatherUploadResult):
             frame = value.frame
@@ -1179,6 +1211,10 @@ class DlrPipeline:
         aligned = None
         alignment_report = None
         model_ready = False
+        sealed_runtime_trainer = None
+        sealed_preparation_failed = False
+        expected_training_contract_hashes = {}
+        expected_backend_ids = {}
 
         if ai_enabled:
             try:
@@ -1190,28 +1226,53 @@ class DlrPipeline:
                     for target in _TARGETS
                 ]
                 if model_persistence_allowed:
-                    registry = self._registry_for_ai()
-                    compatibility = (
-                        model_compatibility
-                        if model_compatibility is not None
-                        else self._compatibility(
-                            terrain_corrected,
-                            conductor=conductor,
-                            correction_options=options,
-                            interval_minutes=interval_minutes,
-                            dem_context=dem_context,
-                            coordinate_context=coordinate_context,
+                    try:
+                        (
+                            sealed_runtime_trainer,
+                            expected_training_contract_hashes,
+                            expected_backend_ids,
+                        ) = self._sealed_load_contracts(
+                            keys,
+                            interval_minutes,
                         )
-                    )
-                    loaded = registry.load_many(
-                        keys,
-                        expected_compatibility={
-                            key: compatibility for key in keys
-                        },
-                    )
-                    loaded_targets = [
-                        key for key in keys if loaded[key].bundle is not None
-                    ]
+                    except TrainingContractError:
+                        sealed_preparation_failed = True
+                        sealed_runtime_trainer = None
+                        loaded = {
+                            key: ModelLoadResult(
+                                None,
+                                None,
+                                "training_failed:TrainingContractError",
+                            )
+                            for key in keys
+                        }
+                    if not sealed_preparation_failed:
+                        compatibility = (
+                            model_compatibility
+                            if model_compatibility is not None
+                            else self._compatibility(
+                                terrain_corrected,
+                                conductor=conductor,
+                                correction_options=options,
+                                interval_minutes=interval_minutes,
+                                dem_context=dem_context,
+                                coordinate_context=coordinate_context,
+                            )
+                        )
+                        registry = self._registry_for_ai()
+                        loaded = registry.load_many(
+                            keys,
+                            expected_compatibility={
+                                key: compatibility for key in keys
+                            },
+                            expected_training_contract_hash=(
+                                expected_training_contract_hashes
+                            ),
+                            expected_backend_id=expected_backend_ids,
+                        )
+                        loaded_targets = [
+                            key for key in keys if loaded[key].bundle is not None
+                        ]
                 model_ready = True
             except Exception as exc:
                 keys = []
@@ -1225,7 +1286,7 @@ class DlrPipeline:
                     )
                 )
 
-        if model_ready and truth is not None:
+        if model_ready and truth is not None and not sealed_preparation_failed:
             try:
                 truth_frame = self._weather_frame(truth, role="truth")
                 if _weather_content_overlaps(physical_input, truth_frame):
@@ -1285,9 +1346,23 @@ class DlrPipeline:
                         continue
                     try:
                         if trainer is None:
-                            trainer = self._sealed_trainer_for_interval(
-                                interval_minutes
-                            )
+                            if self.trainer is None:
+                                trainer = (
+                                    sealed_runtime_trainer
+                                    or self._sealed_trainer_for_interval(
+                                        interval_minutes
+                                    )
+                                )
+                            else:
+                                eligible_trainer = (
+                                    self._sealed_trainer_for_interval(
+                                        interval_minutes
+                                    )
+                                )
+                                trainer = (
+                                    sealed_runtime_trainer
+                                    or eligible_trainer
+                                )
                         attempt = None
                         preparation = trainer.prepare_target(
                             tower_training,
@@ -1300,6 +1375,14 @@ class DlrPipeline:
                             preparation,
                         )
                         if model_persistence_allowed:
+                            if (
+                                runtime_contract_hash
+                                != expected_training_contract_hashes[key]
+                            ):
+                                raise TrainingContractError(
+                                    "training runtime contract differs from "
+                                    "the preload contract"
+                                )
                             attempt = registry.build_attempt(
                                 key,
                                 input_data_hash=preparation.input_data_hash,
@@ -1387,7 +1470,14 @@ class DlrPipeline:
                             if decision.promoted:
                                 trained_targets.append(key)
                                 loaded[key] = registry.load(
-                                    key, expected_compatibility=compatibility
+                                    key,
+                                    expected_compatibility=compatibility,
+                                    expected_training_contract_hash=(
+                                        expected_training_contract_hashes[key]
+                                    ),
+                                    expected_backend_id=(
+                                        expected_backend_ids[key]
+                                    ),
                                 )
                     except TrainingContractError as exc:
                         if load_result is None or load_result.bundle is None:

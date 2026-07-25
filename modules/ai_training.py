@@ -67,6 +67,8 @@ _DEFAULT_ESTIMATOR_PARAMETERS = (
 _SEALED_XGBOOST_ESTIMATOR_PATH = "xgboost.XGBRegressor"
 _SEALED_XGBOOST_IMPLEMENTATION_MODULE = "xgboost.sklearn"
 _SEALED_XGBOOST_ESTIMATOR_NAME = "XGBRegressor"
+SEALED_XGBOOST_BACKEND_ID = "xgboost-residual-v1"
+_NON_PRODUCTION_BACKEND_ID = "non-production-training-backend-v0"
 _MAX_CONTRACT_DEPTH = 12
 _MAX_CONTRACT_ITEMS = 256
 _MAX_CONTRACT_NODES = 2_048
@@ -165,10 +167,13 @@ class TrainingResult:
     bundle: ModelBundle
     metrics: dict[str, float]
     metadata: dict
+    backend_id: str
     training_contract_hash: str
     training_outcome: str
 
     def __post_init__(self) -> None:
+        if not isinstance(self.backend_id, str) or not self.backend_id.strip():
+            raise ValueError("backend_id must be a non-empty string")
         if (
             not isinstance(self.training_contract_hash, str)
             or not self.training_contract_hash.strip()
@@ -178,6 +183,11 @@ class TrainingResult:
             raise ValueError("training result metadata must be a mapping")
         if not isinstance(self.bundle.metadata, Mapping):
             raise ValueError("training bundle metadata must be a mapping")
+        if (
+            self.metadata.get("backend_id") != self.backend_id
+            or self.bundle.metadata.get("backend_id") != self.backend_id
+        ):
+            raise ValueError("training result backend fields must match")
         if (
             self.metadata.get("training_contract_hash")
             != self.training_contract_hash
@@ -600,7 +610,7 @@ def _sealed_xgboost_backend() -> tuple[SealedEstimatorSpec, type]:
     return (
         SealedEstimatorSpec(
             schema_version=1,
-            backend_id="xgboost-residual-v1",
+            backend_id=SEALED_XGBOOST_BACKEND_ID,
             estimator_path=_SEALED_XGBOOST_ESTIMATOR_PATH,
             parameters_json=parameters_json,
             random_seed=42,
@@ -1256,18 +1266,47 @@ def _builtin_trainer_runtime_descriptor(trainer: Any) -> dict[str, Any]:
     }
 
 
+def _runtime_contract_hash(
+    trainer: Any,
+    preparation_contract_hash: str,
+) -> str:
+    return _stable_json_hash(
+        {
+            "preparation_contract_hash": preparation_contract_hash,
+            "trainer": _trainer_runtime_descriptor(trainer),
+        }
+    )
+
+
+def training_runtime_contract_hash_for_scope(
+    trainer: Any,
+    *,
+    target: str,
+    physical_col: str,
+    truth_col: str,
+    feature_columns: Sequence[str],
+    cadence_minutes: float,
+) -> str:
+    training_contract = getattr(trainer, "training_contract", None)
+    if not isinstance(training_contract, TrainingContract):
+        raise TypeError("trainer must provide a TrainingContract")
+    preparation_contract_hash = training_contract.scoped_hash(
+        target=target,
+        physical_col=physical_col,
+        truth_col=truth_col,
+        feature_columns=feature_columns,
+        cadence_minutes=cadence_minutes,
+    )
+    return _runtime_contract_hash(trainer, preparation_contract_hash)
+
+
 def training_runtime_contract_hash(
     trainer: Any,
     preparation: TrainingPreparation,
 ) -> str:
     if not isinstance(preparation, TrainingPreparation):
         raise TypeError("preparation must be a TrainingPreparation")
-    return _stable_json_hash(
-        {
-            "preparation_contract_hash": preparation.training_contract_hash,
-            "trainer": _trainer_runtime_descriptor(trainer),
-        }
-    )
+    return _runtime_contract_hash(trainer, preparation.training_contract_hash)
 
 
 def bind_training_result_contract(
@@ -2297,6 +2336,11 @@ class ResidualTrainer:
             "evaluation_set_hash": evaluation_set_hash,
             "feature_columns": list(feature_columns),
             "cadence_minutes": self.feature_builder.cadence_minutes,
+            "backend_id": (
+                self.sealed_estimator_spec.backend_id
+                if self.sealed_estimator_spec is not None
+                else _NON_PRODUCTION_BACKEND_ID
+            ),
             "training_contract_hash": preparation.training_contract_hash,
             "training_snapshot_hash": preparation.snapshot_hash,
             "random_state": 42,
@@ -2329,6 +2373,7 @@ class ResidualTrainer:
             bundle=bundle,
             metrics=metrics,
             metadata=metadata,
+            backend_id=metadata["backend_id"],
             training_contract_hash=preparation.training_contract_hash,
             training_outcome=training_outcome,
         )

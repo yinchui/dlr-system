@@ -1632,6 +1632,32 @@ def test_fit_estimator_propagates_attestation_mismatch_before_fit(monkeypatch):
     assert fit_calls == []
 
 
+def test_fit_estimator_rejects_loader_type_drift_before_fit(monkeypatch):
+    from xgboost import XGBClassifier
+
+    trainer = ResidualTrainer()
+    fit_calls = []
+
+    def recording_fit(estimator, features, target):
+        fit_calls.append((estimator, features, target))
+        return estimator
+
+    monkeypatch.setattr(
+        ai_training,
+        "_load_xgb_regressor",
+        lambda: XGBClassifier,
+    )
+    monkeypatch.setattr(XGBClassifier, "fit", recording_fit)
+
+    with pytest.raises(ai_training.TrainingContractError, match="type"):
+        trainer._fit_estimator(
+            pd.DataFrame({"feature": [0.0, 1.0]}),
+            np.array([0.0, 1.0]),
+        )
+
+    assert fit_calls == []
+
+
 def test_training_parameter_metadata_never_persists_secret_object_content():
     result = ResidualTrainer(
         estimator_factory=SecretParameterEstimator

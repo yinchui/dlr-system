@@ -546,7 +546,7 @@ def _estimator_implementation_sha256(estimator_type: type) -> str:
     return _sha256_path(implementation_path)
 
 
-def sealed_xgboost_spec() -> SealedEstimatorSpec:
+def _sealed_xgboost_backend() -> tuple[SealedEstimatorSpec, type]:
     try:
         estimator_type = _load_xgb_regressor()
         estimator = estimator_type(**dict(_DEFAULT_ESTIMATOR_PARAMETERS))
@@ -560,16 +560,24 @@ def sealed_xgboost_spec() -> SealedEstimatorSpec:
             "sealed xgboost random_state does not match policy"
         )
     distributions = _resolved_distribution_versions(estimator_type.__module__)
-    return SealedEstimatorSpec(
-        schema_version=1,
-        backend_id="xgboost-residual-v1",
-        estimator_path="xgboost.XGBRegressor",
-        parameters_json=parameters_json,
-        random_seed=42,
-        distributions=tuple(sorted(distributions.items())),
-        implementation_sha256=_estimator_implementation_sha256(estimator_type),
-        policy_version="weather-residual-training-v1",
+    return (
+        SealedEstimatorSpec(
+            schema_version=1,
+            backend_id="xgboost-residual-v1",
+            estimator_path="xgboost.XGBRegressor",
+            parameters_json=parameters_json,
+            random_seed=42,
+            distributions=tuple(sorted(distributions.items())),
+            implementation_sha256=_estimator_implementation_sha256(estimator_type),
+            policy_version="weather-residual-training-v1",
+        ),
+        estimator_type,
     )
+
+
+def sealed_xgboost_spec() -> SealedEstimatorSpec:
+    spec, _ = _sealed_xgboost_backend()
+    return spec
 
 
 def _bounded_contract_items(values, *, label: str) -> list:
@@ -1587,11 +1595,15 @@ class ResidualTrainer:
     ):
         if estimator_factory is None:
             self.estimator_factory = default_estimator
-            self.sealed_estimator_spec = sealed_xgboost_spec()
+            (
+                self.sealed_estimator_spec,
+                self._sealed_estimator_type,
+            ) = _sealed_xgboost_backend()
             self.production_eligible = True
         else:
             self.estimator_factory = estimator_factory
             self.sealed_estimator_spec = None
+            self._sealed_estimator_type = None
             self.production_eligible = False
         self.feature_builder = feature_builder or FeatureBuilder()
         self._factory_contract = FrozenCallableContract.capture(
@@ -1622,16 +1634,15 @@ class ResidualTrainer:
 
     def attest_estimator(self, estimator: object) -> None:
         spec = self.sealed_estimator_spec
-        if not self.production_eligible or spec is None:
+        estimator_type = self._sealed_estimator_type
+        if (
+            not self.production_eligible
+            or spec is None
+            or estimator_type is None
+        ):
             raise TrainingContractError(
                 "estimator attestation requires the sealed production backend"
             )
-        try:
-            estimator_type = _load_xgb_regressor()
-        except Exception as exc:
-            raise TrainingContractError(
-                "estimator type could not be loaded for attestation"
-            ) from exc
         if type(estimator) is not estimator_type:
             raise TrainingContractError("estimator type failed attestation")
         parameters, parameters_json = _strict_estimator_parameters(estimator)

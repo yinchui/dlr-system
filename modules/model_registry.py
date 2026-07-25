@@ -603,6 +603,13 @@ class ModelLoadResult:
 
 
 @dataclass(frozen=True)
+class _GenerationHeader:
+    metadata: ModelMetadata
+    model_path: Path
+    model_checksum: str
+
+
+@dataclass(frozen=True)
 class ModelAttempt:
     key: ModelKey
     input_data_hash: str
@@ -1178,9 +1185,9 @@ class ModelRegistry:
             raise TypeError("attempt must be a ModelAttempt")
         try:
             with self._lock_for(attempt.key):
-                current = self._load_current_locked(attempt.key)
+                current = self._load_current_metadata_locked(attempt.key)
                 champion = (
-                    current.metadata if current.bundle is not None else None
+                    current.metadata if current.metadata is not None else None
                 )
                 current_attempt = replace(
                     attempt,
@@ -1312,16 +1319,13 @@ class ModelRegistry:
             )
         _enforce_private_mode(path, _PRIVATE_FILE_MODE)
 
-    def _read_generation(
+    def _read_generation_header(
         self,
         key: ModelKey,
         generation_dir: Path,
-        expected_compatibility: ModelCompatibility,
-        expected_training_contract_hash: str,
-        expected_backend_id: str,
-    ) -> ModelLoadResult:
+    ) -> tuple[Optional[_GenerationHeader], str]:
         if not self._validate_generation_location(key, generation_dir):
-            return self._fallback("corrupt_manifest")
+            return None, "corrupt_manifest"
         manifest_path = generation_dir / "manifest.json"
         metadata_path = generation_dir / "metadata.json"
         model_path = generation_dir / "model.joblib"
@@ -1331,28 +1335,28 @@ class ModelRegistry:
             manifest_bytes = manifest_path.read_bytes()
             manifest = json.loads(manifest_bytes.decode("utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            return self._fallback("corrupt_manifest")
+            return None, "corrupt_manifest"
         if not isinstance(manifest, dict) or not _MANIFEST_FIELDS.issubset(
             manifest
         ):
-            return self._fallback("corrupt_manifest")
+            return None, "corrupt_manifest"
         if (
             manifest["schema_version"] != 1
             or manifest["model_file"] != "model.joblib"
             or manifest["metadata_file"] != "metadata.json"
         ):
-            return self._fallback("corrupt_manifest")
+            return None, "corrupt_manifest"
         manifest_key = tuple(manifest[name] for name in _KEY_FIELDS)
         expected_key = tuple(getattr(key, name) for name in _KEY_FIELDS)
         if manifest_key != expected_key:
-            return self._fallback("manifest_scope_mismatch")
+            return None, "manifest_scope_mismatch"
 
         try:
             metadata_bytes = metadata_path.read_bytes()
         except OSError:
-            return self._fallback("corrupt_metadata")
+            return None, "corrupt_metadata"
         if hashlib.sha256(metadata_bytes).hexdigest() != manifest["metadata_checksum"]:
-            return self._fallback("corrupt_metadata")
+            return None, "corrupt_metadata"
         try:
             metadata = ModelMetadata.from_dict(
                 json.loads(metadata_bytes.decode("utf-8"))
@@ -1364,13 +1368,40 @@ class ModelRegistry:
             UnicodeDecodeError,
             json.JSONDecodeError,
         ):
-            return self._fallback("corrupt_metadata")
+            return None, "corrupt_metadata"
         if metadata.key != key:
-            return self._fallback("metadata_scope_mismatch")
+            return None, "metadata_scope_mismatch"
         if metadata.model_version != manifest["model_version"]:
-            return self._fallback("metadata_version_mismatch")
+            return None, "metadata_version_mismatch"
         if metadata.checksum != manifest["model_checksum"]:
-            return self._fallback("metadata_checksum_mismatch")
+            return None, "metadata_checksum_mismatch"
+        return (
+            _GenerationHeader(
+                metadata=metadata,
+                model_path=model_path,
+                model_checksum=manifest["model_checksum"],
+            ),
+            "",
+        )
+
+    @staticmethod
+    def _generation_model_checksum_is_valid(
+        header: _GenerationHeader,
+    ) -> bool:
+        try:
+            return _sha256_path(header.model_path) == header.model_checksum
+        except OSError:
+            return False
+
+    def _load_generation_header(
+        self,
+        key: ModelKey,
+        header: _GenerationHeader,
+        expected_compatibility: ModelCompatibility,
+        expected_training_contract_hash: str,
+        expected_backend_id: str,
+    ) -> ModelLoadResult:
+        metadata = header.metadata
 
         for field_name, actual in metadata.compatibility.to_dict().items():
             expected = getattr(expected_compatibility, field_name)
@@ -1382,14 +1413,10 @@ class ModelRegistry:
         if metadata.backend_id != expected_backend_id:
             return self._fallback("incompatible_backend_id")
 
-        try:
-            model_checksum = _sha256_path(model_path)
-        except OSError:
-            return self._fallback("corrupt_model")
-        if model_checksum != manifest["model_checksum"]:
+        if not self._generation_model_checksum_is_valid(header):
             return self._fallback("corrupt_model")
         try:
-            bundle = joblib.load(model_path)
+            bundle = joblib.load(header.model_path)
         except Exception:
             return self._fallback("corrupt_model")
         if not isinstance(bundle, ModelBundle):
@@ -1399,6 +1426,25 @@ class ModelRegistry:
         except (TypeError, ValueError, OverflowError):
             return self._fallback("invalid_model_contract")
         return ModelLoadResult(bundle, metadata, "")
+
+    def _read_generation(
+        self,
+        key: ModelKey,
+        generation_dir: Path,
+        expected_compatibility: ModelCompatibility,
+        expected_training_contract_hash: str,
+        expected_backend_id: str,
+    ) -> ModelLoadResult:
+        header, reason = self._read_generation_header(key, generation_dir)
+        if header is None:
+            return self._fallback(reason)
+        return self._load_generation_header(
+            key,
+            header,
+            expected_compatibility,
+            expected_training_contract_hash,
+            expected_backend_id,
+        )
 
     def _load_locked(
         self,
@@ -1423,43 +1469,53 @@ class ModelRegistry:
             expected_backend_id,
         )
 
-    def _load_current_locked(self, key: ModelKey) -> ModelLoadResult:
+    def _current_generation_header_locked(
+        self,
+        key: ModelKey,
+    ) -> tuple[Optional[_GenerationHeader], str]:
         target_dir = self._target_dir(key)
         if not self._safe_directory(target_dir.parent, create=False):
-            return self._fallback("model_not_found")
+            return None, "model_not_found"
         if not target_dir.is_symlink():
             if target_dir.exists() or target_dir.is_symlink():
-                return self._fallback("corrupt_manifest")
-            return self._fallback("model_not_found")
+                return None, "corrupt_manifest"
+            return None, "model_not_found"
         generation_dir = self._active_generation(key)
-        metadata_path = generation_dir / "metadata.json"
-        self._validate_artifact_path(metadata_path)
-        try:
-            metadata = ModelMetadata.from_dict(
-                json.loads(metadata_path.read_text(encoding="utf-8"))
-            )
-        except (
-            KeyError,
-            OSError,
-            TypeError,
-            ValueError,
-            UnicodeDecodeError,
-            json.JSONDecodeError,
-        ):
-            return self._fallback("corrupt_metadata")
+        return self._read_generation_header(key, generation_dir)
+
+    def _load_current_locked(self, key: ModelKey) -> ModelLoadResult:
+        header, reason = self._current_generation_header_locked(key)
+        if header is None:
+            return self._fallback(reason)
+        metadata = header.metadata
         if (
             metadata.key != key
             or metadata.backend_id != SEALED_XGBOOST_BACKEND_ID
             or metadata.training_contract_hash == _LEGACY_TRAINING_CONTRACT_HASH
         ):
             return self._fallback("invalid_model_contract")
-        return self._read_generation(
+        return self._load_generation_header(
             key,
-            generation_dir,
+            header,
             metadata.compatibility,
             metadata.training_contract_hash,
             metadata.backend_id,
         )
+
+    def _load_current_metadata_locked(self, key: ModelKey) -> ModelLoadResult:
+        header, reason = self._current_generation_header_locked(key)
+        if header is None:
+            return self._fallback(reason)
+        metadata = header.metadata
+        if (
+            metadata.key != key
+            or metadata.backend_id != SEALED_XGBOOST_BACKEND_ID
+            or metadata.training_contract_hash == _LEGACY_TRAINING_CONTRACT_HASH
+        ):
+            return self._fallback("invalid_model_contract")
+        if not self._generation_model_checksum_is_valid(header):
+            return self._fallback("corrupt_model")
+        return ModelLoadResult(None, metadata, "")
 
     def load(
         self,

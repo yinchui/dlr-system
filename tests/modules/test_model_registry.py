@@ -2849,6 +2849,85 @@ def test_cross_contract_rejection_cache_uses_locked_champion_context(tmp_path):
     assert registry.was_rejected(attempt) is True
 
 
+def test_rejection_lookup_does_not_deserialize_locked_champion(
+    tmp_path,
+    monkeypatch,
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    better = model_candidate(
+        key,
+        model_version="better-contract-a",
+        corrected_mae=0.5,
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+        training_contract_hash="a" * 64,
+    )
+    worse = model_candidate(
+        key,
+        model_version="worse-contract-b",
+        corrected_mae=1.5,
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+        training_contract_hash="b" * 64,
+    )
+    attempt = model_attempt(
+        registry,
+        key,
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+        training_contract_hash="b" * 64,
+        champion=None,
+    )
+    assert registry.promote(better).promoted is True
+    assert registry.promote(worse, attempt=attempt).promoted is False
+    load_calls = []
+
+    def reject_deserialization(*args, **kwargs):
+        load_calls.append((args, kwargs))
+        raise AssertionError("rejection lookup must not deserialize a model")
+
+    monkeypatch.setattr(model_registry.joblib, "load", reject_deserialization)
+
+    assert registry.was_rejected(attempt) is True
+    assert load_calls == []
+
+
+def test_corrupt_champion_checksum_invalidates_rejection_context(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    better = model_candidate(
+        key,
+        model_version="better-contract-a",
+        corrected_mae=0.5,
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+        training_contract_hash="a" * 64,
+    )
+    worse = model_candidate(
+        key,
+        model_version="worse-contract-b",
+        corrected_mae=1.5,
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+        training_contract_hash="b" * 64,
+    )
+    attempt = model_attempt(
+        registry,
+        key,
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+        training_contract_hash="b" * 64,
+        champion=None,
+    )
+    assert registry.promote(better).promoted is True
+    assert registry.promote(worse, attempt=attempt).promoted is False
+    assert registry.was_rejected(attempt) is True
+    registry.path_for(key).write_bytes(b"corrupt-model")
+
+    assert registry.was_rejected(attempt) is False
+
+
 def test_file_lock_serializes_competing_promotions_across_processes(tmp_path):
     key = ModelKey("project-a", "line-a", "001", "wind_speed")
     registry = ModelRegistry(tmp_path)

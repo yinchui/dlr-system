@@ -16,7 +16,11 @@ import joblib
 from filelock import FileLock
 
 from modules.ai_prediction import ModelBundle
-from modules.ai_training import SEALED_XGBOOST_BACKEND_ID
+from modules.ai_training import (
+    SEALED_XGBOOST_BACKEND_ID,
+    TrainingContractError,
+    verify_sealed_training_artifact,
+)
 
 
 _ALLOWED_TARGETS = frozenset({"wind_speed", "ambient_temp"})
@@ -62,6 +66,7 @@ _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
 _LEGACY_TRAINING_CONTRACT_HASH = "legacy-training-contract-v0"
 _LEGACY_BACKEND_ID = "legacy-training-backend-v0"
+_LEGACY_OUTCOME_MIGRATION_TOKEN = object()
 _ATTEMPT_POLICY_VERSION = "weather-promotion-v1"
 _ATTEMPT_LEDGER_FIELDS = frozenset(
     {"schema_version", *_KEY_FIELDS, "entries"}
@@ -240,6 +245,7 @@ class ModelMetadata:
     backend_id: str
     _allow_legacy_training_contract: InitVar[bool] = False
     _allow_legacy_backend: InitVar[bool] = False
+    _allow_legacy_training_outcome: InitVar[object] = None
     training_outcome: str = "trained"
     checksum: str = ""
     status: str = "candidate"
@@ -250,6 +256,7 @@ class ModelMetadata:
         self,
         _allow_legacy_training_contract: bool,
         _allow_legacy_backend: bool,
+        _allow_legacy_training_outcome: object,
     ) -> None:
         if not isinstance(self.key, ModelKey):
             raise TypeError("key must be a ModelKey")
@@ -376,6 +383,14 @@ class ModelMetadata:
         object.__setattr__(self, "cadence_minutes", float(self.cadence_minutes))
         if self.training_outcome not in _TRAINING_OUTCOMES:
             raise ValueError("unsupported training_outcome")
+        if (
+            self.training_outcome == "legacy"
+            and _allow_legacy_training_outcome
+            is not _LEGACY_OUTCOME_MIGRATION_TOKEN
+        ):
+            raise ValueError(
+                "legacy training outcome is reserved for metadata migration"
+            )
         if self.checksum:
             if len(self.checksum) != 64 or any(
                 character not in "0123456789abcdef" for character in self.checksum
@@ -413,7 +428,9 @@ class ModelMetadata:
         values.setdefault("status", "candidate")
         values.setdefault("metric_domain", "weather_vs_truth")
         values.setdefault("last_attempted_input_data_hash", None)
-        values.setdefault("training_outcome", "legacy")
+        missing_training_outcome = "training_outcome" not in values
+        if missing_training_outcome:
+            values["training_outcome"] = "legacy"
         missing_training_contract = "training_contract_hash" not in values
         if missing_training_contract:
             values["training_contract_hash"] = _LEGACY_TRAINING_CONTRACT_HASH
@@ -425,6 +442,11 @@ class ModelMetadata:
             compatibility=compatibility,
             _allow_legacy_training_contract=missing_training_contract,
             _allow_legacy_backend=missing_backend,
+            _allow_legacy_training_outcome=(
+                _LEGACY_OUTCOME_MIGRATION_TOKEN
+                if missing_training_outcome
+                else None
+            ),
             **values,
         )
 
@@ -686,14 +708,33 @@ def _validate_bundle(
         and bundle_backend_id != metadata.backend_id
     ):
         raise ValueError("bundle backend does not match metadata")
-    bundle_training_outcome = bundle.metadata.get("training_outcome", "trained")
-    if (
-        metadata.training_outcome != "legacy"
-        and bundle_training_outcome != metadata.training_outcome
-    ):
+    bundle_has_training_outcome = "training_outcome" in bundle.metadata
+    bundle_training_outcome = bundle.metadata.get("training_outcome")
+    if metadata.training_outcome == "legacy":
+        if bundle_has_training_outcome and bundle_training_outcome != "legacy":
+            raise ValueError("bundle training outcome does not match metadata")
+        if metadata.backend_id == SEALED_XGBOOST_BACKEND_ID:
+            try:
+                verify_sealed_training_artifact(
+                    bundle.model,
+                    backend_id=metadata.backend_id,
+                    training_outcome=metadata.training_outcome,
+                    random_seed=metadata.random_seed,
+                )
+            except TrainingContractError as exc:
+                raise ValueError(str(exc)) from exc
+        return
+    if bundle_training_outcome != metadata.training_outcome:
         raise ValueError("bundle training outcome does not match metadata")
-    if not hasattr(bundle.model, "predict"):
-        raise ValueError("bundle model must provide predict")
+    try:
+        verify_sealed_training_artifact(
+            bundle.model,
+            backend_id=metadata.backend_id,
+            training_outcome=metadata.training_outcome,
+            random_seed=metadata.random_seed,
+        )
+    except TrainingContractError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _sha256_path(path: Path) -> str:
@@ -1595,6 +1636,25 @@ class ModelRegistry:
         attempt: Optional[ModelAttempt],
     ) -> None:
         candidate.validate_integrity()
+        if candidate.metadata.backend_id != SEALED_XGBOOST_BACKEND_ID:
+            raise ValueError("only the sealed production backend can be promoted")
+        if candidate.metadata.training_outcome not in {
+            "trained",
+            "data_fallback",
+        }:
+            raise ValueError(
+                f"{candidate.metadata.training_outcome} training outcome "
+                "cannot be promoted"
+            )
+        try:
+            verify_sealed_training_artifact(
+                candidate.bundle.model,
+                backend_id=candidate.metadata.backend_id,
+                training_outcome=candidate.metadata.training_outcome,
+                random_seed=candidate.metadata.random_seed,
+            )
+        except TrainingContractError as exc:
+            raise ValueError(str(exc)) from exc
         if (
             candidate.metadata.training_contract_hash
             == _LEGACY_TRAINING_CONTRACT_HASH

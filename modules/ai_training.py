@@ -567,7 +567,7 @@ def _estimator_implementation_sha256(estimator_type: type) -> str:
     return _sha256_path(implementation_path)
 
 
-def _sealed_xgboost_backend() -> tuple[SealedEstimatorSpec, type]:
+def _sealed_xgboost_estimator_type() -> type:
     try:
         import xgboost
         from xgboost.sklearn import XGBRegressor as supported_estimator_type
@@ -595,6 +595,11 @@ def _sealed_xgboost_backend() -> tuple[SealedEstimatorSpec, type]:
         raise TrainingContractError(
             "sealed xgboost estimator class identity does not match policy"
         )
+    return supported_estimator_type
+
+
+def _sealed_xgboost_backend() -> tuple[SealedEstimatorSpec, type]:
+    estimator_type = _sealed_xgboost_estimator_type()
     try:
         estimator = estimator_type(**dict(_DEFAULT_ESTIMATOR_PARAMETERS))
     except Exception as exc:
@@ -625,6 +630,99 @@ def _sealed_xgboost_backend() -> tuple[SealedEstimatorSpec, type]:
 def sealed_xgboost_spec() -> SealedEstimatorSpec:
     spec, _ = _sealed_xgboost_backend()
     return spec
+
+
+def _sealed_estimator_parameters_match_policy(
+    estimator: object,
+    estimator_type: type,
+) -> None:
+    try:
+        expected_estimator = estimator_type(
+            **dict(_DEFAULT_ESTIMATOR_PARAMETERS)
+        )
+        expected_parameters = estimator_type.get_params(
+            expected_estimator,
+            deep=False,
+        )
+        actual_parameters = estimator_type.get_params(
+            estimator,
+            deep=False,
+        )
+    except Exception as exc:
+        raise TrainingContractError(
+            "sealed estimator parameters could not be verified"
+        ) from exc
+    if type(expected_parameters) is not dict or type(actual_parameters) is not dict:
+        raise TrainingContractError(
+            "sealed estimator parameters must be an exact mapping"
+        )
+    if len(actual_parameters) != len(expected_parameters):
+        raise TrainingContractError(
+            "sealed estimator parameters failed attestation"
+        )
+
+    missing = object()
+    for name, expected in expected_parameters.items():
+        if type(name) is not str:
+            raise TrainingContractError(
+                "sealed estimator parameter names failed attestation"
+            )
+        actual = dict.get(actual_parameters, name, missing)
+        if actual is missing or type(actual) is not type(expected):
+            raise TrainingContractError(
+                "sealed estimator parameters failed attestation"
+            )
+        if expected is not None and actual != expected:
+            label = "random seed" if name == "random_state" else "parameters"
+            raise TrainingContractError(
+                f"sealed estimator {label} failed attestation"
+            )
+
+
+def verify_sealed_training_artifact(
+    model: object,
+    *,
+    backend_id: str,
+    training_outcome: str,
+    random_seed: object,
+) -> None:
+    """Verify a persistable model without inspecting arbitrary callables."""
+    if backend_id != SEALED_XGBOOST_BACKEND_ID:
+        raise TrainingContractError(
+            "model artifact is not from the sealed production backend"
+        )
+    if type(random_seed) is not int or random_seed != 42:
+        raise TrainingContractError(
+            "model artifact random seed does not match sealed policy"
+        )
+    if training_outcome == "legacy":
+        training_outcome = (
+            "data_fallback"
+            if type(model) is ConstantResidualEstimator
+            else "trained"
+        )
+    if training_outcome == "data_fallback":
+        if type(model) is not ConstantResidualEstimator:
+            raise TrainingContractError(
+                "data fallback requires the exact constant residual estimator"
+            )
+        value = object.__getattribute__(model, "value")
+        if type(value) is not float or not np.isfinite(value):
+            raise TrainingContractError(
+                "data fallback value must be finite"
+            )
+        return
+    if training_outcome != "trained":
+        raise TrainingContractError(
+            f"{training_outcome} training outcome cannot be published"
+        )
+
+    estimator_type = _sealed_xgboost_estimator_type()
+    if type(model) is not estimator_type:
+        raise TrainingContractError(
+            "trained artifact requires the exact sealed XGBoost estimator"
+        )
+    _sealed_estimator_parameters_match_policy(model, estimator_type)
 
 
 def _bounded_contract_items(values, *, label: str) -> list:

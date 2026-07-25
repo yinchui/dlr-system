@@ -11,9 +11,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import modules.ai_training as ai_training
 import modules.model_registry as model_registry
 from modules.ai_prediction import ModelBundle
-from modules.ai_training import ResidualTrainer
+from modules.ai_training import (
+    ConstantResidualEstimator,
+    ResidualTrainer,
+    default_estimator,
+)
 from modules.model_registry import (
     ModelCandidate,
     ModelCompatibility,
@@ -64,6 +69,9 @@ def model_metadata(
     input_data_hash="input-a",
     training_contract_hash=DEFAULT_TRAINING_CONTRACT_HASH,
     backend_id=SEALED_BACKEND_ID,
+    training_outcome="data_fallback",
+    random_seed=42,
+    _allow_legacy_training_outcome=False,
     compatibility=None,
 ):
     metrics = dict(WEATHER_METRICS, corrected_mae=corrected_mae)
@@ -82,7 +90,7 @@ def model_metadata(
         model_version=model_version,
         feature_columns=(physical_col, "lag_1"),
         training_params={"max_depth": 3},
-        random_seed=42,
+        random_seed=random_seed,
         time_start="2025-01-01T00:00:00+08:00",
         time_end="2025-01-02T00:00:00+08:00",
         sample_count=4,
@@ -97,6 +105,8 @@ def model_metadata(
         cadence_minutes=30.0,
         training_contract_hash=training_contract_hash,
         backend_id=backend_id,
+        _allow_legacy_training_outcome=_allow_legacy_training_outcome,
+        training_outcome=training_outcome,
     )
 
 
@@ -117,12 +127,18 @@ class MeanResidualModel:
         return np.full(len(features), self.value, dtype=float)
 
 
+class ExplosivePredictor:
+    @property
+    def predict(self):
+        raise AssertionError("custom predictor attributes must not be inspected")
+
+
 def model_candidate(key, *, model_value=0.5, **metadata_options):
     metadata = model_metadata(key, **metadata_options)
     bundle = ModelBundle(
         target_name=key.target,
         feature_columns=list(metadata.feature_columns),
-        model=ConstantResidualModel(model_value),
+        model=ConstantResidualEstimator(model_value),
         cadence_minutes=metadata.cadence_minutes,
         residual_bounds=metadata.residual_bounds,
         line_id=key.line_id,
@@ -131,6 +147,39 @@ def model_candidate(key, *, model_value=0.5, **metadata_options):
             "training_contract": "task-9",
             "training_contract_hash": metadata.training_contract_hash,
             "backend_id": metadata.backend_id,
+            "training_outcome": metadata.training_outcome,
+        },
+    )
+    return ModelCandidate(key=key, bundle=bundle, metadata=metadata)
+
+
+def candidate_with_model(
+    key,
+    model,
+    *,
+    backend_id=SEALED_BACKEND_ID,
+    training_outcome="trained",
+    **metadata_options,
+):
+    metadata = model_metadata(
+        key,
+        backend_id=backend_id,
+        training_outcome=training_outcome,
+        **metadata_options,
+    )
+    bundle = ModelBundle(
+        target_name=key.target,
+        feature_columns=list(metadata.feature_columns),
+        model=model,
+        cadence_minutes=metadata.cadence_minutes,
+        residual_bounds=metadata.residual_bounds,
+        line_id=key.line_id,
+        tower_id=key.tower_id,
+        metadata={
+            "training_contract": "task-9",
+            "training_contract_hash": metadata.training_contract_hash,
+            "backend_id": metadata.backend_id,
+            "training_outcome": metadata.training_outcome,
         },
     )
     return ModelCandidate(key=key, bundle=bundle, metadata=metadata)
@@ -662,6 +711,124 @@ def test_legacy_metadata_without_backend_id_receives_migration_sentinel():
     assert restored.backend_id == LEGACY_BACKEND_ID
 
 
+def test_legacy_metadata_without_training_outcome_receives_migration_sentinel():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    payload = model_metadata(key).to_dict()
+    payload.pop("training_outcome")
+
+    restored = ModelMetadata.from_dict(payload)
+
+    assert restored.training_outcome == "legacy"
+
+
+def test_serialized_metadata_cannot_claim_legacy_training_outcome():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    payload = model_metadata(key).to_dict()
+    payload["training_outcome"] = "legacy"
+
+    with pytest.raises(ValueError, match="legacy.*training outcome"):
+        ModelMetadata.from_dict(payload)
+
+
+def test_new_metadata_cannot_claim_legacy_training_outcome():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    with pytest.raises(ValueError, match="legacy.*training outcome"):
+        model_metadata(key, training_outcome="legacy")
+
+
+def test_new_metadata_cannot_enable_legacy_outcome_migration_flag():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    with pytest.raises(ValueError, match="legacy.*training outcome"):
+        model_metadata(
+            key,
+            training_outcome="legacy",
+            _allow_legacy_training_outcome=True,
+        )
+
+
+@pytest.mark.parametrize("bundle_outcome", ["trained", "operational_fallback"])
+def test_migrated_legacy_outcome_rejects_explicit_bundle_outcome(bundle_outcome):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    payload = model_metadata(key).to_dict()
+    payload.pop("training_outcome")
+    metadata = ModelMetadata.from_dict(payload)
+    model = (
+        default_estimator()
+        if bundle_outcome == "trained"
+        else ConstantResidualEstimator(0.5)
+    )
+    bundle = ModelBundle(
+        target_name=key.target,
+        feature_columns=list(metadata.feature_columns),
+        model=model,
+        cadence_minutes=metadata.cadence_minutes,
+        residual_bounds=metadata.residual_bounds,
+        line_id=key.line_id,
+        tower_id=key.tower_id,
+        metadata={
+            "training_contract_hash": metadata.training_contract_hash,
+            "backend_id": metadata.backend_id,
+            "training_outcome": bundle_outcome,
+        },
+    )
+
+    with pytest.raises(ValueError, match="training outcome"):
+        ModelCandidate(key=key, bundle=bundle, metadata=metadata)
+
+
+@pytest.mark.parametrize("persisted_outcome", [None, "legacy"])
+def test_migrated_legacy_outcome_accepts_matching_bundle_contract(
+    persisted_outcome,
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    payload = model_metadata(key).to_dict()
+    payload.pop("training_outcome")
+    metadata = ModelMetadata.from_dict(payload)
+    bundle_metadata = {
+        "training_contract_hash": metadata.training_contract_hash,
+        "backend_id": metadata.backend_id,
+    }
+    if persisted_outcome is not None:
+        bundle_metadata["training_outcome"] = persisted_outcome
+    bundle = ModelBundle(
+        target_name=key.target,
+        feature_columns=list(metadata.feature_columns),
+        model=default_estimator(),
+        cadence_minutes=metadata.cadence_minutes,
+        residual_bounds=metadata.residual_bounds,
+        line_id=key.line_id,
+        tower_id=key.tower_id,
+        metadata=bundle_metadata,
+    )
+
+    model_registry._validate_bundle(key, bundle, metadata)
+
+
+def test_migrated_legacy_outcome_still_rejects_custom_predictor():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    payload = model_metadata(key).to_dict()
+    payload.pop("training_outcome")
+    metadata = ModelMetadata.from_dict(payload)
+    bundle = ModelBundle(
+        target_name=key.target,
+        feature_columns=list(metadata.feature_columns),
+        model=ExplosivePredictor(),
+        cadence_minutes=metadata.cadence_minutes,
+        residual_bounds=metadata.residual_bounds,
+        line_id=key.line_id,
+        tower_id=key.tower_id,
+        metadata={
+            "training_contract_hash": metadata.training_contract_hash,
+            "backend_id": metadata.backend_id,
+        },
+    )
+
+    with pytest.raises(ValueError, match="sealed|model|estimator"):
+        model_registry._validate_bundle(key, bundle, metadata)
+
+
 def test_serialized_metadata_cannot_claim_the_legacy_backend_id():
     key = ModelKey("project-a", "line-a", "001", "wind_speed")
     payload = model_metadata(key).to_dict()
@@ -838,9 +1005,15 @@ def test_promote_replaces_champion_outside_candidate_sealed_contract(tmp_path):
             model_version="same-version",
             input_data_hash="same-input",
             training_contract_hash="a" * 64,
-            backend_id="xgboost-residual-v0",
             model_value=0.5,
         )
+    )
+    rewrite_persisted_metadata(
+        registry,
+        key,
+        lambda payload: payload.__setitem__(
+            "backend_id", "xgboost-residual-v0"
+        ),
     )
 
     decision = registry.promote(
@@ -1578,12 +1751,13 @@ def test_candidate_defensively_copies_and_freezes_bundle_metadata():
         "training_contract": "task-9",
         "training_contract_hash": "c" * 64,
         "backend_id": SEALED_BACKEND_ID,
+        "training_outcome": "data_fallback",
     }
     metadata = model_metadata(key)
     bundle = ModelBundle(
         target_name=key.target,
         feature_columns=list(metadata.feature_columns),
-        model=ConstantResidualModel(),
+        model=ConstantResidualEstimator(0.5),
         cadence_minutes=metadata.cadence_minutes,
         residual_bounds=metadata.residual_bounds,
         line_id=key.line_id,
@@ -1613,11 +1787,274 @@ def test_candidate_rejects_bundle_backend_mismatch():
         metadata={
             "training_contract_hash": metadata.training_contract_hash,
             "backend_id": "different-backend",
+            "training_outcome": metadata.training_outcome,
         },
     )
 
     with pytest.raises(ValueError, match="backend"):
         ModelCandidate(key=key, bundle=bundle, metadata=metadata)
+
+
+def test_candidate_rejects_nonsealed_backend_with_custom_predictor():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    with pytest.raises(ValueError, match="sealed|backend"):
+        candidate_with_model(
+            key,
+            ConstantResidualModel(),
+            backend_id="xgboost-residual-v0",
+        )
+
+
+def test_candidate_rejects_custom_predictor_with_sealed_backend_label():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    with pytest.raises(ValueError, match="sealed|model|estimator"):
+        candidate_with_model(key, ConstantResidualModel())
+
+
+def test_candidate_rejects_custom_predictor_without_reading_its_attributes():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    with pytest.raises(ValueError, match="sealed|model|estimator"):
+        candidate_with_model(key, ExplosivePredictor())
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value"),
+    [("random_state", None), ("max_depth", 4)],
+)
+def test_candidate_rejects_xgboost_parameter_or_seed_mismatch(parameter, value):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    estimator = default_estimator()
+    estimator.set_params(**{parameter: value})
+
+    with pytest.raises(ValueError, match="parameter|seed|attestation"):
+        candidate_with_model(key, estimator)
+
+
+def test_candidate_rejects_metadata_seed_mismatch():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    with pytest.raises(ValueError, match="seed|random_state"):
+        candidate_with_model(
+            key,
+            default_estimator(),
+            random_seed=None,
+        )
+
+
+def test_candidate_accepts_exact_sealed_xgboost_for_trained_outcome(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    candidate = candidate_with_model(
+        key,
+        default_estimator(),
+        evaluation_mode="full_fit",
+    )
+
+    decision = registry.promote(candidate)
+
+    assert decision.promoted is True
+    assert registry.path_for(key).is_file()
+
+
+def test_registry_artifact_verification_does_not_resolve_distributions(
+    tmp_path,
+    monkeypatch,
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+
+    def fail_if_distribution_mapping_is_read():
+        raise AssertionError("artifact verification repeated distribution mapping")
+
+    monkeypatch.setattr(
+        ai_training.importlib.metadata,
+        "packages_distributions",
+        fail_if_distribution_mapping_is_read,
+    )
+    candidate = candidate_with_model(
+        key,
+        default_estimator(),
+        evaluation_mode="full_fit",
+    )
+
+    decision = registry.promote(candidate)
+
+    assert decision.promoted is True
+
+
+def test_load_converts_artifact_verification_error_to_stable_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    registry.promote(model_candidate(key, evaluation_mode="full_fit"))
+
+    def fail_artifact_verification(*args, **kwargs):
+        raise model_registry.TrainingContractError("attestation failed")
+
+    monkeypatch.setattr(
+        model_registry,
+        "verify_sealed_training_artifact",
+        fail_artifact_verification,
+    )
+
+    loaded = load_model(registry, key)
+
+    assert loaded.bundle is None
+    assert loaded.fallback_reason == "invalid_model_contract"
+
+
+def test_candidate_accepts_finite_constant_for_data_fallback(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+
+    decision = registry.promote(
+        model_candidate(key, evaluation_mode="full_fit", model_value=0.5)
+    )
+
+    assert decision.promoted is True
+    assert registry.path_for(key).is_file()
+
+
+def test_candidate_rejects_nonfinite_data_fallback():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    with pytest.raises(ValueError, match="finite|data fallback"):
+        candidate_with_model(
+            key,
+            ConstantResidualEstimator(float("nan")),
+            training_outcome="data_fallback",
+        )
+
+
+def test_operational_fallback_cannot_enter_registry_lifecycle(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+
+    with pytest.raises(ValueError, match="operational|outcome|publish"):
+        registry.promote(
+            candidate_with_model(
+                key,
+                ConstantResidualEstimator(0.5),
+                training_outcome="operational_fallback",
+            )
+        )
+
+    assert not registry.path_for(key).exists()
+    assert not registry.metadata_path_for(key).exists()
+    assert not registry.manifest_path_for(key).exists()
+    assert not registry.attempt_path_for(key).exists()
+
+
+def test_promote_revalidates_replaced_model_before_lock_or_sidecar(
+    tmp_path,
+    monkeypatch,
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    candidate = model_candidate(
+        key,
+        corrected_mae=WEATHER_METRICS["baseline_mae"],
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+    )
+    attempt = model_attempt(
+        registry,
+        key,
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+    )
+    candidate.bundle.model = ConstantResidualModel()
+
+    def fail_if_lock_is_requested(*args, **kwargs):
+        raise AssertionError("promotion requested a lock before artifact validation")
+
+    monkeypatch.setattr(registry, "_lock_for", fail_if_lock_is_requested)
+
+    with pytest.raises(ValueError, match="sealed|model|estimator"):
+        registry.promote(candidate, attempt=attempt)
+
+    assert not registry.path_for(key).exists()
+    assert not registry.metadata_path_for(key).exists()
+    assert not registry.manifest_path_for(key).exists()
+    assert not registry.attempt_path_for(key).exists()
+    assert not (tmp_path / ".locks").exists()
+
+
+def test_promote_revalidates_backend_before_lock_or_sidecar(
+    tmp_path,
+    monkeypatch,
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    candidate = model_candidate(
+        key,
+        corrected_mae=WEATHER_METRICS["baseline_mae"],
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+    )
+    attempt = model_attempt(
+        registry,
+        key,
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+    )
+    object.__setattr__(
+        candidate,
+        "metadata",
+        model_metadata(
+            key,
+            corrected_mae=WEATHER_METRICS["baseline_mae"],
+            input_data_hash="a" * 64,
+            evaluation_set_hash="e" * 64,
+            backend_id="xgboost-residual-v0",
+        ),
+    )
+    candidate.bundle.metadata = {
+        **candidate.bundle.metadata,
+        "backend_id": "xgboost-residual-v0",
+    }
+    object.__setattr__(
+        candidate,
+        "_integrity_hash",
+        candidate._current_integrity_hash(),
+    )
+
+    def fail_if_lock_is_requested(*args, **kwargs):
+        raise AssertionError("promotion requested a lock before backend validation")
+
+    monkeypatch.setattr(registry, "_lock_for", fail_if_lock_is_requested)
+
+    with pytest.raises(ValueError, match="sealed|backend"):
+        registry.promote(candidate, attempt=attempt)
+
+    assert not registry.path_for(key).exists()
+    assert not registry.metadata_path_for(key).exists()
+    assert not registry.manifest_path_for(key).exists()
+    assert not registry.attempt_path_for(key).exists()
+    assert not (tmp_path / ".locks").exists()
+
+
+def test_promote_revalidates_mutated_xgboost_parameters(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    candidate = candidate_with_model(
+        key,
+        default_estimator(),
+        evaluation_mode="full_fit",
+    )
+    candidate.bundle.model.set_params(random_state=7)
+
+    with pytest.raises(ValueError, match="parameter|seed|attestation"):
+        registry.promote(candidate)
+
+    assert not registry.path_for(key).exists()
+    assert not registry.metadata_path_for(key).exists()
+    assert not registry.manifest_path_for(key).exists()
 
 
 def test_post_replace_permission_probe_cannot_report_unpersisted_attempt(
@@ -1752,12 +2189,13 @@ def test_load_rejects_model_from_different_training_contract(tmp_path):
 def test_load_rejects_model_from_different_backend(tmp_path):
     key = ModelKey("project-a", "line-a", "001", "wind_speed")
     registry = ModelRegistry(tmp_path)
-    registry.promote(
-        model_candidate(
-            key,
-            evaluation_mode="full_fit",
-            backend_id="xgboost-residual-v0",
-        )
+    registry.promote(model_candidate(key, evaluation_mode="full_fit"))
+    rewrite_persisted_metadata(
+        registry,
+        key,
+        lambda payload: payload.__setitem__(
+            "backend_id", "xgboost-residual-v0"
+        ),
     )
 
     loaded = registry.load(

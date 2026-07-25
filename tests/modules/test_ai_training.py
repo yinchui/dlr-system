@@ -1,3 +1,4 @@
+import importlib.metadata
 import json
 import types
 from dataclasses import dataclass, replace
@@ -958,22 +959,14 @@ def test_estimator_exception_falls_back_without_blocking_training():
     assert np.isfinite(prediction).all()
 
 
-def test_missing_xgboost_falls_back_to_median_residual(monkeypatch):
+def test_missing_xgboost_fails_closed_before_training(monkeypatch):
     def unavailable():
         raise ImportError("xgboost unavailable")
 
     monkeypatch.setattr(ai_training, "_load_xgb_regressor", unavailable)
 
-    result = ResidualTrainer().train_target(
-        make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0)),
-        target="wind_speed",
-    )
-
-    assert result.metadata["fallback_reason"] == "xgboost_unavailable"
-    assert result.training_outcome == "operational_fallback"
-    assert result.metadata["training_outcome"] == "operational_fallback"
-    prediction = result.bundle.model.predict(np.zeros((2, 1)))
-    assert prediction.tolist() == [1.5, 1.5]
+    with pytest.raises(ai_training.TrainingContractError, match="xgboost"):
+        ResidualTrainer()
 
 
 def test_constant_residual_is_a_data_fallback_not_an_operational_failure():
@@ -1192,7 +1185,216 @@ def test_default_estimator_has_deterministic_xgboost_parameters(monkeypatch):
         "colsample_bytree": 0.9,
         "random_state": 42,
         "n_jobs": 1,
+        "missing": -1.0e30,
     }
+
+
+def test_default_trainer_has_sealed_xgboost_spec():
+    trainer = ResidualTrainer()
+    spec = trainer.sealed_estimator_spec
+
+    assert trainer.production_eligible is True
+    assert spec.schema_version == 1
+    assert spec.backend_id == "xgboost-residual-v1"
+    assert spec.estimator_path == "xgboost.XGBRegressor"
+    assert spec.parameters["random_state"] == 42
+    assert spec.parameters["n_jobs"] == 1
+    assert spec.parameters["missing"] == -1.0e30
+    assert dict(spec.distributions)["xgboost"] == importlib.metadata.version(
+        "xgboost"
+    )
+    assert len(spec.implementation_sha256) == 64
+    assert spec.policy_version == "weather-residual-training-v1"
+    assert len(spec.digest()) == 64
+
+
+@pytest.mark.parametrize("factory", [MeanResidualEstimator, ai_training.default_estimator])
+def test_explicit_estimator_factory_is_not_production_eligible(factory):
+    trainer = ResidualTrainer(estimator_factory=factory)
+
+    assert trainer.production_eligible is False
+    assert trainer.sealed_estimator_spec is None
+
+
+def test_sealed_xgboost_parameters_cannot_be_mutated():
+    spec = ResidualTrainer().sealed_estimator_spec
+
+    with pytest.raises(TypeError):
+        spec.parameters["random_state"] = None
+
+    assert spec.parameters["random_state"] == 42
+
+
+def test_estimator_attestation_accepts_exact_frozen_parameters():
+    trainer = ResidualTrainer()
+    estimator = ai_training.default_estimator()
+
+    assert estimator.get_params(deep=False) == dict(
+        trainer.sealed_estimator_spec.parameters
+    )
+    trainer.attest_estimator(estimator)
+
+
+def test_default_sealed_estimator_fits_and_predicts_with_frozen_parameters():
+    trainer = ResidualTrainer()
+
+    result = trainer.train_target(
+        make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0)),
+        target="wind_speed",
+    )
+
+    assert result.training_outcome == "trained"
+    assert type(result.bundle.model) is ai_training._load_xgb_regressor()
+    assert result.bundle.model.get_params(deep=False) == dict(
+        trainer.sealed_estimator_spec.parameters
+    )
+
+
+def test_estimator_attestation_rejects_random_seed_mismatch():
+    trainer = ResidualTrainer()
+    estimator = ai_training.default_estimator()
+    estimator.set_params(random_state=None)
+
+    with pytest.raises(
+        ai_training.TrainingContractError,
+        match="attestation|random_state|parameter",
+    ):
+        trainer.attest_estimator(estimator)
+
+
+def test_estimator_attestation_rejects_non_seed_parameter_mismatch():
+    trainer = ResidualTrainer()
+    estimator = ai_training.default_estimator()
+    estimator.set_params(max_depth=99)
+
+    with pytest.raises(
+        ai_training.TrainingContractError,
+        match="attestation|parameter",
+    ):
+        trainer.attest_estimator(estimator)
+
+
+def test_estimator_attestation_rejects_type_mismatch():
+    trainer = ResidualTrainer()
+
+    with pytest.raises(
+        ai_training.TrainingContractError,
+        match="attestation|type",
+    ):
+        trainer.attest_estimator(MeanResidualEstimator())
+
+
+def test_constant_residual_estimator_is_not_the_sealed_xgboost_estimator():
+    trainer = ResidualTrainer()
+    fallback = trainer._fallback_estimator(np.array([1.0, 2.0]))
+
+    assert isinstance(fallback, ai_training.ConstantResidualEstimator)
+    assert trainer.sealed_estimator_spec.estimator_path == "xgboost.XGBRegressor"
+    with pytest.raises(ai_training.TrainingContractError, match="attestation|type"):
+        trainer.attest_estimator(fallback)
+
+
+def test_sealed_xgboost_spec_rejects_missing_distribution_mapping(monkeypatch):
+    monkeypatch.setattr(
+        ai_training.importlib.metadata,
+        "packages_distributions",
+        lambda: {},
+    )
+
+    with pytest.raises(ai_training.TrainingContractError, match="distribution"):
+        ai_training.sealed_xgboost_spec()
+
+
+def test_sealed_xgboost_spec_rejects_ambiguous_distribution_mapping(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        ai_training.importlib.metadata,
+        "packages_distributions",
+        lambda: {"xgboost": ["xgboost", "xgboost-alternate"]},
+    )
+
+    with pytest.raises(ai_training.TrainingContractError, match="distribution"):
+        ai_training.sealed_xgboost_spec()
+
+
+def test_sealed_xgboost_spec_rejects_unreadable_distribution_version(
+    monkeypatch,
+):
+    def unreadable_version(distribution):
+        raise RuntimeError(f"cannot read {distribution}")
+
+    monkeypatch.setattr(
+        ai_training.importlib.metadata,
+        "packages_distributions",
+        lambda: {"xgboost": ["xgboost"]},
+    )
+    monkeypatch.setattr(
+        ai_training.importlib.metadata,
+        "version",
+        unreadable_version,
+    )
+
+    with pytest.raises(ai_training.TrainingContractError, match="version"):
+        ai_training.sealed_xgboost_spec()
+
+
+def test_estimator_attestation_rejects_distribution_version_change(monkeypatch):
+    trainer = ResidualTrainer()
+    estimator = ai_training.default_estimator()
+    original_version = importlib.metadata.version("xgboost")
+    monkeypatch.setattr(
+        ai_training.importlib.metadata,
+        "version",
+        lambda distribution: f"{original_version}-changed",
+    )
+
+    with pytest.raises(
+        ai_training.TrainingContractError,
+        match="attestation|distribution|version",
+    ):
+        trainer.attest_estimator(estimator)
+
+
+def test_estimator_attestation_rejects_implementation_hash_change(monkeypatch):
+    trainer = ResidualTrainer()
+    estimator = ai_training.default_estimator()
+    expected = trainer.sealed_estimator_spec.implementation_sha256
+    changed = "0" * 64 if expected != "0" * 64 else "1" * 64
+    monkeypatch.setattr(ai_training, "_sha256_path", lambda path: changed)
+
+    with pytest.raises(
+        ai_training.TrainingContractError,
+        match="attestation|implementation|hash",
+    ):
+        trainer.attest_estimator(estimator)
+
+
+def test_default_estimator_is_attested_after_construction_and_before_fit(
+    monkeypatch,
+):
+    trainer = ResidualTrainer()
+    estimator = ai_training.default_estimator()
+    events = []
+    original_fit = estimator.fit
+
+    def recording_attestation(candidate):
+        assert candidate is estimator
+        events.append("attest")
+
+    def recording_fit(features, target):
+        events.append("fit")
+        return original_fit(features, target)
+
+    monkeypatch.setattr(trainer, "estimator_factory", lambda: estimator)
+    monkeypatch.setattr(trainer, "attest_estimator", recording_attestation)
+    monkeypatch.setattr(estimator, "fit", recording_fit)
+    trainer._fit_estimator(
+        pd.DataFrame({"feature": [0.0, 1.0]}),
+        np.array([0.0, 1.0]),
+    )
+
+    assert events[:3] == ["attest", "attest", "fit"]
 
 
 def test_training_parameter_metadata_never_persists_secret_object_content():

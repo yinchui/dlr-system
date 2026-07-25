@@ -10,8 +10,9 @@ import json
 import platform
 import sys
 import types
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 import numpy as np
@@ -56,6 +57,7 @@ _DEFAULT_ESTIMATOR_PARAMETERS = (
     ("colsample_bytree", 0.9),
     ("random_state", 42),
     ("n_jobs", 1),
+    ("missing", -1.0e30),
 )
 _MAX_CONTRACT_DEPTH = 12
 _MAX_CONTRACT_ITEMS = 256
@@ -104,6 +106,25 @@ _SENSITIVE_PARAMETER_MARKERS = frozenset(
 
 class TrainingContractError(RuntimeError):
     """Raised when executable training configuration cannot be frozen safely."""
+
+
+@dataclass(frozen=True)
+class SealedEstimatorSpec:
+    schema_version: int
+    backend_id: str
+    estimator_path: str
+    parameters_json: str
+    random_seed: int
+    distributions: tuple[tuple[str, str], ...]
+    implementation_sha256: str
+    policy_version: str
+
+    @property
+    def parameters(self) -> Mapping[str, Any]:
+        return MappingProxyType(json.loads(self.parameters_json))
+
+    def digest(self) -> str:
+        return _stable_json_hash(asdict(self))
 
 
 class _FactoryContractContext:
@@ -379,6 +400,108 @@ def _qualified_name(value: Any) -> str:
     module = getattr(value, "__module__", type(value).__module__)
     qualname = getattr(value, "__qualname__", type(value).__qualname__)
     return f"{module}.{qualname}"
+
+
+def _resolved_distribution_versions(module_name: str) -> dict[str, str]:
+    if not isinstance(module_name, str) or not module_name.strip():
+        raise TrainingContractError("estimator import root has no distribution")
+    import_root = module_name.partition(".")[0]
+    try:
+        package_map = importlib.metadata.packages_distributions()
+    except Exception as exc:
+        raise TrainingContractError(
+            "estimator distribution mapping could not be read"
+        ) from exc
+    if not isinstance(package_map, Mapping):
+        raise TrainingContractError("estimator distribution mapping is invalid")
+    distributions = package_map.get(import_root)
+    if not isinstance(distributions, (list, tuple)) or not distributions:
+        raise TrainingContractError(
+            f"distribution mapping is missing for import root {import_root}"
+        )
+    normalized = []
+    for distribution in distributions:
+        if not isinstance(distribution, str) or not distribution.strip():
+            raise TrainingContractError(
+                f"distribution mapping is invalid for import root {import_root}"
+            )
+        normalized.append(distribution.strip())
+    names = tuple(sorted(set(normalized)))
+    if len(names) != 1:
+        raise TrainingContractError(
+            f"distribution mapping is ambiguous for import root {import_root}"
+        )
+    distribution = names[0]
+    try:
+        version = importlib.metadata.version(distribution)
+    except Exception as exc:
+        raise TrainingContractError(
+            f"distribution version is unreadable for {distribution}"
+        ) from exc
+    if not isinstance(version, str) or not version.strip():
+        raise TrainingContractError(
+            f"distribution version is unreadable for {distribution}"
+        )
+    return {distribution: version.strip()}
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise TrainingContractError(
+            "estimator implementation file could not be read"
+        ) from exc
+    return digest.hexdigest()
+
+
+def _estimator_implementation_sha256(estimator_type: type) -> str:
+    try:
+        implementation_path = Path(inspect.getfile(estimator_type)).resolve(
+            strict=True
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise TrainingContractError(
+            "estimator implementation file could not be resolved"
+        ) from exc
+    if not implementation_path.is_file():
+        raise TrainingContractError("estimator implementation path is not a file")
+    return _sha256_path(implementation_path)
+
+
+def sealed_xgboost_spec() -> SealedEstimatorSpec:
+    try:
+        estimator_type = _load_xgb_regressor()
+        estimator = estimator_type(**dict(_DEFAULT_ESTIMATOR_PARAMETERS))
+    except Exception as exc:
+        raise TrainingContractError(
+            "sealed xgboost estimator is unavailable"
+        ) from exc
+    try:
+        parameters = estimator.get_params(deep=False)
+        parameters_json = _canonical_json(dict(parameters))
+    except Exception as exc:
+        raise TrainingContractError(
+            "sealed xgboost parameters could not be frozen"
+        ) from exc
+    if parameters.get("random_state") != 42:
+        raise TrainingContractError(
+            "sealed xgboost random_state does not match policy"
+        )
+    distributions = _resolved_distribution_versions(estimator_type.__module__)
+    return SealedEstimatorSpec(
+        schema_version=1,
+        backend_id="xgboost-residual-v1",
+        estimator_path="xgboost.XGBRegressor",
+        parameters_json=parameters_json,
+        random_seed=42,
+        distributions=tuple(sorted(distributions.items())),
+        implementation_sha256=_estimator_implementation_sha256(estimator_type),
+        policy_version="weather-residual-training-v1",
+    )
 
 
 def _bounded_contract_items(values, *, label: str) -> list:
@@ -1394,7 +1517,14 @@ class ResidualTrainer:
         estimator_factory: Optional[Callable[[], object]] = None,
         feature_builder: Optional[FeatureBuilder] = None,
     ):
-        self.estimator_factory = estimator_factory or default_estimator
+        if estimator_factory is None:
+            self.estimator_factory = default_estimator
+            self.sealed_estimator_spec = sealed_xgboost_spec()
+            self.production_eligible = True
+        else:
+            self.estimator_factory = estimator_factory
+            self.sealed_estimator_spec = None
+            self.production_eligible = False
         self.feature_builder = feature_builder or FeatureBuilder()
         self._factory_contract = FrozenCallableContract.capture(
             self.estimator_factory
@@ -1421,6 +1551,48 @@ class ResidualTrainer:
 
     def _assert_factory_contract(self) -> None:
         self._factory_contract.verify(self.estimator_factory)
+
+    def attest_estimator(self, estimator: object) -> None:
+        spec = self.sealed_estimator_spec
+        if not self.production_eligible or spec is None:
+            raise TrainingContractError(
+                "estimator attestation requires the sealed production backend"
+            )
+        try:
+            estimator_type = _load_xgb_regressor()
+        except Exception as exc:
+            raise TrainingContractError(
+                "estimator type could not be loaded for attestation"
+            ) from exc
+        if type(estimator) is not estimator_type:
+            raise TrainingContractError("estimator type failed attestation")
+        try:
+            parameters = estimator.get_params(deep=False)
+            parameters_json = _canonical_json(dict(parameters))
+        except Exception as exc:
+            raise TrainingContractError(
+                "estimator parameters could not be read for attestation"
+            ) from exc
+        if parameters.get("random_state") != spec.random_seed:
+            raise TrainingContractError(
+                "estimator random_state failed attestation"
+            )
+        if parameters_json != spec.parameters_json:
+            raise TrainingContractError("estimator parameters failed attestation")
+        distributions = tuple(
+            sorted(
+                _resolved_distribution_versions(estimator_type.__module__).items()
+            )
+        )
+        if distributions != spec.distributions:
+            raise TrainingContractError(
+                "estimator distribution versions failed attestation"
+            )
+        implementation_sha256 = _estimator_implementation_sha256(estimator_type)
+        if implementation_sha256 != spec.implementation_sha256:
+            raise TrainingContractError(
+                "estimator implementation hash failed attestation"
+            )
 
     def training_contract_descriptor(self) -> dict[str, Any]:
         self._assert_factory_contract()
@@ -1609,8 +1781,12 @@ class ResidualTrainer:
                 self._fallback_estimator(residual),
                 f"estimator_factory_failed:{type(exc).__name__}",
             )
+        if self.production_eligible:
+            self.attest_estimator(estimator)
         if not hasattr(estimator, "fit") or not hasattr(estimator, "predict"):
             return self._fallback_estimator(residual), "invalid_estimator"
+        if self.production_eligible:
+            self.attest_estimator(estimator)
         try:
             estimator.fit(features, residual)
         except Exception as exc:

@@ -996,6 +996,8 @@ git add modules/dlr_pipeline.py tests/integration/test_dlr_pipeline.py dispatch_
 git commit -m "feat: run corrected weather models in the DLR pipeline"
 ~~~
 
+> **Task 11 sealed 后端附加实施状态（2026-07-26）：** `docs/plans/2026-07-24-sealed-training-backend.md` 的 Task 1-5 已完成，生产持久化已收口到 sealed XGBoost，真实后端训练/复用验收通过。Task 6 的最终双阶段审查仍是进入 Task 12 前的强制门禁；本标记不表示 Task 12 已开始或完成。
+
 ### Task 12: 增加结构化审计和原子结果写入
 
 **Files:**

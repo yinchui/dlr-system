@@ -38,6 +38,35 @@ python3 -m pytest tests/utils/ -v
 
 ---
 
+## Sealed XGBoost 生产模型验收
+
+DLR 生产模型持久化只支持默认的 sealed XGBoost 后端 `xgboost-residual-v1`。自定义 trainer 或 `estimator_factory` 仍可用于不持久化的训练单元测试，但不能成为 AI 数据源，不能写入模型，也不能写入质量拒绝缓存；生产流水线会按杆塔和目标回退到物理气象。
+
+启动和每次拟合时都会校验以下合同：
+
+- estimator 必须是精确的 `xgboost.XGBRegressor` 类型；
+- 参数必须与冻结策略完全一致：`objective=reg:squarederror`、`n_estimators=120`、`max_depth=3`、`learning_rate=0.05`、`subsample=0.9`、`colsample_bytree=0.9`、`random_state=42`、`n_jobs=1`、`missing=-1e30`；
+- 当前安装的 XGBoost distribution 版本和实现文件 SHA-256 必须与 sealed spec 一致；当前验收环境为 XGBoost `3.2.0`，代码不把该版本写死，而是在运行时读取并绑定；
+- Python、NumPy、Pandas、joblib、XGBoost、后端标识或 sealed spec 变化时，旧模型和旧拒绝记录按 `project/line/tower/target` 独立失效，不影响其他杆塔；
+- 依赖或后端恢复正常后，操作性失败和不受支持后端不会阻止后续重试。
+
+真实后端训练、保存和复用验收：
+
+```bash
+python3 -m pytest tests/integration/test_sealed_xgboost_lifecycle.py -q
+```
+
+sealed 后端边界、依赖失效、质量拒绝缓存和重试覆盖位于 DLR 集成套件：
+
+```bash
+python3 -m pytest tests/integration/test_dlr_pipeline.py -q
+python3 -m pytest tests/modules/test_ai_training.py tests/modules/test_model_registry.py tests/integration/test_dlr_pipeline.py -q
+```
+
+Task 11 的 sealed 后端实现通过最终双阶段审查后，下一项实施任务是 Task 12“结构化审计和原子结果写入”。
+
+---
+
 ## 测试覆盖的功能
 
 ### 1. 配置模块 (config/)

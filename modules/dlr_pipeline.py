@@ -931,11 +931,19 @@ class DlrPipeline:
         return self.trainer
 
     def _sealed_trainer_for_interval(self, interval_minutes: float) -> ResidualTrainer:
+        if self.trainer is not None:
+            if type(self.trainer) is not ResidualTrainer:
+                raise TrainingContractError("unsupported_training_backend")
+            if not object.__getattribute__(
+                self.trainer, "production_eligible"
+            ):
+                raise TrainingContractError("unsupported_training_backend")
         trainer = self._trainer_for_interval(interval_minutes)
         if type(trainer) is not ResidualTrainer or not trainer.production_eligible:
             raise TrainingContractError("unsupported_training_backend")
+        trainer_state = object.__getattribute__(trainer, "__dict__")
         if any(
-            method_name in trainer.__dict__
+            method_name in trainer_state
             for method_name in ("prepare_target", "train_prepared")
         ):
             raise TrainingContractError("unsupported_training_backend")

@@ -670,14 +670,6 @@ class _CountingTrainer:
         self.calls.append((preparation.tower_id, preparation.target))
         return self.delegate.train_prepared(preparation)
 
-    def training_contract_descriptor(self):
-        return {
-            "type": f"{type(self).__module__}.{type(self).__qualname__}",
-            "delegate": self.delegate.training_contract_descriptor(),
-            "behavior_version": getattr(self, "behavior_version", None),
-        }
-
-
 class _ClaimingResidualTrainer(ResidualTrainer):
     def __init__(self):
         super().__init__()
@@ -1037,15 +1029,31 @@ class _AlwaysPoorTrainer(_CountingTrainer):
         return self._rejectable(super().train_prepared(preparation))
 
 
-class _RuntimeContractMutatingTrainer(_CountingTrainer):
+class _PropertyTrackingTrainer:
     def __init__(self):
-        super().__init__()
-        self.behavior_version = 0
+        self.accesses = []
+        self.calls = []
 
-    def train_prepared(self, preparation):
-        result = super().train_prepared(preparation)
-        self.behavior_version += 1
-        return result
+    @property
+    def feature_builder(self):
+        self.accesses.append("feature_builder")
+        accesses = self.accesses
+
+        class TrackedFeatureBuilder:
+            @property
+            def cadence_minutes(self):
+                accesses.append("cadence_minutes")
+                return 30.0
+
+        return TrackedFeatureBuilder()
+
+    def prepare_target(self, *args, **kwargs):
+        self.calls.append("prepare_target")
+        raise AssertionError("custom trainer must be rejected before preparation")
+
+    def train_prepared(self, *args, **kwargs):
+        self.calls.append("train_prepared")
+        raise AssertionError("custom trainer must be rejected before training")
 
 
 def test_pipeline_does_not_retrain_loaded_models_when_truth_is_reuploaded(
@@ -1071,10 +1079,10 @@ def test_pipeline_does_not_retrain_loaded_models_when_truth_is_reuploaded(
     assert second.model_report.trained_targets == ()
 
 
-def test_pipeline_rejects_custom_trainer_before_runtime_contract_mutation(
+def test_pipeline_rejects_custom_trainer_before_reading_injected_properties(
     tmp_path,
 ):
-    trainer = _RuntimeContractMutatingTrainer()
+    trainer = _PropertyTrackingTrainer()
     registry = ModelRegistry(tmp_path)
 
     result = DlrPipeline(registry=registry, trainer=trainer).run(
@@ -1089,6 +1097,7 @@ def test_pipeline_rejects_custom_trainer_before_runtime_contract_mutation(
 
     expected_keys = _expected_pipeline_model_keys()
     assert trainer.calls == []
+    assert trainer.accesses == []
     _assert_unsupported_training_backend(result, expected_keys)
     assert all(not registry.path_for(key).exists() for key in expected_keys)
     assert all(not registry.attempt_path_for(key).exists() for key in expected_keys)

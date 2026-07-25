@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 import copy
-import dis
-import functools
 import hashlib
 import importlib.metadata
 import inspect
 import json
 import platform
 import re
-import sys
-import types
 from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -46,6 +42,8 @@ _TARGET_COLUMNS = {
     },
 }
 _TRAINING_CONTRACT_VERSION = "residual-training-v1"
+_FEATURE_VERSION = "residual-weather-features-v1"
+_TRAINING_POLICY_VERSION = "weather-residual-training-v1"
 _TRAINING_LINEAGE_COLUMNS = (
     "source_file_hash",
     "source_file_hash_physical",
@@ -69,15 +67,6 @@ _SEALED_XGBOOST_IMPLEMENTATION_MODULE = "xgboost.sklearn"
 _SEALED_XGBOOST_ESTIMATOR_NAME = "XGBRegressor"
 SEALED_XGBOOST_BACKEND_ID = "xgboost-residual-v1"
 _NON_PRODUCTION_BACKEND_ID = "non-production-training-backend-v0"
-_MAX_CONTRACT_DEPTH = 12
-_MAX_CONTRACT_ITEMS = 256
-_MAX_CONTRACT_NODES = 2_048
-_EXTERNAL_CONTRACT_ROOTS = frozenset(
-    {"joblib", "numpy", "pandas", "scipy", "sklearn", "xgboost"}
-)
-_DYNAMIC_GLOBAL_ACCESS_NAMES = frozenset(
-    {"__import__", "eval", "exec", "globals", "locals"}
-)
 _TRAINING_OUTCOMES = frozenset(
     {"trained", "data_fallback", "operational_fallback"}
 )
@@ -135,17 +124,6 @@ class SealedEstimatorSpec:
 
     def digest(self) -> str:
         return _stable_json_hash(asdict(self))
-
-
-class _FactoryContractContext:
-    def __init__(self) -> None:
-        self.active: set[int] = set()
-        self.remaining_nodes = _MAX_CONTRACT_NODES
-
-    def consume(self) -> None:
-        if self.remaining_nodes <= 0:
-            raise TrainingContractError("training contract exceeds node limit")
-        self.remaining_nodes -= 1
 
 
 class ConstantResidualEstimator:
@@ -233,10 +211,10 @@ class TrainingContract:
     version: str
     backend_id: str
     estimator_spec_digest: str
-    trainer_descriptor_json: str
-    estimator_descriptor_json: str
     dependency_versions: tuple[tuple[str, str], ...]
     random_seed: int
+    feature_version: str
+    policy_version: str
 
     def scoped_hash(
         self,
@@ -252,10 +230,10 @@ class TrainingContract:
                 "version": self.version,
                 "backend_id": self.backend_id,
                 "estimator_spec_digest": self.estimator_spec_digest,
-                "trainer": json.loads(self.trainer_descriptor_json),
-                "estimator": json.loads(self.estimator_descriptor_json),
                 "dependencies": dict(self.dependency_versions),
                 "random_seed": self.random_seed,
+                "feature_version": self.feature_version,
+                "policy_version": self.policy_version,
                 "target": target,
                 "physical_col": physical_col,
                 "truth_col": truth_col,
@@ -263,27 +241,6 @@ class TrainingContract:
                 "cadence_minutes": float(cadence_minutes),
             }
         )
-
-
-@dataclass(frozen=True)
-class FrozenCallableContract:
-    descriptor_json: str
-
-    @classmethod
-    def capture(cls, value: Any) -> "FrozenCallableContract":
-        return cls(_canonical_json(_callable_contract(value)))
-
-    def verify(self, value: Any) -> None:
-        try:
-            current = _canonical_json(_callable_contract(value))
-        except TrainingContractError:
-            raise
-        except Exception as exc:
-            raise TrainingContractError(
-                "factory contract could not be verified"
-            ) from exc
-        if current != self.descriptor_json:
-            raise TrainingContractError("factory contract changed after initialization")
 
 
 def _load_xgb_regressor():
@@ -625,7 +582,7 @@ def _sealed_xgboost_backend() -> tuple[SealedEstimatorSpec, type]:
             random_seed=42,
             distributions=tuple(sorted(distributions.items())),
             implementation_sha256=_estimator_implementation_sha256(estimator_type),
-            policy_version="weather-residual-training-v1",
+            policy_version=_TRAINING_POLICY_VERSION,
         ),
         estimator_type,
     )
@@ -729,655 +686,13 @@ def verify_sealed_training_artifact(
     _sealed_estimator_parameters_match_policy(model, estimator_type)
 
 
-def _bounded_contract_items(values, *, label: str) -> list:
-    items = []
-    for item in values:
-        if len(items) >= _MAX_CONTRACT_ITEMS:
-            raise TrainingContractError(f"{label} exceeds contract item limit")
-        items.append(item)
-    return items
-
-
-def _factory_state(value: Any) -> dict[str, Any]:
-    state = dict(getattr(value, "__dict__", {}))
-    for owner in type(value).__mro__:
-        slots = owner.__dict__.get("__slots__", ())
-        if isinstance(slots, str):
-            slots = (slots,)
-        for name in slots:
-            if name in {"__dict__", "__weakref__"} or name in state:
-                continue
-            try:
-                state[name] = getattr(value, name)
-            except AttributeError:
-                continue
-    return {str(name): item for name, item in state.items()}
-
-
-def _explicit_contract_descriptor(value: Any) -> Optional[Any]:
-    provider = getattr(value, "training_contract_descriptor", None)
-    if provider is None:
-        return None
-    if not callable(provider):
-        raise TrainingContractError(
-            "training_contract_descriptor must be callable"
-        )
-    try:
-        descriptor = provider()
-    except Exception as exc:
-        raise TrainingContractError(
-            "explicit training contract could not be read"
-        ) from exc
-    if descriptor is None:
-        raise TrainingContractError(
-            "explicit training contract cannot be None"
-        )
-    return descriptor
-
-
-def _contract_value(
-    value: Any,
-    *,
-    _depth: int = 0,
-    _context: Optional[_FactoryContractContext] = None,
-) -> Any:
-    if _depth > _MAX_CONTRACT_DEPTH:
-        raise TrainingContractError("training contract exceeds recursion limit")
-    _context = _context or _FactoryContractContext()
-    _context.consume()
-    if value is None or isinstance(value, (bool, int)):
-        return value
-    if isinstance(value, float):
-        return value if np.isfinite(value) else {"float": str(value)}
-    if isinstance(value, str):
-        if len(value) <= 1024:
-            return value
-        return {
-            "type": "str",
-            "length": len(value),
-            "content_hash": hashlib.sha256(value.encode("utf-8")).hexdigest(),
-        }
-    if isinstance(value, bytes):
-        return {
-            "kind": "bytes",
-            "length": len(value),
-            "content_hash": hashlib.sha256(value).hexdigest(),
-        }
-    if isinstance(value, np.generic):
-        return _contract_value(
-            value.item(), _depth=_depth + 1, _context=_context
-        )
-    if isinstance(value, (np.ndarray, pd.DataFrame, pd.Series, Path)):
-        raise TrainingContractError(
-            "complex factory configuration requires an explicit descriptor"
-        )
-    if isinstance(value, types.ModuleType):
-        return _module_contract(value, _context=_context)
-    if isinstance(value, types.CodeType):
-        return {"kind": "code", "value": _code_contract(value, _context)}
-    if callable(value):
-        return {"kind": "callable", "value": _callable_contract(value, _context)}
-
-    identity = id(value)
-    if identity in _context.active:
-        raise TrainingContractError("cyclic factory configuration is unsupported")
-    _context.active.add(identity)
-    try:
-        if isinstance(value, (list, tuple, frozenset)):
-            items = [
-                _contract_value(item, _depth=_depth + 1, _context=_context)
-                for item in _bounded_contract_items(
-                    value, label=type(value).__name__
-                )
-            ]
-            if isinstance(value, frozenset):
-                items.sort(key=_canonical_json)
-            return {"kind": type(value).__name__, "items": items}
-        if isinstance(value, Mapping):
-            entries = [
-                {"key": _contract_value(key, _depth=_depth + 1, _context=_context),
-                 "value": _contract_value(item, _depth=_depth + 1, _context=_context)}
-                for key, item in _bounded_contract_items(
-                    value.items(), label="mapping"
-                )
-            ]
-            entries.sort(key=lambda item: _canonical_json(item["key"]))
-            return {
-                "kind": "mapping",
-                "type": _qualified_name(type(value)),
-                "entries": entries,
-            }
-        state = _factory_state(value)
-        if not state:
-            raise TrainingContractError(
-                "opaque factory configuration requires an explicit descriptor"
-            )
-        items = _bounded_contract_items(
-            sorted(state.items()), label="object configuration"
-        )
-        return {
-            "kind": "object",
-            "type": _qualified_name(type(value)),
-            "state": {
-                name: _contract_value(item, _depth=_depth + 1, _context=_context)
-                for name, item in items
-            },
-        }
-    finally:
-        _context.active.remove(identity)
-
-
-def _code_contract(
-    code: types.CodeType,
-    context: _FactoryContractContext,
-) -> dict[str, Any]:
-    return {
-        "bytecode_hash": hashlib.sha256(code.co_code).hexdigest(),
-        "exception_table_hash": hashlib.sha256(code.co_exceptiontable).hexdigest(),
-        "names": list(code.co_names),
-        "constants": _contract_value(tuple(code.co_consts), _context=context),
-    }
-
-
-def _referenced_global_dependencies(
-    code: types.CodeType,
-) -> dict[str, tuple[tuple[str, ...], ...]]:
-    dependencies: dict[str, set[tuple[str, ...]]] = {}
-    instructions = list(dis.get_instructions(code))
-    for index, instruction in enumerate(instructions):
-        if instruction.opname not in {"LOAD_GLOBAL", "LOAD_NAME"}:
-            continue
-        name = str(instruction.argval)
-        attribute_path = []
-        for following in instructions[index + 1 :]:
-            if following.opname not in {"LOAD_ATTR", "LOAD_METHOD"}:
-                break
-            attribute_path.append(str(following.argval))
-        dependencies.setdefault(name, set()).add(tuple(attribute_path))
-    for constant in code.co_consts:
-        if isinstance(constant, types.CodeType):
-            for name, paths in _referenced_global_dependencies(constant).items():
-                dependencies.setdefault(name, set()).update(paths)
-    return {
-        name: tuple(sorted(paths))
-        for name, paths in sorted(dependencies.items())
-    }
-
-
-def _module_namespace(value: types.ModuleType) -> dict[str, Any]:
-    try:
-        namespace = object.__getattribute__(value, "__dict__")
-    except Exception as exc:
-        raise TrainingContractError("module contract cannot be read safely") from exc
-    if not isinstance(namespace, dict):
-        raise TrainingContractError("module contract has no static namespace")
-    return namespace
-
-
-def _symbol_module_name(value: Any) -> str:
-    if inspect.isclass(value) or inspect.isfunction(value) or inspect.ismethod(value):
-        module_name = getattr(value, "__module__", "")
-    else:
-        module_name = getattr(type(value), "__module__", "")
-    return module_name if isinstance(module_name, str) else ""
-
-
-def _is_external_contract_symbol(value: Any) -> bool:
-    module_name = _symbol_module_name(value)
-    root = module_name.partition(".")[0]
-    return bool(
-        module_name == "builtins"
-        or root in sys.stdlib_module_names
-        or root in _EXTERNAL_CONTRACT_ROOTS
-    )
-
-
-def _external_symbol_contract(value: Any) -> dict[str, Any]:
-    module_name = _symbol_module_name(value)
-    root = module_name.partition(".")[0]
-    descriptor = {
-        "kind": "external_symbol",
-        "identity": _qualified_name(value if inspect.isroutine(value) or inspect.isclass(value) else type(value)),
-    }
-    if root in sys.stdlib_module_names or module_name == "builtins":
-        descriptor["version"] = platform.python_version()
-    else:
-        try:
-            descriptor["version"] = importlib.metadata.version(root)
-        except (importlib.metadata.PackageNotFoundError, ValueError):
-            descriptor["version"] = "unavailable"
-    return descriptor
-
-
-def _static_dependency_value(value: Any, path: tuple[str, ...]) -> Any:
-    current = value
-    for name in path:
-        if isinstance(current, types.ModuleType):
-            namespace = _module_namespace(current)
-            if name not in namespace:
-                raise TrainingContractError(
-                    f"module dependency {name} is not statically available"
-                )
-            current = namespace[name]
-            continue
-        try:
-            current = inspect.getattr_static(current, name)
-        except AttributeError as exc:
-            raise TrainingContractError(
-                f"dependency attribute {name} is not statically available"
-            ) from exc
-        if isinstance(current, (staticmethod, classmethod)):
-            current = current.__func__
-    return current
-
-
-def _module_contract(
-    value: types.ModuleType,
-    *,
-    attribute_paths: Sequence[tuple[str, ...]] = (),
-    _context: Optional[_FactoryContractContext] = None,
-) -> dict[str, Any]:
-    _context = _context or _FactoryContractContext()
-    namespace = _module_namespace(value)
-    module_name = namespace.get("__name__", "")
-    descriptor = {
-        "kind": "module",
-        "identity": module_name if type(module_name) is str else "",
-    }
-    version = namespace.get("__version__")
-    if type(version) is str:
-        descriptor["version"] = (
-            version
-            if len(version) <= 128
-            else hashlib.sha256(version.encode("utf-8")).hexdigest()
-        )
-    accessed_attributes = []
-    for path in sorted(set(attribute_paths)):
-        if not path:
-            continue
-        dependency = _static_dependency_value(value, path)
-        accessed_attributes.append(
-            {
-                "path": list(path),
-                "value": _global_contract_value(
-                    dependency,
-                    attribute_paths=(),
-                    _context=_context,
-                ),
-            }
-        )
-    if accessed_attributes:
-        descriptor["accessed_attributes"] = accessed_attributes
-    return descriptor
-
-
-def _function_core_contract(
-    value: Any,
-    context: _FactoryContractContext,
-) -> tuple[Any, types.CodeType, dict[str, Any]]:
-    target = getattr(value, "__func__", value)
-    code = getattr(target, "__code__", None)
-    if not isinstance(code, types.CodeType):
-        raise TrainingContractError("factory function has no inspectable bytecode")
-    return target, code, {
-        "module": str(getattr(target, "__module__", "")),
-        "qualname": str(getattr(target, "__qualname__", "")),
-        "implementation": _code_contract(code, context),
-        "defaults": _contract_value(
-            tuple(getattr(target, "__defaults__", ()) or ()), _context=context
-        ),
-        "keyword_defaults": _contract_value(
-            getattr(target, "__kwdefaults__", None) or {}, _context=context
-        ),
-    }
-
-
-def _global_contract_value(
-    value: Any,
-    *,
-    attribute_paths: Sequence[tuple[str, ...]] = (),
-    _context: _FactoryContractContext,
-) -> Any:
-    if isinstance(value, types.ModuleType):
-        return _module_contract(
-            value,
-            attribute_paths=attribute_paths,
-            _context=_context,
-        )
-    if callable(value) and _is_external_contract_symbol(value):
-        return _external_symbol_contract(value)
-    if inspect.isclass(value):
-        return {
-            "kind": "class_reference",
-            "contract": _callable_contract(value, _context),
-        }
-    if inspect.isbuiltin(value) or inspect.ismethoddescriptor(value):
-        return {"kind": "builtin_callable", "identity": _qualified_name(value)}
-    if inspect.isfunction(value) or inspect.ismethod(value):
-        return {
-            "kind": "function_reference",
-            "contract": _callable_contract(value, _context),
-        }
-    if callable(value):
-        explicit = _explicit_contract_descriptor(value)
-        if explicit is None:
-            raise TrainingContractError(
-                "global callable instance requires an explicit descriptor"
-            )
-        return {
-            "kind": "callable_reference",
-            "identity": _qualified_name(type(value)),
-            "declared_configuration": _contract_value(
-                explicit, _context=_context
-            ),
-        }
-    descriptor = _contract_value(value, _context=_context)
-    if not attribute_paths:
-        return descriptor
-    accessed_attributes = []
-    for path in sorted(set(attribute_paths)):
-        if not path:
-            continue
-        dependency = _static_dependency_value(value, path)
-        accessed_attributes.append(
-            {
-                "path": list(path),
-                "value": _global_contract_value(
-                    dependency,
-                    attribute_paths=(),
-                    _context=_context,
-                ),
-            }
-        )
-    if not accessed_attributes:
-        return descriptor
-    return {
-        "kind": "referenced_value",
-        "value": descriptor,
-        "accessed_attributes": accessed_attributes,
-    }
-
-
-def _function_contract(
-    value: Any,
-    *,
-    _context: _FactoryContractContext,
-) -> dict[str, Any]:
-    target, code, descriptor = _function_core_contract(value, _context)
-    explicit = _explicit_contract_descriptor(value)
-    if explicit is not None:
-        descriptor["declared_configuration"] = _contract_value(
-            explicit, _context=_context
-        )
-    closure = None if explicit is not None else getattr(target, "__closure__", None)
-    if closure:
-        closure_values = []
-        for name, cell in zip(code.co_freevars, closure):
-            try:
-                cell_value = cell.cell_contents
-            except ValueError as exc:
-                raise TrainingContractError("callable has an empty closure cell") from exc
-            if name == "__class__" and inspect.isclass(cell_value):
-                closure_values.append(
-                    {"name": name, "class": _qualified_name(cell_value)}
-                )
-                continue
-            closure_values.append(
-                {
-                    "name": name,
-                    "value": _contract_value(
-                        cell_value,
-                        _context=_context,
-                    ),
-                }
-            )
-        descriptor["closure"] = closure_values
-    global_values = getattr(target, "__globals__", {})
-    builtin_values = getattr(target, "__builtins__", {})
-    if not isinstance(builtin_values, Mapping):
-        builtin_values = vars(builtin_values)
-    references = {}
-    for name, attribute_paths in _referenced_global_dependencies(code).items():
-        if name in global_values:
-            scope, global_value = "global", global_values[name]
-        elif name in builtin_values:
-            if name in _DYNAMIC_GLOBAL_ACCESS_NAMES:
-                raise TrainingContractError(
-                    f"dynamic global access through {name} is unsupported"
-                )
-            scope, global_value = "builtin", builtin_values[name]
-        else:
-            references[name] = {"scope": "unbound"}
-            continue
-        references[name] = {
-            "scope": scope,
-            "value": _global_contract_value(
-                global_value,
-                attribute_paths=attribute_paths,
-                _context=_context,
-            ),
-        }
-    if references:
-        descriptor["globals"] = references
-    return descriptor
-
-
-def _class_contract(
-    value: type,
-    *,
-    _context: _FactoryContractContext,
-) -> dict[str, Any]:
-    explicit = _explicit_contract_descriptor(value)
-    if explicit is not None:
-        return {
-            "kind": "class",
-            "identity": _qualified_name(value),
-            "declared_configuration": _contract_value(
-                explicit, _context=_context
-            ),
-        }
-
-    members = {}
-    method_count = 0
-    owners = [owner for owner in reversed(value.__mro__) if owner is not object]
-    for owner in owners:
-        if _is_external_contract_symbol(owner):
-            members[f"{_qualified_name(owner)}::__external__"] = (
-                _external_symbol_contract(owner)
-            )
-            continue
-        for name, item in sorted(vars(owner).items()):
-            if name in {
-                "__classcell__",
-                "__dict__",
-                "__doc__",
-                "__module__",
-                "__weakref__",
-            }:
-                continue
-            if name.startswith("__") and name not in {
-                "__call__",
-                "__init__",
-                "__repr__",
-                "__str__",
-            }:
-                continue
-            if isinstance(item, (staticmethod, classmethod)):
-                item = item.__func__
-            if inspect.isfunction(item):
-                members[name] = {
-                    "kind": "method",
-                    "contract": _callable_contract(item, _context),
-                }
-                method_count += 1
-            elif not name.startswith("_") and not inspect.isdatadescriptor(item):
-                members[name] = {
-                    "kind": "configuration",
-                    "value": _contract_value(item, _context=_context),
-                }
-    if not method_count:
-        raise TrainingContractError(
-            f"class factory {_qualified_name(value)} has no inspectable methods"
-        )
-    return {
-        "kind": "class",
-        "identity": _qualified_name(value),
-        "mro": [_qualified_name(owner) for owner in reversed(owners)],
-        "members": members,
-    }
-
-
-def _callable_contract(
-    value: Any,
-    _context: Optional[_FactoryContractContext] = None,
-) -> dict[str, Any]:
-    _context = _context or _FactoryContractContext()
-    _context.consume()
-    if value is default_estimator:
-        return {
-            "kind": "default_estimator",
-            "symbol": "xgboost.XGBRegressor",
-            "declared_parameters": dict(_DEFAULT_ESTIMATOR_PARAMETERS),
-        }
-    if not isinstance(value, functools.partial) and _is_external_contract_symbol(
-        value
-    ):
-        return _external_symbol_contract(value)
-    identity = id(value)
-    if identity in _context.active:
-        raise TrainingContractError("cyclic callable factory is unsupported")
-    if len(_context.active) >= _MAX_CONTRACT_DEPTH:
-        raise TrainingContractError("training contract exceeds recursion limit")
-    _context.active.add(identity)
-    try:
-        if isinstance(value, functools.partial):
-            return {
-                "kind": "partial",
-                "callable": _callable_contract(value.func, _context),
-                "args": _contract_value(tuple(value.args), _context=_context),
-                "keywords": _contract_value(
-                    value.keywords or {}, _context=_context
-                ),
-            }
-        if (
-            inspect.isbuiltin(value)
-            or inspect.ismethoddescriptor(value)
-            or (inspect.isclass(value) and value.__module__ == "builtins")
-        ):
-            return {"kind": "builtin_callable", "identity": _qualified_name(value)}
-        if inspect.isclass(value):
-            return _class_contract(value, _context=_context)
-        if inspect.isfunction(value) or inspect.ismethod(value):
-            descriptor = {
-                "kind": "function",
-                **_function_contract(value, _context=_context),
-            }
-            if inspect.ismethod(value) and not inspect.isclass(value.__self__):
-                descriptor["bound_state"] = _contract_value(
-                    value.__self__, _context=_context
-                )
-            return descriptor
-        if not callable(value):
-            raise TrainingContractError("estimator factory must be callable")
-        explicit = _explicit_contract_descriptor(value)
-        descriptor = {
-            "kind": "callable_instance",
-            "identity": _qualified_name(type(value)),
-        }
-        if explicit is not None:
-            descriptor["declared_configuration"] = _contract_value(
-                explicit, _context=_context
-            )
-        else:
-            descriptor["class"] = _callable_contract(type(value), _context)
-            descriptor["configuration"] = _contract_value(
-                _factory_state(value), _context=_context
-            )
-        return descriptor
-    finally:
-        _context.active.remove(identity)
-
-
-def _trainer_runtime_descriptor(trainer: Any) -> dict[str, Any]:
-    explicit = _explicit_contract_descriptor(trainer)
-    if explicit is None:
-        raise TrainingContractError(
-            "trainer must implement training_contract_descriptor()"
-        )
-    descriptor = {
-        "trainer_type": _qualified_name(type(trainer)),
-        "configuration": _contract_value(explicit),
-    }
-    if isinstance(trainer, ResidualTrainer):
-        descriptor["builtin_runtime"] = _builtin_trainer_runtime_descriptor(
-            trainer
-        )
-    return descriptor
-
-
-def _builtin_trainer_runtime_descriptor(trainer: Any) -> dict[str, Any]:
-    context = _FactoryContractContext()
-    trainer_type = type(trainer)
-
-    def method_code(name: str) -> dict[str, Any]:
-        try:
-            value = inspect.getattr_static(trainer_type, name)
-        except AttributeError as exc:
-            raise TrainingContractError(
-                f"builtin trainer dependency {name} is missing"
-            ) from exc
-        if isinstance(value, (staticmethod, classmethod)):
-            value = value.__func__
-        code = getattr(value, "__code__", None)
-        if not isinstance(code, types.CodeType):
-            raise TrainingContractError(
-                f"builtin trainer dependency {name} is not inspectable"
-            )
-        return _code_contract(code, context)
-
-    return {
-        "methods": {
-            "prepare_target": method_code("prepare_target"),
-            "train_prepared": method_code("train_prepared"),
-            "_fit_estimator": method_code("_fit_estimator"),
-            "_fallback_estimator": method_code("_fallback_estimator"),
-            "_predict_corrected": method_code("_predict_corrected"),
-            "_time_split": method_code("_time_split"),
-        },
-        "callables": {
-            "_metric_values": _callable_contract(_metric_values, context),
-            "_robust_residual_bounds": _callable_contract(
-                _robust_residual_bounds, context
-            ),
-            "_training_outcome": _callable_contract(
-                _training_outcome, context
-            ),
-            "missing_value_collision_rows": _callable_contract(
-                missing_value_collision_rows, context
-            ),
-        },
-        "configuration": _contract_value(
-            {
-                "physical_bounds": PHYSICAL_BOUNDS,
-                "training_outcomes": _TRAINING_OUTCOMES,
-                "operational_fallback_reasons": _OPERATIONAL_FALLBACK_REASONS,
-                "operational_fallback_prefixes": _OPERATIONAL_FALLBACK_PREFIXES,
-            },
-            _context=context,
-        ),
-    }
-
-
-def _runtime_contract_hash(
-    trainer: Any,
-    preparation_contract_hash: str,
-) -> str:
-    return _stable_json_hash(
-        {
-            "preparation_contract_hash": preparation_contract_hash,
-            "trainer": _trainer_runtime_descriptor(trainer),
-        }
-    )
+def _training_contract_for(trainer: Any) -> TrainingContract:
+    if type(trainer) is not ResidualTrainer:
+        raise TrainingContractError("unsupported_training_backend")
+    training_contract = object.__getattribute__(trainer, "training_contract")
+    if type(training_contract) is not TrainingContract:
+        raise TrainingContractError("unsupported_training_backend")
+    return training_contract
 
 
 def training_runtime_contract_hash_for_scope(
@@ -1389,26 +704,35 @@ def training_runtime_contract_hash_for_scope(
     feature_columns: Sequence[str],
     cadence_minutes: float,
 ) -> str:
-    training_contract = getattr(trainer, "training_contract", None)
-    if not isinstance(training_contract, TrainingContract):
-        raise TypeError("trainer must provide a TrainingContract")
-    preparation_contract_hash = training_contract.scoped_hash(
+    training_contract = _training_contract_for(trainer)
+    return training_contract.scoped_hash(
         target=target,
         physical_col=physical_col,
         truth_col=truth_col,
         feature_columns=feature_columns,
         cadence_minutes=cadence_minutes,
     )
-    return _runtime_contract_hash(trainer, preparation_contract_hash)
 
 
 def training_runtime_contract_hash(
     trainer: Any,
     preparation: TrainingPreparation,
 ) -> str:
-    if not isinstance(preparation, TrainingPreparation):
+    training_contract = _training_contract_for(trainer)
+    if type(preparation) is not TrainingPreparation:
         raise TypeError("preparation must be a TrainingPreparation")
-    return _runtime_contract_hash(trainer, preparation.training_contract_hash)
+    current_hash = training_contract.scoped_hash(
+        target=preparation.target,
+        physical_col=preparation.physical_col,
+        truth_col=preparation.truth_col,
+        feature_columns=preparation.feature_columns,
+        cadence_minutes=preparation.cadence_minutes,
+    )
+    if current_hash != preparation.training_contract_hash:
+        raise TrainingContractError(
+            "preparation training contract does not match trainer"
+        )
+    return current_hash
 
 
 def bind_training_result_contract(
@@ -1788,41 +1112,29 @@ class ResidualTrainer:
             self.production_eligible = False
         self._attested_distribution_names: Optional[tuple[str, ...]] = None
         self.feature_builder = feature_builder or FeatureBuilder()
-        self._factory_contract = FrozenCallableContract.capture(
-            self.estimator_factory
-        )
         dependencies = _dependency_versions()
-        trainer_type = type(self)
-        contract_context = _FactoryContractContext()
-        trainer_descriptor = {
-            "type": _qualified_name(trainer_type),
-            "prepare_target": _code_contract(
-                trainer_type.prepare_target.__code__, contract_context
-            ),
-            "train_prepared": _code_contract(
-                trainer_type.train_prepared.__code__, contract_context
-            ),
-        }
+        estimator_spec = self.sealed_estimator_spec
         self.training_contract = TrainingContract(
             version=_TRAINING_CONTRACT_VERSION,
             backend_id=(
-                self.sealed_estimator_spec.backend_id
-                if self.sealed_estimator_spec is not None
+                estimator_spec.backend_id
+                if estimator_spec is not None
                 else _NON_PRODUCTION_BACKEND_ID
             ),
             estimator_spec_digest=(
-                self.sealed_estimator_spec.digest()
-                if self.sealed_estimator_spec is not None
+                estimator_spec.digest()
+                if estimator_spec is not None
                 else _NON_PRODUCTION_BACKEND_ID
             ),
-            trainer_descriptor_json=_canonical_json(trainer_descriptor),
-            estimator_descriptor_json=self._factory_contract.descriptor_json,
             dependency_versions=tuple(sorted(dependencies.items())),
             random_seed=42,
+            feature_version=_FEATURE_VERSION,
+            policy_version=(
+                estimator_spec.policy_version
+                if estimator_spec is not None
+                else _TRAINING_POLICY_VERSION
+            ),
         )
-
-    def _assert_factory_contract(self) -> None:
-        self._factory_contract.verify(self.estimator_factory)
 
     def attest_estimator(self, estimator: object) -> None:
         spec = self.sealed_estimator_spec
@@ -1873,31 +1185,6 @@ class ResidualTrainer:
             )
         if distribution_names_to_cache is not None:
             self._attested_distribution_names = distribution_names_to_cache
-
-    def training_contract_descriptor(self) -> dict[str, Any]:
-        self._assert_factory_contract()
-        return {
-            "version": _TRAINING_CONTRACT_VERSION,
-            "backend_id": self.training_contract.backend_id,
-            "estimator_spec_digest": (
-                self.training_contract.estimator_spec_digest
-            ),
-            "trainer_descriptor_hash": hashlib.sha256(
-                self.training_contract.trainer_descriptor_json.encode("utf-8")
-            ).hexdigest(),
-            "estimator_descriptor_hash": hashlib.sha256(
-                self.training_contract.estimator_descriptor_json.encode("utf-8")
-            ).hexdigest(),
-            "dependencies": dict(self.training_contract.dependency_versions),
-            "random_seed": self.training_contract.random_seed,
-            "feature_builder": {
-                "type": _qualified_name(type(self.feature_builder)),
-                "cadence_minutes": float(self.feature_builder.cadence_minutes),
-                "derived_features": list(
-                    self.feature_builder._DERIVED_FEATURE_COLUMNS
-                ),
-            },
-        }
 
     @staticmethod
     def _target_columns(
@@ -2169,7 +1456,6 @@ class ResidualTrainer:
         physical_col: Optional[str] = None,
         truth_col: Optional[str] = None,
     ) -> TrainingPreparation:
-        self._assert_factory_contract()
         working, line_id, tower_id = self._validated_scope(frame)
         physical_col, truth_col = self._target_columns(
             working, target, physical_col, truth_col
@@ -2362,7 +1648,6 @@ class ResidualTrainer:
         self,
         preparation: TrainingPreparation,
     ) -> TrainingResult:
-        self._assert_factory_contract()
         preparation = self._validated_preparation(preparation)
 
         target = preparation.target
@@ -2430,8 +1715,6 @@ class ResidualTrainer:
             )
             final_bounds = _robust_residual_bounds(residual)
             full_fit_metrics = None
-
-        self._assert_factory_contract()
 
         timestamp_values = feature_frame["timestamp"]
         training_outcome = _training_outcome(final_reason, evaluation_reason)

@@ -6,14 +6,17 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
 from thermal_functions import ThermalCalculator, EnvironmentGenerator, LineAnalyzer
+from config.config import AUDIT_LOG_DIR, MODEL_DIR
 from modules.data_processor import normalize_weather_input_dataframe
 from modules.dlr_pipeline import DlrPipeline, derive_line_identity
+from modules.model_registry import ModelRegistry
 from modules import terrain as terrain_module
 from modules.weather_correction import CorrectionOptions, WeatherCorrectionService
 from modules.weather_upload import (
     normalize_optional_truth_weather,
     normalize_uploaded_weather_files,
 )
+from utils.audit_log import JsonAuditLogger
 import os
 
 
@@ -704,7 +707,12 @@ with tab_line:
 
             progress_bar.progress(60)
             status_text.text("正在修正气象并进行热平衡计算...")
-            pipeline = DlrPipeline()
+            pipeline = DlrPipeline(
+                registry=ModelRegistry(
+                    MODEL_DIR,
+                    audit_logger=JsonAuditLogger(AUDIT_LOG_DIR),
+                )
+            )
             line_identity = derive_line_identity(
                 physical_snapshot,
                 tower_coords=st.session_state.tower_coords,

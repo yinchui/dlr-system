@@ -21,6 +21,7 @@ from modules.ai_training import (
     TrainingContractError,
     verify_sealed_training_artifact,
 )
+from utils.audit_log import AuditEvent
 
 
 _ALLOWED_TARGETS = frozenset({"wind_speed", "ambient_temp"})
@@ -593,6 +594,7 @@ class PromotionDecision:
     promoted: bool
     reason: str
     metadata: Optional[ModelMetadata] = None
+    audit_persisted: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -600,6 +602,7 @@ class ModelLoadResult:
     bundle: Optional[ModelBundle]
     metadata: Optional[ModelMetadata]
     fallback_reason: str = ""
+    audit_persisted: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -880,6 +883,10 @@ class ModelRegistry:
         min_mae_improvement: float = 0.0,
         max_generations: int = 2,
         max_attempt_records: int = 64,
+        audit_logger: Optional[Any] = None,
+        audit_run_id: Optional[str] = None,
+        audit_result_id: Optional[str] = None,
+        audit_source: str = "model_registry",
     ):
         if (
             isinstance(max_generations, bool)
@@ -926,6 +933,191 @@ class ModelRegistry:
         self.min_mae_improvement = float(min_mae_improvement)
         self.max_generations = max_generations
         self.max_attempt_records = max_attempt_records
+        _require_nonempty_string(audit_source, "audit_source")
+        if audit_run_id is not None:
+            _require_nonempty_string(audit_run_id, "audit_run_id")
+        if audit_result_id is not None:
+            _require_nonempty_string(audit_result_id, "audit_result_id")
+        self.audit_logger = audit_logger
+        self.audit_run_id = audit_run_id or uuid.uuid4().hex
+        self.audit_result_id = audit_result_id or uuid.uuid4().hex
+        self.audit_source = audit_source
+
+    @staticmethod
+    def _combine_audit_statuses(
+        *statuses: Optional[bool],
+    ) -> Optional[bool]:
+        observed = tuple(status for status in statuses if status is not None)
+        if not observed:
+            return None
+        return all(observed)
+
+    @staticmethod
+    def _key_input_hash(key: ModelKey) -> str:
+        return hashlib.sha256(
+            _json_bytes(
+                {name: getattr(key, name) for name in _KEY_FIELDS}
+            )
+        ).hexdigest()
+
+    def _default_audit_config_hash(self) -> str:
+        return hashlib.sha256(
+            _json_bytes(
+                {
+                    "min_mae_improvement": self.min_mae_improvement,
+                    "max_generations": self.max_generations,
+                    "max_attempt_records": self.max_attempt_records,
+                    "policy_version": _ATTEMPT_POLICY_VERSION,
+                }
+            )
+        ).hexdigest()
+
+    @staticmethod
+    def _model_config_hash(
+        compatibility: ModelCompatibility,
+        training_contract_hash: str,
+        backend_id: str,
+    ) -> str:
+        return hashlib.sha256(
+            _json_bytes(
+                {
+                    "compatibility": compatibility.to_dict(),
+                    "training_contract_hash": training_contract_hash,
+                    "backend_id": backend_id,
+                }
+            )
+        ).hexdigest()
+
+    def _write_audit(
+        self,
+        key: ModelKey,
+        *,
+        stage: str,
+        input_hash: Optional[str] = None,
+        config_hash: Optional[str] = None,
+        source: Optional[str] = None,
+        fallback_reason: str = "",
+        error_code: str = "",
+        details: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[bool]:
+        if self.audit_logger is None:
+            return None
+        try:
+            event = AuditEvent(
+                run_id=self.audit_run_id,
+                result_id=self.audit_result_id,
+                line_id=key.line_id,
+                tower_id=key.tower_id,
+                stage=stage,
+                input_hash=input_hash or self._key_input_hash(key),
+                config_hash=config_hash or self._default_audit_config_hash(),
+                source=source or self.audit_source,
+                fallback_reason=fallback_reason,
+                error_code=error_code,
+                details={
+                    "project_id": key.project_id,
+                    "target": key.target,
+                    **dict(details or {}),
+                },
+            )
+            return self.audit_logger.write(event) is True
+        except Exception:
+            return False
+
+    def _audit_candidate(
+        self,
+        candidate: ModelCandidate,
+        *,
+        stage: str,
+        source: str,
+        fallback_reason: str = "",
+        error_code: str = "",
+        details: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[bool]:
+        metadata = candidate.metadata
+        return self._write_audit(
+            candidate.key,
+            stage=stage,
+            input_hash=metadata.input_data_hash,
+            config_hash=self._model_config_hash(
+                metadata.compatibility,
+                metadata.training_contract_hash,
+                metadata.backend_id,
+            ),
+            source=source,
+            fallback_reason=fallback_reason,
+            error_code=error_code,
+            details={
+                "model_version": metadata.model_version,
+                "training_outcome": metadata.training_outcome,
+                "evaluation_mode": metadata.evaluation_mode,
+                **dict(details or {}),
+            },
+        )
+
+    def _audit_load_result(
+        self,
+        key: ModelKey,
+        result: ModelLoadResult,
+        *,
+        expected_compatibility: ModelCompatibility,
+        expected_training_contract_hash: str,
+        expected_backend_id: str,
+    ) -> Optional[bool]:
+        config_hash = self._model_config_hash(
+            expected_compatibility,
+            expected_training_contract_hash,
+            expected_backend_id,
+        )
+        details = {
+            "loaded": result.bundle is not None,
+            "model_version": (
+                result.metadata.model_version
+                if result.metadata is not None
+                else ""
+            ),
+        }
+        load_status = self._write_audit(
+            key,
+            stage="model_load",
+            config_hash=config_hash,
+            source="model_registry_load",
+            fallback_reason=result.fallback_reason,
+            error_code=result.fallback_reason,
+            details=details,
+        )
+        if not result.fallback_reason:
+            return load_status
+        invalidation_status = None
+        if result.fallback_reason.startswith("incompatible_") or (
+            result.fallback_reason.startswith("corrupt_")
+            or result.fallback_reason.endswith("_mismatch")
+            or result.fallback_reason
+            in {"invalid_model_contract", "unsafe_model_path"}
+        ):
+            invalidation_status = self._write_audit(
+                key,
+                stage="model_invalidation",
+                config_hash=config_hash,
+                source="model_registry_load_validation",
+                fallback_reason=result.fallback_reason,
+                error_code=result.fallback_reason,
+                details=details,
+            )
+        fallback_status = self._write_audit(
+            key,
+            stage="model_fallback",
+            config_hash=config_hash,
+            source="model_registry_physical_fallback",
+            fallback_reason=result.fallback_reason,
+            error_code=result.fallback_reason,
+            details=details,
+        )
+        return self._combine_audit_statuses(
+            load_status,
+            invalidation_status,
+            fallback_status,
+        )
 
     def _safe_directory(self, path: Path, *, create: bool) -> bool:
         try:
@@ -1280,11 +1472,12 @@ class ModelRegistry:
 
     def _prune_generations(
         self, key: ModelKey, active_generation: Path
-    ) -> None:
+    ) -> Optional[bool]:
         generation_root = self._generation_root(key)
         if not self._validate_generation_location(key, active_generation):
             raise UnsafeModelPathError("active generation is unsafe")
         history = []
+        audit_statuses = []
         with os.scandir(generation_root) as entries:
             for entry in entries:
                 path = generation_root / entry.name
@@ -1292,9 +1485,31 @@ class ModelRegistry:
                     continue
                 if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
                     self._remove_generation_entry(key, path)
+                    audit_statuses.append(
+                        self._write_audit(
+                            key,
+                            stage="model_prune",
+                            source="model_registry_generation_cleanup",
+                            details={
+                                "generation": entry.name,
+                                "reason": "unsafe_generation_entry",
+                            },
+                        )
+                    )
                     continue
                 if not self._complete_generation(path):
                     self._remove_generation_entry(key, path)
+                    audit_statuses.append(
+                        self._write_audit(
+                            key,
+                            stage="model_prune",
+                            source="model_registry_generation_cleanup",
+                            details={
+                                "generation": entry.name,
+                                "reason": "incomplete_generation",
+                            },
+                        )
+                    )
                     continue
                 history.append(
                     (entry.stat(follow_symlinks=False).st_mtime_ns, path)
@@ -1302,6 +1517,18 @@ class ModelRegistry:
         history.sort(key=lambda item: item[0], reverse=True)
         for _, obsolete in history[self.max_generations - 1 :]:
             self._remove_generation_entry(key, obsolete)
+            audit_statuses.append(
+                self._write_audit(
+                    key,
+                    stage="model_prune",
+                    source="model_registry_generation_retention",
+                    details={
+                        "generation": obsolete.name,
+                        "reason": "retention_limit",
+                    },
+                )
+            )
+        return self._combine_audit_statuses(*audit_statuses)
 
     @staticmethod
     def _validate_artifact_path(path: Path) -> None:
@@ -1538,14 +1765,22 @@ class ModelRegistry:
         _require_nonempty_string(expected_backend_id, "expected_backend_id")
         try:
             with self._lock_for(key):
-                return self._load_locked(
+                result = self._load_locked(
                     key,
                     expected_compatibility,
                     expected_training_contract_hash,
                     expected_backend_id,
                 )
         except UnsafeModelPathError:
-            return self._fallback("unsafe_model_path")
+            result = self._fallback("unsafe_model_path")
+        audit_persisted = self._audit_load_result(
+            key,
+            result,
+            expected_compatibility=expected_compatibility,
+            expected_training_contract_hash=expected_training_contract_hash,
+            expected_backend_id=expected_backend_id,
+        )
+        return replace(result, audit_persisted=audit_persisted)
 
     def load_many(
         self,
@@ -1604,8 +1839,21 @@ class ModelRegistry:
                     expected_backend_id=expected_backend_id[key],
                 )
             except Exception as exc:
-                loaded[key] = self._fallback(
+                result = self._fallback(
                     f"load_failed:{type(exc).__name__}"
+                )
+                audit_persisted = self._audit_load_result(
+                    key,
+                    result,
+                    expected_compatibility=expected_compatibility[key],
+                    expected_training_contract_hash=(
+                        expected_training_contract_hash[key]
+                    ),
+                    expected_backend_id=expected_backend_id[key],
+                )
+                loaded[key] = replace(
+                    result,
+                    audit_persisted=audit_persisted,
                 )
         return loaded
 
@@ -1613,7 +1861,7 @@ class ModelRegistry:
         self,
         candidate: ModelCandidate,
         status: str,
-    ) -> ModelMetadata:
+    ) -> tuple[ModelMetadata, Optional[bool]]:
         key = candidate.key
         target_dir = self._target_dir(key)
         target_parent = target_dir.parent
@@ -1685,11 +1933,13 @@ class ModelRegistry:
             except Exception:
                 pass
             try:
-                self._prune_generations(key, generation_dir)
+                prune_audit_persisted = self._prune_generations(
+                    key, generation_dir
+                )
                 _fsync_directory(generation_root)
             except Exception:
-                pass
-            return active_metadata
+                prune_audit_persisted = None
+            return active_metadata, prune_audit_persisted
         finally:
             try:
                 if temp_link.is_symlink() or temp_link.exists():
@@ -1711,7 +1961,9 @@ class ModelRegistry:
         champion: Optional[ModelMetadata] = None,
     ) -> PromotionDecision:
         try:
-            metadata = self._publish_locked(candidate, status=status)
+            metadata, prune_audit_persisted = self._publish_locked(
+                candidate, status=status
+            )
         except UnsafeModelPathError:
             return PromotionDecision(False, "unsafe_model_path", champion)
         except Exception as exc:
@@ -1720,7 +1972,12 @@ class ModelRegistry:
                 f"publish_failed:{type(exc).__name__}",
                 champion,
             )
-        return PromotionDecision(True, reason, metadata)
+        return PromotionDecision(
+            True,
+            reason,
+            metadata,
+            audit_persisted=prune_audit_persisted,
+        )
 
     def _record_rejection_locked(
         self,
@@ -1816,15 +2073,12 @@ class ModelRegistry:
                 "attempt contract does not match candidate, bundle, or registry"
             )
 
-    def promote(
+    def _decide_promotion(
         self,
         candidate: ModelCandidate,
         *,
         attempt: Optional[ModelAttempt] = None,
     ) -> PromotionDecision:
-        if not isinstance(candidate, ModelCandidate):
-            raise TypeError("candidate must be a ModelCandidate")
-        self._validate_promotion_contract(candidate, attempt)
         try:
             self._safe_directory(
                 self._target_dir(candidate.key).parent, create=False
@@ -1967,3 +2221,64 @@ class ModelRegistry:
                 status="active_provisional",
                 reason="promoted_provisional",
             )
+
+    def promote(
+        self,
+        candidate: ModelCandidate,
+        *,
+        attempt: Optional[ModelAttempt] = None,
+    ) -> PromotionDecision:
+        if not isinstance(candidate, ModelCandidate):
+            raise TypeError("candidate must be a ModelCandidate")
+        self._validate_promotion_contract(candidate, attempt)
+        training_reason = candidate.bundle.metadata.get("fallback_reason", "")
+        if not isinstance(training_reason, str):
+            training_reason = ""
+        training_audit_persisted = self._audit_candidate(
+            candidate,
+            stage="model_training",
+            source="sealed_xgboost_training_candidate",
+            fallback_reason=training_reason,
+            error_code=training_reason,
+        )
+        try:
+            decision = self._decide_promotion(candidate, attempt=attempt)
+        except Exception as exc:
+            self._audit_candidate(
+                candidate,
+                stage="model_fallback",
+                source="model_registry_promotion_error",
+                fallback_reason=f"promotion_failed:{type(exc).__name__}",
+                error_code=type(exc).__name__,
+            )
+            raise
+        promotion_audit_persisted = self._audit_candidate(
+            candidate,
+            stage="model_promotion",
+            source="model_registry_promotion",
+            fallback_reason="" if decision.promoted else decision.reason,
+            error_code="" if decision.promoted else decision.reason,
+            details={
+                "promoted": decision.promoted,
+                "decision_reason": decision.reason,
+            },
+        )
+        fallback_audit_persisted = None
+        if not decision.promoted:
+            fallback_audit_persisted = self._audit_candidate(
+                candidate,
+                stage="model_fallback",
+                source="model_registry_promotion_fallback",
+                fallback_reason=decision.reason,
+                error_code=decision.reason,
+                details={"promoted": False},
+            )
+        return replace(
+            decision,
+            audit_persisted=self._combine_audit_statuses(
+                training_audit_persisted,
+                decision.audit_persisted,
+                promotion_audit_persisted,
+                fallback_audit_persisted,
+            ),
+        )

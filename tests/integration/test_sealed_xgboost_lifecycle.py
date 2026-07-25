@@ -24,8 +24,8 @@ def _weather_segment(
     wind = np.array([2.0, 4.0, 3.0, 5.0])
     temperature = np.array([30.0, 32.0, 28.0, 31.0])
     if truth_offset:
-        wind = wind + np.array([0.75, 1.5, 0.75, 1.5])
-        temperature = temperature + np.array([-1.0, -2.0, -1.0, -2.0])
+        wind = wind + np.array([0.75, 1.5, -1.5, -2.25])
+        temperature = temperature + np.array([-1.0, -2.0, 1.5, 2.5])
     return pd.DataFrame(
         {
             "tower_id": ["001", "001", "002", "002"],
@@ -119,6 +119,23 @@ def test_real_xgboost_trains_persists_and_reuses_per_tower_models(tmp_path):
     assert second.max_currents.size > 0
     assert np.isfinite(first.max_currents).all()
     assert np.isfinite(second.max_currents).all()
+    expected_directions = {
+        ("001", "wind_speed"): 1.0,
+        ("002", "wind_speed"): -1.0,
+        ("001", "ambient_temp"): -1.0,
+        ("002", "ambient_temp"): 1.0,
+    }
+    for result in (first, second):
+        comparison = result.comparison_weather
+        for (tower_id, target), direction in expected_directions.items():
+            tower = comparison.loc[
+                comparison["tower_id"].astype(str) == tower_id
+            ]
+            correction = (
+                tower[f"{target}_ai"] - tower[f"{target}_physical"]
+            )
+            assert tower[f"{target}_used_ai"].all()
+            assert direction * correction.mean() > 0.25
     registry = first_pipeline.registry
     model_paths = [registry.path_for(key) for key in expected_keys]
     manifest_paths = [registry.manifest_path_for(key) for key in expected_keys]

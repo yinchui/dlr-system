@@ -20,7 +20,11 @@ import numpy as np
 import pandas as pd
 
 from config.config import PHYSICAL_BOUNDS
-from modules.ai_prediction import FeatureBuilder, ModelBundle
+from modules.ai_prediction import (
+    FeatureBuilder,
+    ModelBundle,
+    missing_value_collision_rows,
+)
 
 
 _TARGET_COLUMNS = {
@@ -477,6 +481,20 @@ def _normalized_distribution_name(value: Any) -> str:
     return re.sub(r"[-_.]+", "-", value).lower()
 
 
+def _distribution_version(distribution: str) -> str:
+    try:
+        version = importlib.metadata.version(distribution)
+    except Exception as exc:
+        raise TrainingContractError(
+            f"distribution version is unreadable for {distribution}"
+        ) from exc
+    if not isinstance(version, str) or not version.strip():
+        raise TrainingContractError(
+            f"distribution version is unreadable for {distribution}"
+        )
+    return version.strip()
+
+
 def _resolved_distribution_versions(module_name: str) -> dict[str, str]:
     if not isinstance(module_name, str) or not module_name.strip():
         raise TrainingContractError("estimator import root has no distribution")
@@ -509,17 +527,7 @@ def _resolved_distribution_versions(module_name: str) -> dict[str, str]:
             f"distribution mapping is ambiguous for import root {import_root}"
         )
     distribution = names[0]
-    try:
-        version = importlib.metadata.version(distribution)
-    except Exception as exc:
-        raise TrainingContractError(
-            f"distribution version is unreadable for {distribution}"
-        ) from exc
-    if not isinstance(version, str) or not version.strip():
-        raise TrainingContractError(
-            f"distribution version is unreadable for {distribution}"
-        )
-    return {distribution: version.strip()}
+    return {distribution: _distribution_version(distribution)}
 
 
 def _sha256_path(path: Path) -> str:
@@ -1232,6 +1240,9 @@ def _builtin_trainer_runtime_descriptor(trainer: Any) -> dict[str, Any]:
             "_training_outcome": _callable_contract(
                 _training_outcome, context
             ),
+            "missing_value_collision_rows": _callable_contract(
+                missing_value_collision_rows, context
+            ),
         },
         "configuration": _contract_value(
             {
@@ -1634,6 +1645,7 @@ class ResidualTrainer:
             self.sealed_estimator_spec = None
             self._sealed_estimator_type = None
             self.production_eligible = False
+        self._attested_distribution_names: Optional[tuple[str, ...]] = None
         self.feature_builder = feature_builder or FeatureBuilder()
         self._factory_contract = FrozenCallableContract.capture(
             self.estimator_factory
@@ -1681,11 +1693,24 @@ class ResidualTrainer:
             )
         if parameters_json != spec.parameters_json:
             raise TrainingContractError("estimator parameters failed attestation")
-        distributions = tuple(
-            sorted(
-                _resolved_distribution_versions(estimator_type.__module__).items()
+        cached_distribution_names = self._attested_distribution_names
+        distribution_names_to_cache = None
+        if cached_distribution_names is None:
+            distributions = tuple(
+                sorted(
+                    _resolved_distribution_versions(
+                        estimator_type.__module__
+                    ).items()
+                )
             )
-        )
+            distribution_names_to_cache = tuple(
+                distribution for distribution, _ in distributions
+            )
+        else:
+            distributions = tuple(
+                (distribution, _distribution_version(distribution))
+                for distribution in cached_distribution_names
+            )
         if distributions != spec.distributions:
             raise TrainingContractError(
                 "estimator distribution versions failed attestation"
@@ -1695,6 +1720,8 @@ class ResidualTrainer:
             raise TrainingContractError(
                 "estimator implementation hash failed attestation"
             )
+        if distribution_names_to_cache is not None:
+            self._attested_distribution_names = distribution_names_to_cache
 
     def training_contract_descriptor(self) -> dict[str, Any]:
         self._assert_factory_contract()
@@ -1883,8 +1910,6 @@ class ResidualTrainer:
                 self._fallback_estimator(residual),
                 f"estimator_factory_failed:{type(exc).__name__}",
             )
-        if self.production_eligible:
-            self.attest_estimator(estimator)
         if not hasattr(estimator, "fit") or not hasattr(estimator, "predict"):
             return self._fallback_estimator(residual), "invalid_estimator"
         if self.production_eligible:
@@ -2014,6 +2039,12 @@ class ResidualTrainer:
         model_features = feature_frame.loc[:, list(feature_columns)].copy(deep=True)
         if not np.isfinite(model_features.to_numpy(dtype=float)).all():
             raise ValueError("model features must contain finite values")
+        if self.production_eligible:
+            missing = self.sealed_estimator_spec.parameters.get("missing")
+            if missing_value_collision_rows(model_features, missing).any():
+                raise ValueError(
+                    "model features collide with estimator missing sentinel"
+                )
         segments = self.feature_builder.continuous_segments(working)
         split = self._time_split(feature_frame, segments)
         if split is not None:

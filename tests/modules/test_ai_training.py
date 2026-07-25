@@ -1,4 +1,6 @@
+import hashlib
 import importlib.metadata
+import inspect
 import json
 import types
 from dataclasses import dataclass, replace
@@ -743,6 +745,26 @@ def test_runtime_contract_tracks_builtin_training_dependencies(monkeypatch):
     ) != original_hash
 
 
+def test_runtime_contract_tracks_missing_collision_validator(monkeypatch):
+    trainer, _, preparation = _temporal_preparation()
+    original_hash = ai_training.training_runtime_contract_hash(
+        trainer, preparation
+    )
+
+    def changed_collision_rows(features, missing):
+        return np.zeros(len(features), dtype=bool)
+
+    monkeypatch.setattr(
+        ai_training,
+        "missing_value_collision_rows",
+        changed_collision_rows,
+    )
+
+    assert ai_training.training_runtime_contract_hash(
+        trainer, preparation
+    ) != original_hash
+
+
 def test_training_contract_changes_with_dependency_versions(monkeypatch):
     frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
     monkeypatch.setattr(
@@ -1208,6 +1230,17 @@ def test_default_trainer_has_sealed_xgboost_spec():
     assert len(spec.digest()) == 64
 
 
+def test_sealed_xgboost_implementation_hash_matches_source_file():
+    from xgboost.sklearn import XGBRegressor
+
+    implementation_path = Path(inspect.getfile(XGBRegressor)).resolve(
+        strict=True
+    )
+    expected = hashlib.sha256(implementation_path.read_bytes()).hexdigest()
+
+    assert ResidualTrainer().sealed_estimator_spec.implementation_sha256 == expected
+
+
 @pytest.mark.parametrize(
     "build_backend",
     [ai_training.sealed_xgboost_spec, ResidualTrainer],
@@ -1350,6 +1383,39 @@ def test_default_sealed_estimator_fits_and_predicts_with_frozen_parameters():
     assert result.bundle.model.get_params(deep=False) == dict(
         trainer.sealed_estimator_spec.parameters
     )
+
+
+def test_default_trainer_rejects_float32_missing_feature_collision(
+    monkeypatch,
+):
+    trainer = ResidualTrainer()
+    frame = make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0))
+    missing = trainer.sealed_estimator_spec.parameters["missing"]
+    collision = np.nextafter(float(np.float32(missing)), np.inf)
+    assert collision != missing
+    assert np.float32(collision) == np.float32(missing)
+    frame["slope"] = collision
+    custom_result = ResidualTrainer(
+        estimator_factory=constant_factory
+    ).train_target(frame, target="wind_speed")
+    assert isinstance(custom_result.bundle.model, MeanResidualEstimator)
+    fit_calls = []
+    original_fit = trainer._sealed_estimator_type.fit
+
+    def recording_fit(estimator, features, target, **kwargs):
+        fit_calls.append((features, target))
+        return original_fit(estimator, features, target, **kwargs)
+
+    monkeypatch.setattr(
+        trainer._sealed_estimator_type,
+        "fit",
+        recording_fit,
+    )
+
+    with pytest.raises(ValueError, match="missing"):
+        trainer.train_target(frame, target="wind_speed")
+
+    assert fit_calls == []
 
 
 def test_estimator_attestation_rejects_random_seed_mismatch():
@@ -1590,6 +1656,87 @@ def test_estimator_attestation_accepts_equivalent_runtime_distribution_name(
     assert version_calls == ["xgboost"]
 
 
+def test_estimator_attestation_rejects_version_change_after_mapping_cache(
+    monkeypatch,
+):
+    trainer = ResidualTrainer()
+    trainer.attest_estimator(ai_training.default_estimator())
+    sealed_version = dict(trainer.sealed_estimator_spec.distributions)["xgboost"]
+    mapping_calls = []
+    version_calls = []
+    monkeypatch.setattr(
+        ai_training.importlib.metadata,
+        "packages_distributions",
+        lambda: mapping_calls.append("scan") or {"xgboost": ["xgboost"]},
+    )
+    monkeypatch.setattr(
+        ai_training.importlib.metadata,
+        "version",
+        lambda distribution: version_calls.append(distribution)
+        or f"{sealed_version}-changed",
+    )
+
+    with pytest.raises(ai_training.TrainingContractError, match="distribution"):
+        trainer.attest_estimator(ai_training.default_estimator())
+
+    assert mapping_calls == []
+    assert version_calls == ["xgboost"]
+
+
+def test_failed_attestation_does_not_cache_distribution_mapping(monkeypatch):
+    trainer = ResidualTrainer()
+    estimator = ai_training.default_estimator()
+    original_sha256_path = ai_training._sha256_path
+    expected_hash = trainer.sealed_estimator_spec.implementation_sha256
+    changed_hash = "0" * 64 if expected_hash != "0" * 64 else "1" * 64
+    monkeypatch.setattr(
+        ai_training,
+        "_sha256_path",
+        lambda path: changed_hash,
+    )
+
+    with pytest.raises(ai_training.TrainingContractError, match="implementation"):
+        trainer.attest_estimator(estimator)
+
+    monkeypatch.setattr(ai_training, "_sha256_path", original_sha256_path)
+    mapping_calls = []
+    monkeypatch.setattr(
+        ai_training.importlib.metadata,
+        "packages_distributions",
+        lambda: mapping_calls.append("scan") or {},
+    )
+
+    with pytest.raises(ai_training.TrainingContractError, match="distribution"):
+        trainer.attest_estimator(estimator)
+
+    assert mapping_calls == ["scan"]
+
+
+def test_default_training_scans_distribution_mapping_twice(monkeypatch):
+    original_packages_distributions = (
+        ai_training.importlib.metadata.packages_distributions
+    )
+    mapping_calls = []
+
+    def recording_packages_distributions():
+        mapping_calls.append("scan")
+        return original_packages_distributions()
+
+    monkeypatch.setattr(
+        ai_training.importlib.metadata,
+        "packages_distributions",
+        recording_packages_distributions,
+    )
+
+    result = ResidualTrainer().train_target(
+        make_training_frame(residuals=(0.0, 1.0, 2.0, 3.0)),
+        target="wind_speed",
+    )
+
+    assert result.metadata["independent_evaluation"] is True
+    assert mapping_calls == ["scan", "scan"]
+
+
 def test_estimator_attestation_rejects_implementation_hash_change(monkeypatch):
     trainer = ResidualTrainer()
     estimator = ai_training.default_estimator()
@@ -1604,31 +1751,38 @@ def test_estimator_attestation_rejects_implementation_hash_change(monkeypatch):
         trainer.attest_estimator(estimator)
 
 
-def test_default_estimator_is_attested_after_construction_and_before_fit(
+def test_default_estimator_is_attested_once_after_construction_and_before_fit(
     monkeypatch,
 ):
     trainer = ResidualTrainer()
-    estimator = ai_training.default_estimator()
     events = []
-    original_fit = estimator.fit
+    original_factory = trainer.estimator_factory
+
+    def recording_factory():
+        events.append("construct")
+        estimator = original_factory()
+        original_fit = estimator.fit
+
+        def recording_fit(features, target):
+            events.append("fit")
+            return original_fit(features, target)
+
+        estimator.fit = recording_fit
+        return estimator
 
     def recording_attestation(candidate):
-        assert candidate is estimator
         events.append("attest")
+        original_attestation(candidate)
 
-    def recording_fit(features, target):
-        events.append("fit")
-        return original_fit(features, target)
-
-    monkeypatch.setattr(trainer, "estimator_factory", lambda: estimator)
+    original_attestation = trainer.attest_estimator
+    monkeypatch.setattr(trainer, "estimator_factory", recording_factory)
     monkeypatch.setattr(trainer, "attest_estimator", recording_attestation)
-    monkeypatch.setattr(estimator, "fit", recording_fit)
     trainer._fit_estimator(
         pd.DataFrame({"feature": [0.0, 1.0]}),
         np.array([0.0, 1.0]),
     )
 
-    assert events[:3] == ["attest", "attest", "fit"]
+    assert events == ["construct", "attest", "fit"]
 
 
 def test_fit_estimator_propagates_attestation_mismatch_before_fit(monkeypatch):

@@ -611,6 +611,46 @@ def test_pipeline_trains_missing_models_then_reuses_them(tmp_path):
     np.testing.assert_allclose(first.max_currents, second.max_currents)
 
 
+def test_missing_sentinel_terrain_falls_back_to_finite_physical_dlr(tmp_path):
+    terrain = {
+        tower_id: {"elevation": 1000.0, "slope": -1.0e30, "aspect": 0.0}
+        for tower_id in ("001", "002")
+    }
+
+    result = DlrPipeline(model_root=tmp_path).run(
+        physical=_weather("physical"),
+        truth=_weather("truth", truth_offset=True),
+        project_id="project-a",
+        line_id="line-a",
+        interval_minutes=30,
+        terrain_lookup=terrain,
+        ai_enabled=True,
+        conductor=_conductor(),
+        truth_tolerance="5min",
+    )
+
+    assert result.model_report.trained_targets == ()
+    assert result.model_report.used_targets == ()
+    assert result.model_report.active_model_count == 0
+    assert sum(
+        fallback.reason == "training_failed:ValueError"
+        for fallback in result.model_report.fallbacks
+    ) == 4
+    assert not result.comparison_weather[
+        ["wind_speed_used_ai", "ambient_temp_used_ai"]
+    ].to_numpy(dtype=bool).any()
+    np.testing.assert_array_equal(
+        result.comparison_weather["wind_speed_ai"],
+        result.comparison_weather["wind_speed_physical"],
+    )
+    np.testing.assert_array_equal(
+        result.comparison_weather["ambient_temp_ai"],
+        result.comparison_weather["ambient_temp_physical"],
+    )
+    assert result.max_currents.size > 0
+    assert np.isfinite(result.max_currents).all()
+
+
 class _CountingTrainer:
     def __init__(self):
         self.delegate = ResidualTrainer()
@@ -980,6 +1020,8 @@ def test_temporary_import_failure_is_retried_without_rejection_sidecar(
     tmp_path,
     monkeypatch,
 ):
+    original_loader = ai_training._load_xgb_regressor
+
     def unavailable():
         raise ImportError("temporary xgboost outage")
 
@@ -1011,14 +1053,16 @@ def test_temporary_import_failure_is_retried_without_rejection_sidecar(
 
     assert all(not registry.attempt_path_for(key).exists() for key in expected_keys)
     assert all(not registry.path_for(key).exists() for key in expected_keys)
-    assert {
-        decision.reason for decision in degraded.model_report.promotion_decisions
-    } == {"operational_training_fallback"}
+    assert degraded.model_report.promotion_decisions == ()
+    assert sum(
+        fallback.reason == "training_failed:TrainingContractError"
+        for fallback in degraded.model_report.fallbacks
+    ) == 4
 
     monkeypatch.setattr(
         ai_training,
         "_load_xgb_regressor",
-        lambda: _LinearResidualRegressor,
+        original_loader,
     )
 
     recovered = pipeline.run(**run_kwargs)

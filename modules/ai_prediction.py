@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from numbers import Real
 from pathlib import Path
@@ -52,6 +53,28 @@ _TARGET_PHYSICAL_COLUMNS = {
         }
     ),
 }
+
+
+def missing_value_collision_rows(features, missing) -> np.ndarray:
+    """Return rows that XGBoost float32 input treats as finite missing."""
+    row_count = len(features)
+    try:
+        numeric_missing = float(missing)
+    except (TypeError, ValueError, OverflowError):
+        return np.zeros(row_count, dtype=bool)
+    if not np.isfinite(numeric_missing):
+        return np.zeros(row_count, dtype=bool)
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            effective_features = np.asarray(features, dtype=np.float32)
+            effective_missing = np.float32(numeric_missing)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "model features cannot be checked for missing collisions"
+        ) from exc
+    if effective_features.ndim != 2 or effective_features.shape[0] != row_count:
+        raise ValueError("model features must be a two-dimensional matrix")
+    return np.equal(effective_features, effective_missing).any(axis=1)
 
 
 class FeatureBuilder:
@@ -438,6 +461,22 @@ class ResidualPredictor:
                     f"bundle scope mismatch for {column}: expected {expected}"
                 )
 
+    @staticmethod
+    def _model_missing_value(model: object):
+        get_params = getattr(model, "get_params", None)
+        if not callable(get_params):
+            return None
+        parameters = get_params(deep=False)
+        if not isinstance(parameters, Mapping):
+            return None
+        return parameters.get("missing")
+
+    @staticmethod
+    def _select_rows(features, rows: np.ndarray):
+        if isinstance(features, pd.DataFrame):
+            return features.iloc[np.flatnonzero(rows)]
+        return features[rows]
+
     def predict(
         self,
         df: pd.DataFrame,
@@ -482,11 +521,25 @@ class ResidualPredictor:
         try:
             if bundle.scaler is not None:
                 feature_frame = bundle.scaler.transform(feature_frame)
-            raw_residual = np.asarray(
-                bundle.model.predict(feature_frame), dtype=float
-            ).reshape(-1)
-            if len(raw_residual) != len(output):
-                raise ValueError("model returned an unexpected prediction length")
+            collision_rows = missing_value_collision_rows(
+                feature_frame,
+                self._model_missing_value(bundle.model),
+            )
+            prediction_rows = ~collision_rows
+            raw_residual = np.full(len(output), np.nan, dtype=float)
+            if prediction_rows.any():
+                prediction_features = self._select_rows(
+                    feature_frame,
+                    prediction_rows,
+                )
+                prediction = np.asarray(
+                    bundle.model.predict(prediction_features), dtype=float
+                ).reshape(-1)
+                if len(prediction) != int(prediction_rows.sum()):
+                    raise ValueError(
+                        "model returned an unexpected prediction length"
+                    )
+                raw_residual[prediction_rows] = prediction
         except Exception as exc:
             return self._fallback_output(
                 output,
@@ -521,6 +574,7 @@ class ResidualPredictor:
             "non_finite_prediction"
         )
         reasons[bounds_exceeded] = "physical_bounds_exceeded"
+        reasons[collision_rows] = "feature_missing_collision"
         output[f"{target_name}_residual"] = residual
         output[f"{target_name}_final"] = corrected
         output["used_ai"] = valid_ai

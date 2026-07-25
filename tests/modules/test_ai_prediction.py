@@ -1,3 +1,4 @@
+import joblib
 import numpy as np
 import pandas as pd
 import pytest
@@ -5,6 +6,7 @@ import pytest
 import modules.ai_prediction as ai_prediction
 from config.config import PROJECT_TIMEZONE
 from modules.ai_prediction import FeatureBuilder, ModelBundle, ResidualPredictor
+from modules.ai_training import ResidualTrainer
 
 
 class OffsetModel:
@@ -23,6 +25,11 @@ class SequenceModel:
 class ExplodingModel:
     def predict(self, features):
         raise OSError("model unavailable")
+
+
+class UnreadableParametersModel(OffsetModel):
+    def get_params(self, deep=False):
+        raise RuntimeError("parameters unavailable")
 
 
 class RecordingLagModel:
@@ -405,6 +412,107 @@ def test_predictor_returns_physical_plus_residual_prediction():
     assert predicted["wind_speed_final"].tolist() == [3.5, 4.5]
 
 
+def test_loaded_sealed_xgboost_falls_back_for_float32_missing_collision(
+    tmp_path,
+):
+    physical = np.arange(2.0, 6.0)
+    training_frame = pd.DataFrame(
+        {
+            "line_id": ["line-a"] * 4,
+            "tower_id": ["001"] * 4,
+            "timestamp": pd.date_range("2025-01-01", periods=4, freq="30min"),
+            "source_file_hash": ["dataset-a"] * 4,
+            "wind_speed_local": physical,
+            "wind_speed_truth": physical + np.arange(4.0),
+            "slope": np.full(4, 4.0),
+        }
+    )
+    training = ResidualTrainer().train_target(
+        training_frame,
+        target="wind_speed",
+    )
+    bundle_path = tmp_path / "sealed-bundle.joblib"
+    joblib.dump(training.bundle, bundle_path)
+    loaded_bundle = joblib.load(bundle_path)
+    missing = loaded_bundle.model.get_params(deep=False)["missing"]
+    collision = np.nextafter(float(np.float32(missing)), np.inf)
+    assert collision != missing
+    assert np.float32(collision) == np.float32(missing)
+    prediction_frame = training_frame.drop(
+        columns="wind_speed_truth"
+    ).iloc[:2].copy()
+    prediction_frame.loc[prediction_frame.index[0], "slope"] = collision
+
+    predicted = ResidualPredictor({"wind_speed": loaded_bundle}).predict(
+        prediction_frame,
+        target_name="wind_speed",
+        physical_col="wind_speed_local",
+    )
+
+    collided, safe = predicted.index
+    assert predicted.loc[collided, "wind_speed_final"] == physical[0]
+    assert predicted.loc[collided, "wind_speed_residual"] == 0.0
+    assert not bool(predicted.loc[collided, "used_ai"])
+    assert (
+        predicted.loc[collided, "fallback_reason"]
+        == "feature_missing_collision"
+    )
+    assert bool(predicted.loc[safe, "used_ai"])
+    assert predicted.loc[safe, "fallback_reason"] == ""
+
+
+def test_custom_model_without_missing_accepts_finite_sentinel_feature():
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2025-12-10 00:00"]),
+            "wind_speed_local": [3.0],
+            "slope": [-1.0e30],
+        }
+    )
+    bundle = ModelBundle(
+        target_name="wind_speed",
+        feature_columns=["slope_feature"],
+        model=OffsetModel(),
+    )
+
+    predicted = ResidualPredictor({"wind_speed": bundle}).predict(
+        frame,
+        target_name="wind_speed",
+        physical_col="wind_speed_local",
+    )
+
+    assert predicted.loc[0, "wind_speed_final"] == 3.5
+    assert bool(predicted.loc[0, "used_ai"])
+    assert predicted.loc[0, "fallback_reason"] == ""
+
+
+def test_unreadable_model_parameters_fall_back_before_prediction():
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2025-12-10 00:00"]),
+            "wind_speed_local": [3.0],
+        }
+    )
+    bundle = ModelBundle(
+        target_name="wind_speed",
+        feature_columns=["wind_speed_local"],
+        model=UnreadableParametersModel(),
+    )
+
+    predicted = ResidualPredictor({"wind_speed": bundle}).predict(
+        frame,
+        target_name="wind_speed",
+        physical_col="wind_speed_local",
+    )
+
+    assert predicted.loc[0, "wind_speed_final"] == 3.0
+    assert not bool(predicted.loc[0, "used_ai"])
+    assert (
+        predicted.loc[0, "fallback_reason"]
+        == "prediction_failed:RuntimeError"
+    )
+
+
 def test_predictor_clips_residual_then_rejects_out_of_bounds_candidates():
     df = pd.DataFrame(
         {
@@ -454,7 +562,7 @@ def test_predictor_falls_back_when_final_candidate_exceeds_physical_bounds():
 
     assert predicted.loc[0, "wind_speed_final"] == 74.0
     assert predicted.loc[0, "wind_speed_residual"] == 0.0
-    assert predicted.loc[0, "used_ai"] == False
+    assert not bool(predicted.loc[0, "used_ai"])
     assert predicted.loc[0, "fallback_reason"] == "physical_bounds_exceeded"
 
 
@@ -505,7 +613,7 @@ def test_predictor_model_exception_falls_back_without_propagating():
     )
 
     assert predicted.loc[0, "wind_speed_final"] == 3.0
-    assert predicted.loc[0, "used_ai"] == False
+    assert not bool(predicted.loc[0, "used_ai"])
     assert predicted.loc[0, "fallback_reason"] == "prediction_failed:OSError"
 
 
@@ -553,8 +661,8 @@ def test_all_fallback_paths_return_the_exact_input_physical_value():
 
     assert unavailable.loc[0, "wind_speed_final"] == 80.0
     assert non_finite.loc[0, "wind_speed_final"] == 80.0
-    assert unavailable.loc[0, "used_ai"] == False
-    assert non_finite.loc[0, "used_ai"] == False
+    assert not bool(unavailable.loc[0, "used_ai"])
+    assert not bool(non_finite.loc[0, "used_ai"])
 
 
 def test_predictor_rejects_invalid_timestamp_before_model_fallback():

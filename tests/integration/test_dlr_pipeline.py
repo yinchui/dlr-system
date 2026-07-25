@@ -9,6 +9,7 @@ import pytest
 from affine import Affine
 from pyproj import CRS
 from rasterio.coords import BoundingBox
+from sklearn.dummy import DummyRegressor
 from xgboost import XGBRegressor
 
 import modules.ai_training as ai_training
@@ -772,6 +773,139 @@ def test_custom_estimator_factory_cannot_enter_pipeline_persistence(tmp_path):
     _assert_unsupported_training_backend(result, expected_keys)
     assert not list(model_root.rglob("model.joblib"))
     assert not list(model_root.rglob("*.attempts.json"))
+
+
+def test_mutated_exact_trainer_cannot_replace_persisted_model(
+    tmp_path,
+    monkeypatch,
+):
+    model_root = tmp_path / "models"
+    registry = ModelRegistry(model_root)
+    trainer = ResidualTrainer()
+    training_calls = []
+    original_train_prepared = trainer.train_prepared
+
+    def forged_train_prepared(preparation):
+        training_calls.append((preparation.tower_id, preparation.target))
+        result = original_train_prepared(preparation)
+        model = DummyRegressor(strategy="constant", constant=0.0)
+        model.fit(
+            np.zeros((1, len(result.bundle.feature_columns)), dtype=float),
+            np.zeros(1, dtype=float),
+        )
+        return replace(
+            result,
+            bundle=replace(result.bundle, model=model),
+        )
+
+    monkeypatch.setattr(trainer, "train_prepared", forged_train_prepared)
+
+    result = DlrPipeline(registry=registry, trainer=trainer).run(
+        physical=_weather("physical"),
+        truth=_weather("truth", truth_offset=True),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    expected_keys = _expected_pipeline_model_keys()
+    assert training_calls == []
+    _assert_unsupported_training_backend(result, expected_keys)
+    for key in expected_keys:
+        assert not registry.path_for(key).exists()
+        assert not registry.metadata_path_for(key).exists()
+        assert not registry.manifest_path_for(key).exists()
+        assert not registry.attempt_path_for(key).exists()
+
+
+def test_mutated_exact_trainer_prepare_is_rejected_without_execution(
+    tmp_path,
+    monkeypatch,
+):
+    model_root = tmp_path / "models"
+    registry = ModelRegistry(model_root)
+    trainer = ResidualTrainer()
+    preparation_calls = []
+    original_prepare_target = trainer.prepare_target
+
+    def forged_prepare_target(frame, target, **kwargs):
+        preparation_calls.append((str(frame["tower_id"].iloc[0]), target))
+        return original_prepare_target(frame, target, **kwargs)
+
+    monkeypatch.setattr(trainer, "prepare_target", forged_prepare_target)
+
+    result = DlrPipeline(registry=registry, trainer=trainer).run(
+        physical=_weather("physical"),
+        truth=_weather("truth", truth_offset=True),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    expected_keys = _expected_pipeline_model_keys()
+    assert preparation_calls == []
+    _assert_unsupported_training_backend(result, expected_keys)
+    for key in expected_keys:
+        assert not registry.path_for(key).exists()
+        assert not registry.metadata_path_for(key).exists()
+        assert not registry.manifest_path_for(key).exists()
+        assert not registry.attempt_path_for(key).exists()
+
+
+def test_mutated_exact_trainer_cannot_poison_sealed_rejection_cache(
+    tmp_path,
+    monkeypatch,
+):
+    model_root = tmp_path / "models"
+    registry = ModelRegistry(model_root)
+    trainer = ResidualTrainer()
+    training_calls = []
+    original_train_prepared = trainer.train_prepared
+
+    def forged_train_prepared(preparation):
+        training_calls.append((preparation.tower_id, preparation.target))
+        result = original_train_prepared(preparation)
+        full_fit_metrics = dict(result.metadata["full_fit_metrics"])
+        full_fit_metrics["corrected_mae"] = full_fit_metrics["baseline_mae"]
+        full_fit_metrics["corrected_rmse"] = full_fit_metrics["baseline_rmse"]
+        return replace(
+            result,
+            metadata={
+                **result.metadata,
+                "full_fit_metrics": full_fit_metrics,
+            },
+        )
+
+    monkeypatch.setattr(trainer, "train_prepared", forged_train_prepared)
+    run_kwargs = {
+        "physical": _weather("physical"),
+        "truth": _weather("truth", truth_offset=True),
+        "project_id": "project-a",
+        "line_id": "line-a",
+        "terrain_lookup": {},
+        "ai_enabled": True,
+        "conductor": _conductor(),
+    }
+
+    rejected = DlrPipeline(registry=registry, trainer=trainer).run(**run_kwargs)
+
+    expected_keys = _expected_pipeline_model_keys()
+    assert training_calls == []
+    _assert_unsupported_training_backend(rejected, expected_keys)
+    assert all(not registry.attempt_path_for(key).exists() for key in expected_keys)
+
+    recovered = DlrPipeline(model_root=model_root).run(**run_kwargs)
+
+    assert recovered.model_report.trained_targets == expected_keys
+    assert recovered.model_report.used_targets == expected_keys
+    assert all(
+        decision.promoted
+        for decision in recovered.model_report.promotion_decisions
+    )
 
 
 @pytest.mark.parametrize(
@@ -2407,19 +2541,18 @@ def test_one_tower_target_training_failure_does_not_disable_other_models(
     tmp_path,
     monkeypatch,
 ):
-    trainer = ResidualTrainer()
-    original_train_prepared = trainer.train_prepared
+    original_train_prepared = ResidualTrainer.train_prepared
 
-    def selectively_fail(preparation):
+    def selectively_fail(self, preparation):
         if (
             preparation.tower_id == "001"
             and preparation.target == "wind_speed"
         ):
             raise RuntimeError("tower target failed")
-        return original_train_prepared(preparation)
+        return original_train_prepared(self, preparation)
 
-    monkeypatch.setattr(trainer, "train_prepared", selectively_fail)
-    result = DlrPipeline(model_root=tmp_path, trainer=trainer).run(
+    monkeypatch.setattr(ResidualTrainer, "train_prepared", selectively_fail)
+    result = DlrPipeline(model_root=tmp_path).run(
         physical=_weather("physical"),
         truth=_weather("truth", truth_offset=True),
         project_id="project-a",
@@ -2430,7 +2563,11 @@ def test_one_tower_target_training_failure_does_not_disable_other_models(
     )
 
     failed_key = ModelKey("project-a", "line-a", "001", "wind_speed")
-    assert failed_key not in result.model_report.trained_targets
+    successful_keys = tuple(
+        key for key in _expected_pipeline_model_keys() if key != failed_key
+    )
+    assert result.model_report.trained_targets == successful_keys
+    assert result.model_report.used_targets == successful_keys
     assert result.model_report.active_model_count == 3
     tower_one = result.comparison_weather.loc[
         result.comparison_weather["tower_id"] == "001"
@@ -2440,6 +2577,41 @@ def test_one_tower_target_training_failure_does_not_disable_other_models(
     assert any(
         fallback.key == failed_key
         and fallback.reason == "training_failed:RuntimeError"
+        for fallback in result.model_report.fallbacks
+    )
+
+
+def test_one_tower_target_without_aligned_truth_does_not_disable_other_models(
+    tmp_path,
+):
+    truth = _weather("truth", truth_offset=True)
+    truth.loc[truth["tower_id"] == "001", "wind_speed"] = np.nan
+
+    result = DlrPipeline(model_root=tmp_path).run(
+        physical=_weather("physical"),
+        truth=truth,
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    failed_key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    successful_keys = tuple(
+        key for key in _expected_pipeline_model_keys() if key != failed_key
+    )
+    assert result.model_report.trained_targets == successful_keys
+    assert result.model_report.used_targets == successful_keys
+    assert result.model_report.active_model_count == 3
+    tower_one = result.comparison_weather.loc[
+        result.comparison_weather["tower_id"] == "001"
+    ]
+    assert not tower_one["wind_speed_used_ai"].any()
+    assert tower_one["ambient_temp_used_ai"].all()
+    assert any(
+        fallback.key == failed_key
+        and fallback.reason == "no_aligned_truth"
         for fallback in result.model_report.fallbacks
     )
 

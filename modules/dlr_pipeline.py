@@ -933,7 +933,18 @@ class DlrPipeline:
         trainer = self._trainer_for_interval(interval_minutes)
         if type(trainer) is not ResidualTrainer or not trainer.production_eligible:
             raise TrainingContractError("unsupported_training_backend")
-        return trainer
+        if any(
+            method_name in trainer.__dict__
+            for method_name in ("prepare_target", "train_prepared")
+        ):
+            raise TrainingContractError("unsupported_training_backend")
+        if self.trainer is None:
+            return trainer
+        return ResidualTrainer(
+            feature_builder=FeatureBuilder(
+                cadence_minutes=float(interval_minutes)
+            )
+        )
 
     @staticmethod
     def _weather_frame(value, *, role: str) -> pd.DataFrame:

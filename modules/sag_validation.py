@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+from collections import Counter
+from io import BytesIO
+import hashlib
+import json
 import math
 import uuid
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Callable, Mapping, Optional
+from pathlib import Path
+from typing import Any, Callable, Mapping, MutableMapping, Optional
 
 import numpy as np
 import pandas as pd
 
 from config.config import SAG_VALIDATION_DEFAULTS
 from modules.data_processor import normalize_tower_id
+from modules.weather_upload import freeze_uploaded_file
+from utils.audit_log import AuditEvent, write_result_atomic
 
 
 _ANGLE_COLUMNS = ("angle_deg", "inclination", "inclination_angle")
@@ -67,10 +74,13 @@ class SagValidationSnapshot:
     solar_radiation: tuple[tuple[float, ...], ...]
     elevations: tuple[tuple[float, ...], ...]
     operating_currents: Optional[tuple[tuple[float, ...], ...]] = None
+    line_id: str = "unknown-line"
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_run_id, str) or not self.source_run_id:
             raise ValueError("source_run_id must be a non-empty string")
+        if not isinstance(self.line_id, str) or not self.line_id:
+            raise ValueError("line_id must be a non-empty string")
         if not self.tower_ids or not self.timestamps:
             raise ValueError("snapshot axes cannot be empty")
         tower_ids = tuple(str(value) for value in self.tower_ids)
@@ -220,6 +230,8 @@ def normalize_inclination_dataframe(
     angle_column = _column_matching(frame, _ANGLE_COLUMNS, "倾角")
     if angle_column is None:
         raise ValueError("倾角列是必需字段")
+    if frame.empty:
+        raise ValueError("倾角数据至少包含一行记录")
 
     output = frame.copy(deep=True).reset_index(drop=True)
     output["sample_index"] = np.arange(len(output), dtype=int)
@@ -285,6 +297,7 @@ def build_sag_snapshot(
     *,
     tower_coords: Optional[Mapping[str, Mapping[str, Any]]] = None,
     source_run_id: Optional[str] = None,
+    line_id: str = "unknown-line",
 ) -> SagValidationSnapshot:
     if not isinstance(line_data, Mapping):
         raise TypeError("line_data must be a mapping")
@@ -389,6 +402,7 @@ def build_sag_snapshot(
         solar_radiation=_frozen_matrix(solar),
         elevations=_frozen_matrix(elevations),
         operating_currents=operating,
+        line_id=line_id,
     )
 
 
@@ -872,6 +886,17 @@ class SagValidationBatchResult:
     rows: tuple[SagValidationResult, ...]
     formula_version: str
     source_run_id: str = ""
+    result_id: str = ""
+    input_hash: str = ""
+    result_path: Optional[Path] = None
+    audit_events: tuple[AuditEvent, ...] = ()
+    audit_persisted: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "rows", tuple(self.rows))
+        object.__setattr__(self, "audit_events", tuple(self.audit_events))
+        if self.result_path is not None:
+            object.__setattr__(self, "result_path", Path(self.result_path))
 
     def __iter__(self):
         return iter(self.rows)
@@ -1450,4 +1475,442 @@ class SagValidationService:
             rows=results,
             formula_version=self.config.formula_version,
             source_run_id=snapshot.source_run_id if snapshot is not None else "",
+            result_id=uuid.uuid4().hex,
         )
+
+
+def publish_sag_snapshot(
+    state: MutableMapping[str, Any],
+    line_data: Mapping[str, Any],
+    conductor_params: Mapping[str, Any],
+    *,
+    tower_coords: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    source_run_id: Optional[str] = None,
+    line_id: str = "unknown-line",
+) -> SagValidationSnapshot:
+    if not isinstance(state, MutableMapping):
+        raise TypeError("state must be a mutable mapping")
+    snapshot = build_sag_snapshot(
+        line_data,
+        conductor_params,
+        tower_coords=tower_coords,
+        source_run_id=source_run_id,
+        line_id=line_id,
+    )
+    state["sag_validation_snapshot"] = snapshot
+    return snapshot
+
+
+def _inclination_hash(frame: pd.DataFrame) -> str:
+    normalized = frame.copy(deep=True)
+    for column in normalized.columns:
+        normalized[column] = normalized[column].map(
+            lambda value: value.isoformat()
+            if isinstance(value, (pd.Timestamp,))
+            else str(value)
+        )
+    digest = hashlib.sha256()
+    digest.update(
+        json.dumps(
+            [str(column) for column in normalized.columns],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    digest.update(pd.util.hash_pandas_object(normalized, index=True).values.tobytes())
+    return digest.hexdigest()
+
+
+def _fallback_input_hash(value: Any) -> str:
+    identity = f"{type(value).__module__}.{type(value).__qualname__}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _config_hash(service: SagValidationService) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            asdict(service.config),
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _write_sag_audit(audit_logger: Optional[Any], event: AuditEvent):
+    if audit_logger is None:
+        return None
+    try:
+        return audit_logger.write(event) is True
+    except Exception:
+        return False
+
+
+def _failure_audit_event(
+    snapshot: SagValidationSnapshot,
+    service: SagValidationService,
+    *,
+    result_id: str,
+    input_hash: str,
+    stage: str,
+    error_code: str,
+    sample_count: int,
+) -> AuditEvent:
+    return AuditEvent(
+        run_id=snapshot.source_run_id,
+        result_id=result_id,
+        line_id=snapshot.line_id,
+        tower_id="multiple",
+        stage=stage,
+        input_hash=input_hash,
+        config_hash=_config_hash(service),
+        source="sag_post_validation",
+        fallback_reason=error_code,
+        error_code=error_code,
+        details={
+            "formula_version": service.config.formula_version,
+            "sample_count": sample_count,
+            "result_persisted": False,
+        },
+    )
+
+
+def _audit_and_raise(
+    exc: Exception,
+    *,
+    snapshot: SagValidationSnapshot,
+    service: SagValidationService,
+    result_id: str,
+    input_hash: str,
+    stage: str,
+    error_prefix: str,
+    sample_count: int,
+    audit_logger: Optional[Any],
+) -> None:
+    error_code = f"{error_prefix}:{type(exc).__name__}"
+    try:
+        event = _failure_audit_event(
+            snapshot,
+            service,
+            result_id=result_id,
+            input_hash=input_hash,
+            stage=stage,
+            error_code=error_code,
+            sample_count=sample_count,
+        )
+        _write_sag_audit(audit_logger, event)
+    except Exception:
+        pass
+    raise exc
+
+
+def _read_inclination_blob(name: str, content: bytes) -> pd.DataFrame:
+    extension = Path(name).suffix.lower()
+    if extension == ".csv":
+        decode_error = None
+        for encoding in ("utf-8-sig", "gb18030", "gbk"):
+            try:
+                return pd.read_csv(BytesIO(content), encoding=encoding)
+            except UnicodeDecodeError as exc:
+                decode_error = exc
+        raise ValueError(
+            "CSV 编码无法识别，支持 UTF-8、GB18030 和 GBK"
+        ) from decode_error
+    if extension == ".xlsx":
+        return pd.read_excel(BytesIO(content))
+    raise ValueError("仅支持 CSV 或 XLSX 倾角文件")
+
+
+def _error_code_counts(rows) -> dict[str, int]:
+    counts = Counter(row.error_code for row in rows if row.error_code)
+    return dict(sorted(counts.items()))
+
+
+def _parameter_source_counts(rows) -> dict[str, dict[str, int]]:
+    counts: dict[str, Counter] = {}
+    for row in rows:
+        for name, source in row.parameter_sources.items():
+            counts.setdefault(name, Counter())[source] += 1
+    return {
+        name: dict(sorted(source_counts.items()))
+        for name, source_counts in sorted(counts.items())
+    }
+
+
+def _timestamp_payload(value: Any) -> Any:
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if hasattr(value, "isoformat") and callable(value.isoformat):
+        return value.isoformat()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def build_backend_sag_payload(
+    result: SagValidationBatchResult,
+) -> dict[str, Any]:
+    if not isinstance(result, SagValidationBatchResult):
+        raise TypeError("result must be a SagValidationBatchResult")
+    rows = []
+    for row in result.rows:
+        rows.append(
+            {
+                "result_id": row.result_id,
+                "tower_id": row.tower_id,
+                "timestamp": _timestamp_payload(row.timestamp),
+                "sample_index": row.sample_index,
+                "state": row.state.value,
+                "angle_deg": row.angle_deg,
+                "horizontal_tension_n": row.horizontal_tension_n,
+                "measured_temp_c": row.measured_temp_c,
+                "theoretical_temp_c": row.theoretical_temp_c,
+                "ambient_temp_c": row.ambient_temp_c,
+                "temperature_error_c": row.temperature_error_c,
+                "threshold_c": row.threshold_c,
+                "derating_factor": row.derating_factor,
+                "original_current_a": row.original_current_a,
+                "recalculated_current_a": row.recalculated_current_a,
+                "checked_current_a": row.checked_current_a,
+                "final_current_a": row.final_current_a,
+                "formula_version": row.formula_version,
+                "valid": row.valid,
+                "error_code": row.error_code,
+                "fallback_reason": row.fallback_reason,
+                "parameter_sources": dict(row.parameter_sources),
+            }
+        )
+    return {
+        "result_id": result.result_id,
+        "source_run_id": result.source_run_id,
+        "formula_version": result.formula_version,
+        "input_hash": result.input_hash,
+        "rows": rows,
+    }
+
+
+_VISIBLE_STATE_LABELS = {
+    SagState.NORMAL: "正常",
+    SagState.RISK: "风险",
+    SagState.RECOVERY: "恢复",
+    SagState.INVALID: "无效",
+}
+
+
+def build_visible_sag_result(result: SagValidationBatchResult) -> pd.DataFrame:
+    if not isinstance(result, SagValidationBatchResult):
+        raise TypeError("result must be a SagValidationBatchResult")
+    return pd.DataFrame(
+        [
+            {
+                "杆塔": row.tower_id,
+                "时间": _timestamp_payload(row.timestamp),
+                "状态": _VISIBLE_STATE_LABELS[row.state],
+                "反推温度(°C)": row.measured_temp_c,
+                "理论温度(°C)": row.theoretical_temp_c,
+                "温差(°C)": row.temperature_error_c,
+                "校验电流(A)": row.checked_current_a,
+                "最终电流(A)": row.final_current_a,
+            }
+            for row in result.rows
+        ],
+        columns=[
+            "杆塔",
+            "时间",
+            "状态",
+            "反推温度(°C)",
+            "理论温度(°C)",
+            "温差(°C)",
+            "校验电流(A)",
+            "最终电流(A)",
+        ],
+    )
+
+
+def run_sag_validation(
+    snapshot: SagValidationSnapshot,
+    inclination_frame: pd.DataFrame,
+    *,
+    selected_tower_id: Optional[str] = None,
+    conductor: Optional[Mapping[str, Any]] = None,
+    service: Optional[SagValidationService] = None,
+    output_dir: Optional[Path | str] = None,
+    audit_logger: Optional[Any] = None,
+    input_hash: str = "",
+) -> SagValidationBatchResult:
+    if not isinstance(snapshot, SagValidationSnapshot):
+        raise TypeError("snapshot must be a SagValidationSnapshot")
+    validation_service = service or SagValidationService()
+    if not isinstance(validation_service, SagValidationService):
+        raise TypeError("service must be a SagValidationService")
+    result_id = uuid.uuid4().hex
+    try:
+        resolved_input_hash = input_hash or _inclination_hash(inclination_frame)
+    except Exception:
+        resolved_input_hash = input_hash or _fallback_input_hash(inclination_frame)
+    sample_count = (
+        len(inclination_frame)
+        if isinstance(inclination_frame, pd.DataFrame)
+        else 0
+    )
+    selected = selected_tower_id or snapshot.tower_ids[0]
+    try:
+        normalized = normalize_inclination_dataframe(
+            inclination_frame,
+            selected_tower_id=selected,
+            snapshot=snapshot,
+        )
+    except Exception as exc:
+        _audit_and_raise(
+            exc,
+            snapshot=snapshot,
+            service=validation_service,
+            result_id=result_id,
+            input_hash=resolved_input_hash,
+            stage="sag_validation",
+            error_prefix="inclination_normalization_failed",
+            sample_count=sample_count,
+            audit_logger=audit_logger,
+        )
+    try:
+        batch = validation_service.validate_batch(
+            normalized,
+            snapshot=snapshot,
+            conductor=conductor or snapshot.conductor_params,
+        )
+    except Exception as exc:
+        _audit_and_raise(
+            exc,
+            snapshot=snapshot,
+            service=validation_service,
+            result_id=result_id,
+            input_hash=resolved_input_hash,
+            stage="sag_validation",
+            error_prefix="sag_calculation_failed",
+            sample_count=sample_count,
+            audit_logger=audit_logger,
+        )
+    batch = replace(
+        batch,
+        result_id=result_id,
+        input_hash=resolved_input_hash,
+    )
+
+    result_path = None
+    persist_error = ""
+    if output_dir is not None:
+        try:
+            result_path = write_result_atomic(
+                output_dir,
+                result_id,
+                build_backend_sag_payload(batch),
+            )
+        except Exception as exc:
+            persist_error = f"result_persist_failed:{type(exc).__name__}"
+
+    error_counts = _error_code_counts(batch.rows)
+    source_counts = _parameter_source_counts(batch.rows)
+    invalid_rows = sum(row.state is SagState.INVALID for row in batch.rows)
+    fallback_reason = persist_error
+    if not fallback_reason and invalid_rows:
+        fallback_reason = "contains_invalid_samples"
+    audit_error_codes = [persist_error] if persist_error else []
+    audit_error_codes.extend(error_counts)
+    audit_error_code = ";".join(audit_error_codes)
+    tower_ids = {row.tower_id for row in batch.rows}
+    try:
+        audit_event = AuditEvent(
+            run_id=snapshot.source_run_id,
+            result_id=result_id,
+            line_id=snapshot.line_id,
+            tower_id=(
+                next(iter(tower_ids))
+                if len(tower_ids) == 1
+                else "multiple" if tower_ids else "none"
+            ),
+            stage="sag_validation",
+            input_hash=resolved_input_hash,
+            config_hash=_config_hash(validation_service),
+            source="sag_post_validation",
+            fallback_reason=fallback_reason,
+            error_code=audit_error_code,
+            details={
+                "formula_version": batch.formula_version,
+                "sample_count": len(batch.rows),
+                "invalid_rows": invalid_rows,
+                "result_persisted": result_path is not None,
+                "error_code_counts": error_counts,
+                "parameter_source_counts": source_counts,
+            },
+        )
+    except Exception:
+        return replace(
+            batch,
+            result_path=result_path,
+            audit_events=(),
+            audit_persisted=False,
+        )
+    audit_persisted = _write_sag_audit(audit_logger, audit_event)
+    return replace(
+        batch,
+        result_path=result_path,
+        audit_events=(audit_event,),
+        audit_persisted=audit_persisted,
+    )
+
+
+def run_sag_validation_upload(
+    snapshot: SagValidationSnapshot,
+    uploaded_file: Any,
+    *,
+    selected_tower_id: Optional[str] = None,
+    conductor: Optional[Mapping[str, Any]] = None,
+    service: Optional[SagValidationService] = None,
+    output_dir: Optional[Path | str] = None,
+    audit_logger: Optional[Any] = None,
+) -> SagValidationBatchResult:
+    if not isinstance(snapshot, SagValidationSnapshot):
+        raise TypeError("snapshot must be a SagValidationSnapshot")
+    validation_service = service or SagValidationService()
+    if not isinstance(validation_service, SagValidationService):
+        raise TypeError("service must be a SagValidationService")
+    result_id = uuid.uuid4().hex
+    try:
+        blob = freeze_uploaded_file(uploaded_file)
+    except Exception as exc:
+        _audit_and_raise(
+            exc,
+            snapshot=snapshot,
+            service=validation_service,
+            result_id=result_id,
+            input_hash=_fallback_input_hash(uploaded_file),
+            stage="sag_input_parse",
+            error_prefix="input_freeze_failed",
+            sample_count=0,
+            audit_logger=audit_logger,
+        )
+    try:
+        frame = _read_inclination_blob(blob.name, blob.content)
+    except Exception as exc:
+        _audit_and_raise(
+            exc,
+            snapshot=snapshot,
+            service=validation_service,
+            result_id=result_id,
+            input_hash=blob.sha256,
+            stage="sag_input_parse",
+            error_prefix="input_parse_failed",
+            sample_count=0,
+            audit_logger=audit_logger,
+        )
+    return run_sag_validation(
+        snapshot,
+        frame,
+        selected_tower_id=selected_tower_id,
+        conductor=conductor,
+        service=validation_service,
+        output_dir=output_dir,
+        audit_logger=audit_logger,
+        input_hash=blob.sha256,
+    )

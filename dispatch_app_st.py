@@ -1,15 +1,17 @@
 import streamlit as st
 import copy
+import uuid
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
 from thermal_functions import ThermalCalculator, EnvironmentGenerator, LineAnalyzer
-from config.config import AUDIT_LOG_DIR, MODEL_DIR
+from config.config import AUDIT_LOG_DIR, MODEL_DIR, STANDARD_CONDUCTORS
 from modules.data_processor import normalize_weather_input_dataframe
 from modules.dlr_pipeline import DlrPipeline, derive_line_identity
 from modules.model_registry import ModelRegistry
+from modules.sag_validation import publish_sag_snapshot
 from modules import terrain as terrain_module
 from modules.weather_correction import CorrectionOptions, WeatherCorrectionService
 from modules.weather_upload import (
@@ -194,22 +196,7 @@ def apply_weather_corrections(line_data, correction_config, conductor_params):
 # ==============================================================================
 # 标准导线数据库
 # ==============================================================================
-STANDARD_CONDUCTORS = {
-    "4×JL/G1A-630/45": {
-        'D0': 0.0338,
-        'R_low_25': 4.680e-5,
-        'R_high_75': 5.830e-5,
-        'R_high_200': 8.740e-5,
-        'materials': [
-            {'type': 'aluminum', 'density': 1.701},
-            {'type': 'steel', 'density': 0.350}
-        ]
-    },
-    "ACSR Drake (795 kcmil)": {
-        'D0': 0.0281, 'R_low_25': 7.283e-5, 'R_high_75': 8.688e-5, 'R_high_200': 1.220e-4,
-        'materials': [{'type': 'aluminum', 'density': 1.116}, {'type': 'steel', 'density': 0.5126}]
-    },
-}
+# 页面和后台机械参数共用同一只读配置目录。
 
 
 # ==============================================================================
@@ -707,10 +694,13 @@ with tab_line:
 
             progress_bar.progress(60)
             status_text.text("正在修正气象并进行热平衡计算...")
+            dlr_run_id = uuid.uuid4().hex
             pipeline = DlrPipeline(
                 registry=ModelRegistry(
                     MODEL_DIR,
                     audit_logger=JsonAuditLogger(AUDIT_LOG_DIR),
+                    audit_run_id=dlr_run_id,
+                    audit_result_id=dlr_run_id,
                 )
             )
             line_identity = derive_line_identity(
@@ -738,6 +728,19 @@ with tab_line:
                 for key in ('vertical', 'terrain', 'desert', 'wind_dir')
             ):
                 line_data['correction_details'] = None
+
+            sag_conductor_params = {
+                **STANDARD_CONDUCTORS[selected_preset],
+                **st.session_state.conductor_params,
+            }
+            publish_sag_snapshot(
+                st.session_state,
+                line_data,
+                sag_conductor_params,
+                tower_coords=st.session_state.tower_coords,
+                source_run_id=dlr_run_id,
+                line_id=line_identity.line_id,
+            )
 
             st.session_state.physical_weather_snapshot = physical_snapshot
             st.session_state.truth_weather_snapshot = truth_snapshot

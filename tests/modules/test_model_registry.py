@@ -71,7 +71,9 @@ def model_metadata(
     backend_id=SEALED_BACKEND_ID,
     training_outcome="data_fallback",
     random_seed=42,
-    _allow_legacy_training_outcome=False,
+    _allow_legacy_training_contract=None,
+    _allow_legacy_backend=None,
+    _allow_legacy_training_outcome=None,
     compatibility=None,
 ):
     metrics = dict(WEATHER_METRICS, corrected_mae=corrected_mae)
@@ -105,6 +107,8 @@ def model_metadata(
         cadence_minutes=30.0,
         training_contract_hash=training_contract_hash,
         backend_id=backend_id,
+        _allow_legacy_training_contract=_allow_legacy_training_contract,
+        _allow_legacy_backend=_allow_legacy_backend,
         _allow_legacy_training_outcome=_allow_legacy_training_outcome,
         training_outcome=training_outcome,
     )
@@ -737,14 +741,17 @@ def test_new_metadata_cannot_claim_legacy_training_outcome():
         model_metadata(key, training_outcome="legacy")
 
 
-def test_new_metadata_cannot_enable_legacy_outcome_migration_flag():
+@pytest.mark.parametrize("authorization", [True, object()])
+def test_new_metadata_cannot_enable_legacy_outcome_migration_flag(
+    authorization,
+):
     key = ModelKey("project-a", "line-a", "001", "wind_speed")
 
     with pytest.raises(ValueError, match="legacy.*training outcome"):
         model_metadata(
             key,
             training_outcome="legacy",
-            _allow_legacy_training_outcome=True,
+            _allow_legacy_training_outcome=authorization,
         )
 
 
@@ -845,6 +852,20 @@ def test_new_metadata_cannot_claim_the_legacy_backend_id():
         model_metadata(key, backend_id=LEGACY_BACKEND_ID)
 
 
+@pytest.mark.parametrize("authorization", [True, object()])
+def test_new_metadata_cannot_enable_legacy_backend_migration_flag(
+    authorization,
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    with pytest.raises(ValueError, match="legacy.*backend"):
+        model_metadata(
+            key,
+            backend_id=LEGACY_BACKEND_ID,
+            _allow_legacy_backend=authorization,
+        )
+
+
 def test_new_metadata_cannot_claim_the_legacy_training_contract():
     key = ModelKey("project-a", "line-a", "001", "wind_speed")
 
@@ -852,6 +873,20 @@ def test_new_metadata_cannot_claim_the_legacy_training_contract():
         model_metadata(
             key,
             training_contract_hash="legacy-training-contract-v0",
+        )
+
+
+@pytest.mark.parametrize("authorization", [True, object()])
+def test_new_metadata_cannot_enable_legacy_contract_migration_flag(
+    authorization,
+):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    with pytest.raises(ValueError, match="legacy.*training contract"):
+        model_metadata(
+            key,
+            training_contract_hash="legacy-training-contract-v0",
+            _allow_legacy_training_contract=authorization,
         )
 
 

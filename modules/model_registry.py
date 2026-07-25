@@ -66,6 +66,8 @@ _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
 _LEGACY_TRAINING_CONTRACT_HASH = "legacy-training-contract-v0"
 _LEGACY_BACKEND_ID = "legacy-training-backend-v0"
+_LEGACY_TRAINING_CONTRACT_MIGRATION_TOKEN = object()
+_LEGACY_BACKEND_MIGRATION_TOKEN = object()
 _LEGACY_OUTCOME_MIGRATION_TOKEN = object()
 _ATTEMPT_POLICY_VERSION = "weather-promotion-v1"
 _ATTEMPT_LEDGER_FIELDS = frozenset(
@@ -243,8 +245,8 @@ class ModelMetadata:
     cadence_minutes: float
     training_contract_hash: str
     backend_id: str
-    _allow_legacy_training_contract: InitVar[bool] = False
-    _allow_legacy_backend: InitVar[bool] = False
+    _allow_legacy_training_contract: InitVar[object] = None
+    _allow_legacy_backend: InitVar[object] = None
     _allow_legacy_training_outcome: InitVar[object] = None
     training_outcome: str = "trained"
     checksum: str = ""
@@ -254,8 +256,8 @@ class ModelMetadata:
 
     def __post_init__(
         self,
-        _allow_legacy_training_contract: bool,
-        _allow_legacy_backend: bool,
+        _allow_legacy_training_contract: object,
+        _allow_legacy_backend: object,
         _allow_legacy_training_outcome: object,
     ) -> None:
         if not isinstance(self.key, ModelKey):
@@ -343,13 +345,17 @@ class ModelMetadata:
         )
         if (
             self.training_contract_hash == _LEGACY_TRAINING_CONTRACT_HASH
-            and not _allow_legacy_training_contract
+            and _allow_legacy_training_contract
+            is not _LEGACY_TRAINING_CONTRACT_MIGRATION_TOKEN
         ):
             raise ValueError(
                 "legacy training contract is reserved for metadata migration"
             )
         _require_nonempty_string(self.backend_id, "backend_id")
-        if self.backend_id == _LEGACY_BACKEND_ID and not _allow_legacy_backend:
+        if (
+            self.backend_id == _LEGACY_BACKEND_ID
+            and _allow_legacy_backend is not _LEGACY_BACKEND_MIGRATION_TOKEN
+        ):
             raise ValueError("legacy backend is reserved for metadata migration")
         if self.last_attempted_input_data_hash is not None:
             _require_nonempty_string(
@@ -440,8 +446,14 @@ class ModelMetadata:
         return cls(
             key=key,
             compatibility=compatibility,
-            _allow_legacy_training_contract=missing_training_contract,
-            _allow_legacy_backend=missing_backend,
+            _allow_legacy_training_contract=(
+                _LEGACY_TRAINING_CONTRACT_MIGRATION_TOKEN
+                if missing_training_contract
+                else None
+            ),
+            _allow_legacy_backend=(
+                _LEGACY_BACKEND_MIGRATION_TOKEN if missing_backend else None
+            ),
             _allow_legacy_training_outcome=(
                 _LEGACY_OUTCOME_MIGRATION_TOKEN
                 if missing_training_outcome

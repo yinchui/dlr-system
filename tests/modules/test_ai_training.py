@@ -1807,6 +1807,17 @@ def test_fit_estimator_propagates_attestation_mismatch_before_fit(monkeypatch):
     assert fit_calls == []
 
 
+def test_fit_estimator_attests_before_capability_fallback(monkeypatch):
+    trainer = ResidualTrainer()
+    monkeypatch.setattr(trainer, "estimator_factory", object)
+
+    with pytest.raises(ai_training.TrainingContractError, match="type"):
+        trainer._fit_estimator(
+            pd.DataFrame({"feature": [0.0, 1.0]}),
+            np.array([0.0, 1.0]),
+        )
+
+
 def test_fit_estimator_rejects_loader_type_drift_before_fit(monkeypatch):
     from xgboost import XGBClassifier
 

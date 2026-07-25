@@ -1910,10 +1910,10 @@ class ResidualTrainer:
                 self._fallback_estimator(residual),
                 f"estimator_factory_failed:{type(exc).__name__}",
             )
-        if not hasattr(estimator, "fit") or not hasattr(estimator, "predict"):
-            return self._fallback_estimator(residual), "invalid_estimator"
         if self.production_eligible:
             self.attest_estimator(estimator)
+        if not hasattr(estimator, "fit") or not hasattr(estimator, "predict"):
+            return self._fallback_estimator(residual), "invalid_estimator"
         try:
             estimator.fit(features, residual)
         except Exception as exc:

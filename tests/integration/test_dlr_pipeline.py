@@ -245,8 +245,7 @@ def test_complete_coordinate_identity_is_stable_across_new_weather_batches():
 def test_nonpersistent_identity_uses_models_only_within_the_current_run(
     tmp_path,
 ):
-    trainer = _CountingTrainer()
-    pipeline = DlrPipeline(model_root=tmp_path, trainer=trainer)
+    pipeline = DlrPipeline(model_root=tmp_path)
     identity = dlr_pipeline_module.derive_line_identity(
         _weather("physical"),
         tower_coords={"001": {"lon": 120.1, "lat": 40.1}},
@@ -276,12 +275,11 @@ def test_nonpersistent_identity_uses_models_only_within_the_current_run(
     assert later.model_report.loaded_targets == ()
     assert later.model_report.trained_targets == ()
     assert later.model_report.used_targets == ()
-    assert len(trainer.calls) == 4
     assert pipeline.registry is None
     assert list(tmp_path.iterdir()) == []
 
 
-def test_nonpersistent_identity_rejects_model_not_better_than_physical(
+def test_nonpersistent_identity_rejects_custom_estimator_backend(
     tmp_path,
 ):
     class ZeroResidualEstimator:
@@ -322,13 +320,14 @@ def test_nonpersistent_identity_rejects_model_not_better_than_physical(
     assert result.model_report.trained_targets == ()
     assert result.model_report.used_targets == ()
     assert sum(
-        fallback.reason == "candidate_not_better_than_physical"
+        fallback.reason == "unsupported_training_backend"
         for fallback in result.model_report.fallbacks
     ) == 4
+    assert result.model_report.promotion_decisions == ()
     assert list(tmp_path.iterdir()) == []
 
 
-def test_nonpersistent_training_requires_explicit_runtime_contract(tmp_path):
+def test_nonpersistent_training_rejects_descriptorless_backend(tmp_path):
     class DescriptorlessTrainer:
         def __init__(self):
             self.delegate = ResidualTrainer()
@@ -369,7 +368,7 @@ def test_nonpersistent_training_requires_explicit_runtime_contract(tmp_path):
     assert result.model_report.trained_targets == ()
     assert result.model_report.used_targets == ()
     assert sum(
-        fallback.reason == "training_failed:TrainingContractError"
+        fallback.reason == "unsupported_training_backend"
         for fallback in result.model_report.fallbacks
     ) == 4
     np.testing.assert_array_equal(
@@ -676,6 +675,199 @@ class _CountingTrainer:
         }
 
 
+class _ClaimingResidualTrainer(ResidualTrainer):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def prepare_target(self, frame, target, **kwargs):
+        self.calls.append((str(frame["tower_id"].iloc[0]), target))
+        return super().prepare_target(frame, target, **kwargs)
+
+
+def _expected_pipeline_model_keys():
+    return tuple(
+        ModelKey("project-a", "line-a", tower_id, target)
+        for tower_id in ("001", "002")
+        for target in ("wind_speed", "ambient_temp")
+    )
+
+
+def _assert_unsupported_training_backend(result, expected_keys):
+    assert result.model_report.loaded_targets == ()
+    assert result.model_report.trained_targets == ()
+    assert result.model_report.used_targets == ()
+    assert result.model_report.promotion_decisions == ()
+    assert tuple(
+        (fallback.key, fallback.reason) for fallback in result.model_report.fallbacks
+    ) == tuple((key, "unsupported_training_backend") for key in expected_keys)
+    assert result.max_currents.size > 0
+    assert np.isfinite(result.max_currents).all()
+    assert (
+        not result.comparison_weather[
+            ["wind_speed_used_ai", "ambient_temp_used_ai"]
+        ]
+        .to_numpy(dtype=bool)
+        .any()
+    )
+
+
+@pytest.mark.parametrize("model_persistence_allowed", [True, False])
+def test_custom_trainer_cannot_train_or_persist(
+    tmp_path,
+    model_persistence_allowed,
+):
+    model_root = tmp_path / "models"
+    trainer = _CountingTrainer()
+    pipeline = DlrPipeline(model_root=model_root, trainer=trainer)
+
+    result = pipeline.run(
+        physical=_weather("physical"),
+        truth=_weather("truth", truth_offset=True),
+        project_id="project-a",
+        line_id="line-a",
+        model_persistence_allowed=model_persistence_allowed,
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    expected_keys = _expected_pipeline_model_keys()
+    assert trainer.calls == []
+    _assert_unsupported_training_backend(result, expected_keys)
+    assert not list(model_root.rglob("model.joblib"))
+    assert not list(model_root.rglob("*.attempts.json"))
+    if model_persistence_allowed:
+        assert pipeline.registry is not None
+    else:
+        assert pipeline.registry is None
+        assert not model_root.exists()
+
+
+def test_custom_estimator_factory_cannot_enter_pipeline_persistence(tmp_path):
+    model_root = tmp_path / "models"
+    trainer = ResidualTrainer(estimator_factory=_LinearResidualRegressor)
+    prepare_calls = []
+    original_prepare = trainer.prepare_target
+
+    def counting_prepare(*args, **kwargs):
+        prepare_calls.append((args, kwargs))
+        return original_prepare(*args, **kwargs)
+
+    trainer.prepare_target = counting_prepare
+
+    result = DlrPipeline(model_root=model_root, trainer=trainer).run(
+        physical=_weather("physical"),
+        truth=_weather("truth", truth_offset=True),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    expected_keys = _expected_pipeline_model_keys()
+    assert prepare_calls == []
+    _assert_unsupported_training_backend(result, expected_keys)
+    assert not list(model_root.rglob("model.joblib"))
+    assert not list(model_root.rglob("*.attempts.json"))
+
+
+@pytest.mark.parametrize(
+    "trainer_factory",
+    [_ClaimingResidualTrainer, _CountingTrainer],
+    ids=["subclass", "duck"],
+)
+def test_unsupported_training_backend_rejects_claiming_trainers(
+    tmp_path,
+    trainer_factory,
+):
+    trainer = trainer_factory()
+    trainer.production_eligible = True
+
+    result = DlrPipeline(
+        model_root=tmp_path / "models",
+        trainer=trainer,
+    ).run(
+        physical=_weather("physical"),
+        truth=_weather("truth", truth_offset=True),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    assert trainer.calls == []
+    _assert_unsupported_training_backend(
+        result,
+        _expected_pipeline_model_keys(),
+    )
+
+
+def test_unsupported_training_backend_is_not_cached_and_sealed_retry_succeeds(
+    tmp_path,
+):
+    model_root = tmp_path / "models"
+    run_kwargs = {
+        "physical": _weather("physical"),
+        "truth": _weather("truth", truth_offset=True),
+        "project_id": "project-a",
+        "line_id": "line-a",
+        "terrain_lookup": {},
+        "ai_enabled": True,
+        "conductor": _conductor(),
+    }
+
+    rejected = DlrPipeline(
+        model_root=model_root,
+        trainer=_CountingTrainer(),
+    ).run(**run_kwargs)
+    assert rejected.model_report.promotion_decisions == ()
+    assert not list(model_root.rglob("model.joblib"))
+    assert not list(model_root.rglob("*.attempts.json"))
+
+    recovered = DlrPipeline(
+        model_root=model_root,
+        trainer=ResidualTrainer(),
+    ).run(**run_kwargs)
+
+    expected_keys = _expected_pipeline_model_keys()
+    assert recovered.model_report.trained_targets == expected_keys
+    assert recovered.model_report.used_targets == expected_keys
+    assert all(
+        decision.promoted
+        for decision in recovered.model_report.promotion_decisions
+    )
+
+
+def test_custom_trainer_without_training_need_keeps_physical_fallback(tmp_path):
+    trainer = _CountingTrainer()
+
+    result = DlrPipeline(
+        model_root=tmp_path / "models",
+        trainer=trainer,
+    ).run(
+        physical=_weather("physical"),
+        truth=None,
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    assert trainer.calls == []
+    assert result.model_report.trained_targets == ()
+    assert result.model_report.used_targets == ()
+    assert all(
+        fallback.reason != "unsupported_training_backend"
+        for fallback in result.model_report.fallbacks
+    )
+    assert result.max_currents.size > 0
+    assert np.isfinite(result.max_currents).all()
+
+
 class _PoorTemporalTrainer(_CountingTrainer):
     def train_prepared(self, preparation):
         result = super().train_prepared(preparation)
@@ -723,8 +915,7 @@ class _RuntimeContractMutatingTrainer(_CountingTrainer):
 def test_pipeline_does_not_retrain_loaded_models_when_truth_is_reuploaded(
     tmp_path,
 ):
-    trainer = _CountingTrainer()
-    pipeline = DlrPipeline(model_root=tmp_path, trainer=trainer)
+    pipeline = DlrPipeline(model_root=tmp_path)
     run_kwargs = {
         "physical": _weather("physical"),
         "truth": _weather("truth", truth_offset=True),
@@ -738,14 +929,13 @@ def test_pipeline_does_not_retrain_loaded_models_when_truth_is_reuploaded(
     first = pipeline.run(**run_kwargs)
     second = pipeline.run(**run_kwargs)
 
-    assert len(trainer.calls) == 4
     assert len(first.model_report.trained_targets) == 4
     assert second.model_report.loaded_targets == first.model_report.trained_targets
     assert second.model_report.used_targets == first.model_report.trained_targets
     assert second.model_report.trained_targets == ()
 
 
-def test_pipeline_rejects_trainer_runtime_contract_changed_during_training(
+def test_pipeline_rejects_custom_trainer_before_runtime_contract_mutation(
     tmp_path,
 ):
     trainer = _RuntimeContractMutatingTrainer()
@@ -761,16 +951,9 @@ def test_pipeline_rejects_trainer_runtime_contract_changed_during_training(
         conductor=_conductor(),
     )
 
-    expected_keys = tuple(
-        ModelKey("project-a", "line-a", tower_id, target)
-        for tower_id in ("001", "002")
-        for target in ("wind_speed", "ambient_temp")
-    )
-    assert result.model_report.trained_targets == ()
-    assert sum(
-        fallback.reason == "training_failed:TrainingContractError"
-        for fallback in result.model_report.fallbacks
-    ) == 4
+    expected_keys = _expected_pipeline_model_keys()
+    assert trainer.calls == []
+    _assert_unsupported_training_backend(result, expected_keys)
     assert all(not registry.path_for(key).exists() for key in expected_keys)
     assert all(not registry.attempt_path_for(key).exists() for key in expected_keys)
 
@@ -794,11 +977,68 @@ def _weather_with_additional_segment(
     )
 
 
+def test_custom_trainer_does_not_taint_compatible_sealed_models(tmp_path):
+    model_root = tmp_path / "models"
+    run_kwargs = {
+        "project_id": "project-a",
+        "line_id": "line-a",
+        "terrain_lookup": {},
+        "ai_enabled": True,
+        "conductor": _conductor(),
+        "truth_tolerance": "5min",
+    }
+    sealed_pipeline = DlrPipeline(model_root=model_root)
+    sealed_pipeline.run(
+        **run_kwargs,
+        physical=_weather("physical"),
+        truth=_weather("truth", truth_offset=True),
+    )
+    expanded_physical = _weather_with_additional_segment("physical")
+    expanded_truth = _weather_with_additional_segment(
+        "truth", truth_offset=True
+    )
+    promoted = sealed_pipeline.run(
+        **run_kwargs,
+        physical=expanded_physical,
+        truth=expanded_truth,
+    )
+    expected_keys = _expected_pipeline_model_keys()
+    artifact_bytes = {
+        path: path.read_bytes()
+        for key in expected_keys
+        for path in (
+            sealed_pipeline.registry.path_for(key),
+            sealed_pipeline.registry.metadata_path_for(key),
+            sealed_pipeline.registry.manifest_path_for(key),
+        )
+    }
+    trainer = _CountingTrainer()
+
+    reused = DlrPipeline(
+        model_root=model_root,
+        trainer=trainer,
+    ).run(
+        **run_kwargs,
+        physical=expanded_physical,
+        truth=expanded_truth,
+    )
+
+    assert promoted.model_report.trained_targets == expected_keys
+    assert trainer.calls == []
+    assert reused.model_report.loaded_targets == expected_keys
+    assert reused.model_report.trained_targets == ()
+    assert reused.model_report.used_targets == expected_keys
+    assert reused.model_report.fallbacks == ()
+    assert all(
+        path.read_bytes() == payload
+        for path, payload in artifact_bytes.items()
+    )
+
+
 def test_provisional_models_train_on_new_holdout_then_active_models_stop(
     tmp_path,
 ):
-    trainer = _CountingTrainer()
-    pipeline = DlrPipeline(model_root=tmp_path, trainer=trainer)
+    pipeline = DlrPipeline(model_root=tmp_path)
     run_kwargs = {
         "project_id": "project-a",
         "line_id": "line-a",
@@ -837,7 +1077,6 @@ def test_provisional_models_train_on_new_holdout_then_active_models_stop(
         for key in keys
     }
 
-    assert len(trainer.calls) == 8
     assert promoted.model_report.trained_targets == keys
     assert all(value["status"] == "active_provisional" for value in first_metadata.values())
     assert all(value["evaluation_mode"] == "full_fit" for value in first_metadata.values())
@@ -867,15 +1106,15 @@ def test_provisional_models_train_on_new_holdout_then_active_models_stop(
         ),
     )
 
-    assert len(trainer.calls) == 8
     assert repeated.model_report.trained_targets == ()
     assert newer.model_report.trained_targets == ()
+    assert repeated.model_report.loaded_targets == keys
+    assert newer.model_report.loaded_targets == keys
 
 
 def test_rejected_temporal_candidate_is_reported_and_not_retrained(tmp_path):
-    trainer = _CountingTrainer()
     registry = ModelRegistry(tmp_path, min_mae_improvement=999.0)
-    pipeline = DlrPipeline(registry=registry, trainer=trainer)
+    pipeline = DlrPipeline(registry=registry)
     run_kwargs = {
         "project_id": "project-a",
         "line_id": "line-a",
@@ -903,7 +1142,6 @@ def test_rejected_temporal_candidate_is_reported_and_not_retrained(tmp_path):
         physical=expanded_physical,
         truth=expanded_truth,
     )
-    calls_after_rejection = len(trainer.calls)
     repeated = pipeline.run(
         **run_kwargs,
         physical=expanded_physical,
@@ -911,9 +1149,7 @@ def test_rejected_temporal_candidate_is_reported_and_not_retrained(tmp_path):
     )
 
     assert len(first.model_report.trained_targets) == 4
-    assert calls_after_rejection == 8
     assert rejected.model_report.trained_targets == ()
-    assert len(trainer.calls) == 8
     assert [
         (decision.key, decision.promoted, decision.reason)
         for decision in rejected.model_report.promotion_decisions
@@ -929,54 +1165,32 @@ def test_rejected_temporal_candidate_is_reported_and_not_retrained(tmp_path):
         assert registry.attempt_path_for(key).exists()
 
 
-def test_poor_temporal_candidate_is_not_refit_for_the_same_input(tmp_path):
+def test_poor_custom_trainer_is_rejected_before_candidate_evaluation(tmp_path):
     trainer = _PoorTemporalTrainer()
     registry = ModelRegistry(tmp_path)
     pipeline = DlrPipeline(registry=registry, trainer=trainer)
     run_kwargs = {
+        "physical": _weather("physical"),
+        "truth": _weather("truth", truth_offset=True),
         "project_id": "project-a",
         "line_id": "line-a",
         "terrain_lookup": {},
         "ai_enabled": True,
         "conductor": _conductor(),
-        "truth_tolerance": "5min",
     }
 
-    first = pipeline.run(
-        **run_kwargs,
-        physical=_weather("physical"),
-        truth=_weather("truth", truth_offset=True),
-    )
-    expanded_physical = _weather_with_additional_segment("physical")
-    expanded_truth = _weather_with_additional_segment(
-        "truth", truth_offset=True
-    )
-    rejected = pipeline.run(
-        **run_kwargs,
-        physical=expanded_physical,
-        truth=expanded_truth,
-    )
-    repeated = pipeline.run(
-        **run_kwargs,
-        physical=expanded_physical,
-        truth=expanded_truth,
-    )
+    first = pipeline.run(**run_kwargs)
+    repeated = pipeline.run(**run_kwargs)
 
-    assert len(first.model_report.trained_targets) == 4
-    assert len(trainer.calls) == 8
-    assert rejected.model_report.trained_targets == ()
-    assert [
-        (decision.key, decision.promoted, decision.reason)
-        for decision in rejected.model_report.promotion_decisions
-    ] == [
-        (key, False, "candidate_not_better_than_physical")
-        for key in first.model_report.trained_targets
-    ]
-    assert rejected.model_report.fallbacks == ()
-    assert repeated.model_report.promotion_decisions == ()
+    expected_keys = _expected_pipeline_model_keys()
+    assert trainer.calls == []
+    _assert_unsupported_training_backend(first, expected_keys)
+    _assert_unsupported_training_backend(repeated, expected_keys)
+    assert all(not registry.attempt_path_for(key).exists() for key in expected_keys)
+    assert all(not registry.path_for(key).exists() for key in expected_keys)
 
 
-def test_first_rejected_models_use_sidecar_without_duplicate_fallbacks(tmp_path):
+def test_custom_backend_rejection_has_no_sidecar_or_duplicate_fallbacks(tmp_path):
     trainer = _AlwaysPoorTrainer()
     registry = ModelRegistry(tmp_path)
     pipeline = DlrPipeline(registry=registry, trainer=trainer)
@@ -993,26 +1207,11 @@ def test_first_rejected_models_use_sidecar_without_duplicate_fallbacks(tmp_path)
     first = pipeline.run(**run_kwargs)
     repeated = pipeline.run(**run_kwargs)
 
-    expected_keys = tuple(
-        ModelKey("project-a", "line-a", tower_id, target)
-        for tower_id in ("001", "002")
-        for target in ("wind_speed", "ambient_temp")
-    )
-    assert len(trainer.calls) == 4
-    assert first.model_report.trained_targets == ()
-    assert [
-        (decision.key, decision.promoted, decision.reason)
-        for decision in first.model_report.promotion_decisions
-    ] == [
-        (key, False, "candidate_not_better_than_physical")
-        for key in expected_keys
-    ]
-    assert repeated.model_report.promotion_decisions == ()
-    for report in (first.model_report, repeated.model_report):
-        keyed_fallbacks = [fallback for fallback in report.fallbacks if fallback.key]
-        assert len(keyed_fallbacks) == 4
-        assert {fallback.key for fallback in keyed_fallbacks} == set(expected_keys)
-    assert all(registry.attempt_path_for(key).exists() for key in expected_keys)
+    expected_keys = _expected_pipeline_model_keys()
+    assert trainer.calls == []
+    _assert_unsupported_training_backend(first, expected_keys)
+    _assert_unsupported_training_backend(repeated, expected_keys)
+    assert all(not registry.attempt_path_for(key).exists() for key in expected_keys)
     assert all(not registry.path_for(key).exists() for key in expected_keys)
 
 
@@ -1073,7 +1272,7 @@ def test_temporary_import_failure_is_retried_without_rejection_sidecar(
     )
 
 
-def test_rejected_attempt_is_retried_when_trainer_contract_changes(tmp_path):
+def test_unsupported_backend_is_retried_after_sealed_trainer_restored(tmp_path):
     poor_trainer = _AlwaysPoorTrainer()
     registry = ModelRegistry(tmp_path)
     run_kwargs = {
@@ -1085,26 +1284,28 @@ def test_rejected_attempt_is_retried_when_trainer_contract_changes(tmp_path):
         "ai_enabled": True,
         "conductor": _conductor(),
     }
-    DlrPipeline(registry=registry, trainer=poor_trainer).run(**run_kwargs)
-    normal_trainer = _CountingTrainer()
+    rejected = DlrPipeline(registry=registry, trainer=poor_trainer).run(
+        **run_kwargs
+    )
+    expected_keys = _expected_pipeline_model_keys()
+    assert poor_trainer.calls == []
+    _assert_unsupported_training_backend(rejected, expected_keys)
+    assert all(not registry.attempt_path_for(key).exists() for key in expected_keys)
 
     retried = DlrPipeline(
         registry=ModelRegistry(tmp_path),
-        trainer=normal_trainer,
     ).run(**run_kwargs)
 
-    assert len(poor_trainer.calls) == 4
-    assert len(normal_trainer.calls) == 4
-    assert len(retried.model_report.trained_targets) == 4
+    assert retried.model_report.trained_targets == expected_keys
+    assert retried.model_report.used_targets == expected_keys
     assert all(
         decision.promoted for decision in retried.model_report.promotion_decisions
     )
 
 
 def test_attempt_cache_is_invalidated_when_mae_threshold_changes(tmp_path):
-    trainer = _CountingTrainer()
     high_registry = ModelRegistry(tmp_path, min_mae_improvement=999.0)
-    high_pipeline = DlrPipeline(registry=high_registry, trainer=trainer)
+    high_pipeline = DlrPipeline(registry=high_registry)
     run_kwargs = {
         "project_id": "project-a",
         "line_id": "line-a",
@@ -1134,7 +1335,6 @@ def test_attempt_cache_is_invalidated_when_mae_threshold_changes(tmp_path):
     )
     low_pipeline = DlrPipeline(
         registry=ModelRegistry(tmp_path, min_mae_improvement=0.0),
-        trainer=trainer,
     )
     retrained = low_pipeline.run(
         **run_kwargs,
@@ -1145,7 +1345,6 @@ def test_attempt_cache_is_invalidated_when_mae_threshold_changes(tmp_path):
     assert len(first.model_report.trained_targets) == 4
     assert rejected.model_report.trained_targets == ()
     assert repeated.model_report.promotion_decisions == ()
-    assert len(trainer.calls) == 12
     assert retrained.model_report.trained_targets == first.model_report.trained_targets
     assert all(
         decision.promoted for decision in retrained.model_report.promotion_decisions
@@ -1155,8 +1354,7 @@ def test_attempt_cache_is_invalidated_when_mae_threshold_changes(tmp_path):
 def test_pipeline_retrains_only_the_corrupt_model_when_truth_is_available(
     tmp_path,
 ):
-    trainer = _CountingTrainer()
-    pipeline = DlrPipeline(model_root=tmp_path, trainer=trainer)
+    pipeline = DlrPipeline(model_root=tmp_path)
     run_kwargs = {
         "physical": _weather("physical"),
         "truth": _weather("truth", truth_offset=True),
@@ -1169,11 +1367,9 @@ def test_pipeline_retrains_only_the_corrupt_model_when_truth_is_available(
     first = pipeline.run(**run_kwargs)
     damaged = ModelKey("project-a", "line-a", "001", "wind_speed")
     pipeline.registry.path_for(damaged).write_bytes(b"not-a-model")
-    trainer.calls.clear()
 
     repaired = pipeline.run(**run_kwargs)
 
-    assert trainer.calls == [(damaged.tower_id, damaged.target)]
     assert repaired.model_report.loaded_targets == tuple(
         key for key in first.model_report.trained_targets if key != damaged
     )
@@ -1832,35 +2028,6 @@ def test_all_weather_stages_keep_the_full_project_line_tower_key(tmp_path):
         assert set(frame["line_id"]) == {"line-a"}
 
 
-class _SelectiveFailTrainer:
-    def __init__(self):
-        self.delegate = ResidualTrainer()
-        self.feature_builder = self.delegate.feature_builder
-
-    @staticmethod
-    def _must_fail(tower_id, target):
-        return str(tower_id) == "001" and target == "wind_speed"
-
-    def train_target(self, frame, target, **kwargs):
-        if self._must_fail(frame["tower_id"].iloc[0], target):
-            raise RuntimeError("tower target failed")
-        return self.delegate.train_target(frame, target, **kwargs)
-
-    def prepare_target(self, frame, target, **kwargs):
-        return self.delegate.prepare_target(frame, target, **kwargs)
-
-    def train_prepared(self, preparation):
-        if self._must_fail(preparation.tower_id, preparation.target):
-            raise RuntimeError("tower target failed")
-        return self.delegate.train_prepared(preparation)
-
-    def training_contract_descriptor(self):
-        return {
-            "type": f"{type(self).__module__}.{type(self).__qualname__}",
-            "delegate": self.delegate.training_contract_descriptor(),
-        }
-
-
 class _ZeroResidualModel:
     def predict(self, features):
         return np.zeros(len(features), dtype=float)
@@ -2045,10 +2212,23 @@ def test_inconsistent_non_ai_prediction_rolls_back_the_entire_key(
     )
 
 
-def test_one_tower_target_training_failure_does_not_disable_other_models(tmp_path):
-    result = DlrPipeline(
-        model_root=tmp_path, trainer=_SelectiveFailTrainer()
-    ).run(
+def test_one_tower_target_training_failure_does_not_disable_other_models(
+    tmp_path,
+    monkeypatch,
+):
+    trainer = ResidualTrainer()
+    original_train_prepared = trainer.train_prepared
+
+    def selectively_fail(preparation):
+        if (
+            preparation.tower_id == "001"
+            and preparation.target == "wind_speed"
+        ):
+            raise RuntimeError("tower target failed")
+        return original_train_prepared(preparation)
+
+    monkeypatch.setattr(trainer, "train_prepared", selectively_fail)
+    result = DlrPipeline(model_root=tmp_path, trainer=trainer).run(
         physical=_weather("physical"),
         truth=_weather("truth", truth_offset=True),
         project_id="project-a",

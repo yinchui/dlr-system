@@ -929,6 +929,12 @@ class DlrPipeline:
             )
         return self.trainer
 
+    def _sealed_trainer_for_interval(self, interval_minutes: float) -> ResidualTrainer:
+        trainer = self._trainer_for_interval(interval_minutes)
+        if type(trainer) is not ResidualTrainer or not trainer.production_eligible:
+            raise TrainingContractError("unsupported_training_backend")
+        return trainer
+
     @staticmethod
     def _weather_frame(value, *, role: str) -> pd.DataFrame:
         if isinstance(value, WeatherUploadResult):
@@ -1268,7 +1274,9 @@ class DlrPipeline:
                         continue
                     try:
                         if trainer is None:
-                            trainer = self._trainer_for_interval(interval_minutes)
+                            trainer = self._sealed_trainer_for_interval(
+                                interval_minutes
+                            )
                         attempt = None
                         preparation = trainer.prepare_target(
                             tower_training,
@@ -1370,6 +1378,14 @@ class DlrPipeline:
                                 loaded[key] = registry.load(
                                     key, expected_compatibility=compatibility
                                 )
+                    except TrainingContractError as exc:
+                        if load_result is None or load_result.bundle is None:
+                            reason = (
+                                "unsupported_training_backend"
+                                if str(exc) == "unsupported_training_backend"
+                                else "training_failed:TrainingContractError"
+                            )
+                            fallbacks.append(ModelFallback(key, reason))
                     except Exception as exc:
                         if load_result is None or load_result.bundle is None:
                             fallbacks.append(

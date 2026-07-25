@@ -8,6 +8,7 @@ import importlib.metadata
 import inspect
 import json
 import platform
+import re
 import sys
 import types
 from dataclasses import asdict, dataclass, fields, is_dataclass, replace
@@ -402,6 +403,77 @@ def _qualified_name(value: Any) -> str:
     return f"{module}.{qualname}"
 
 
+def _strict_json_parameter_value(value: Any) -> bool:
+    if value is None or type(value) in {bool, int, str}:
+        return True
+    if type(value) is float:
+        return bool(np.isfinite(value))
+    if type(value) is list:
+        return all(_strict_json_parameter_value(item) for item in value)
+    if type(value) is dict:
+        return all(
+            type(key) is str
+            and bool(key)
+            and _strict_json_parameter_value(item)
+            for key, item in value.items()
+        )
+    return False
+
+
+def _strict_estimator_parameters(estimator: object) -> tuple[dict[str, Any], str]:
+    try:
+        raw_parameters = estimator.get_params(deep=False)
+    except Exception as exc:
+        raise TrainingContractError(
+            "estimator parameters could not be read"
+        ) from exc
+    if not isinstance(raw_parameters, Mapping):
+        raise TrainingContractError("estimator parameters must be a mapping")
+    try:
+        parameters = dict(raw_parameters)
+    except Exception as exc:
+        raise TrainingContractError(
+            "estimator parameters could not be copied"
+        ) from exc
+    try:
+        strict_json = all(
+            type(key) is str
+            and bool(key)
+            and _strict_json_parameter_value(value)
+            for key, value in parameters.items()
+        )
+    except Exception as exc:
+        raise TrainingContractError(
+            "estimator parameters are not strict JSON"
+        ) from exc
+    if not strict_json:
+        raise TrainingContractError("estimator parameters are not strict JSON")
+    try:
+        parameters_json = _canonical_json(parameters)
+        if json.loads(parameters_json) != parameters:
+            raise ValueError("parameter JSON round trip changed values")
+    except Exception as exc:
+        raise TrainingContractError(
+            "estimator parameters could not be frozen"
+        ) from exc
+    return parameters, parameters_json
+
+
+_DISTRIBUTION_NAME_PATTERN = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
+)
+
+
+def _normalized_distribution_name(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or _DISTRIBUTION_NAME_PATTERN.fullmatch(value) is None
+    ):
+        raise TrainingContractError("estimator distribution name is invalid")
+    return re.sub(r"[-_.]+", "-", value).lower()
+
+
 def _resolved_distribution_versions(module_name: str) -> dict[str, str]:
     if not isinstance(module_name, str) or not module_name.strip():
         raise TrainingContractError("estimator import root has no distribution")
@@ -414,18 +486,20 @@ def _resolved_distribution_versions(module_name: str) -> dict[str, str]:
         ) from exc
     if not isinstance(package_map, Mapping):
         raise TrainingContractError("estimator distribution mapping is invalid")
-    distributions = package_map.get(import_root)
+    try:
+        distributions = package_map.get(import_root)
+    except Exception as exc:
+        raise TrainingContractError(
+            "estimator distribution mapping could not be read"
+        ) from exc
     if not isinstance(distributions, (list, tuple)) or not distributions:
         raise TrainingContractError(
             f"distribution mapping is missing for import root {import_root}"
         )
-    normalized = []
-    for distribution in distributions:
-        if not isinstance(distribution, str) or not distribution.strip():
-            raise TrainingContractError(
-                f"distribution mapping is invalid for import root {import_root}"
-            )
-        normalized.append(distribution.strip())
+    normalized = [
+        _normalized_distribution_name(distribution)
+        for distribution in distributions
+    ]
     names = tuple(sorted(set(normalized)))
     if len(names) != 1:
         raise TrainingContractError(
@@ -480,13 +554,7 @@ def sealed_xgboost_spec() -> SealedEstimatorSpec:
         raise TrainingContractError(
             "sealed xgboost estimator is unavailable"
         ) from exc
-    try:
-        parameters = estimator.get_params(deep=False)
-        parameters_json = _canonical_json(dict(parameters))
-    except Exception as exc:
-        raise TrainingContractError(
-            "sealed xgboost parameters could not be frozen"
-        ) from exc
+    parameters, parameters_json = _strict_estimator_parameters(estimator)
     if parameters.get("random_state") != 42:
         raise TrainingContractError(
             "sealed xgboost random_state does not match policy"
@@ -1566,13 +1634,7 @@ class ResidualTrainer:
             ) from exc
         if type(estimator) is not estimator_type:
             raise TrainingContractError("estimator type failed attestation")
-        try:
-            parameters = estimator.get_params(deep=False)
-            parameters_json = _canonical_json(dict(parameters))
-        except Exception as exc:
-            raise TrainingContractError(
-                "estimator parameters could not be read for attestation"
-            ) from exc
+        parameters, parameters_json = _strict_estimator_parameters(estimator)
         if parameters.get("random_state") != spec.random_seed:
             raise TrainingContractError(
                 "estimator random_state failed attestation"

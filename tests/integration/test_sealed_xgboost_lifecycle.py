@@ -1,7 +1,10 @@
+import joblib
 import numpy as np
 import pandas as pd
+from xgboost import XGBRegressor
 
 from modules.dlr_pipeline import DlrPipeline
+from modules.model_registry import ModelKey
 
 
 def _weather_segment(
@@ -79,7 +82,13 @@ def _conductor() -> dict[str, float]:
 
 
 def test_real_xgboost_trains_persists_and_reuses_per_tower_models(tmp_path):
-    first = DlrPipeline(model_root=tmp_path).run(
+    expected_keys = tuple(
+        ModelKey("project-a", "line-a", tower_id, target)
+        for tower_id in ("001", "002")
+        for target in ("wind_speed", "ambient_temp")
+    )
+    first_pipeline = DlrPipeline(model_root=tmp_path)
+    first = first_pipeline.run(
         physical=_weather_with_independent_segments("physical"),
         truth=_weather_with_independent_segments(
             "truth", truth_offset=True
@@ -100,8 +109,23 @@ def test_real_xgboost_trains_persists_and_reuses_per_tower_models(tmp_path):
         conductor=_conductor(),
     )
 
-    assert first.model_report.trained_targets
-    assert second.model_report.loaded_targets == first.model_report.trained_targets
-    assert second.model_report.used_targets == first.model_report.trained_targets
+    assert first.model_report.trained_targets == expected_keys
+    assert first.model_report.used_targets == expected_keys
+    assert first.model_report.fallbacks == ()
+    assert second.model_report.loaded_targets == expected_keys
+    assert second.model_report.used_targets == expected_keys
+    assert second.model_report.fallbacks == ()
+    assert first.max_currents.size > 0
+    assert second.max_currents.size > 0
     assert np.isfinite(first.max_currents).all()
     assert np.isfinite(second.max_currents).all()
+    registry = first_pipeline.registry
+    model_paths = [registry.path_for(key) for key in expected_keys]
+    manifest_paths = [registry.manifest_path_for(key) for key in expected_keys]
+    assert len(model_paths) == 4
+    assert len(manifest_paths) == 4
+    assert all(path.is_file() for path in model_paths)
+    assert all(path.is_file() for path in manifest_paths)
+    assert all(
+        type(joblib.load(path).model) is XGBRegressor for path in model_paths
+    )

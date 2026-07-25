@@ -1235,6 +1235,87 @@ def test_estimator_attestation_accepts_exact_frozen_parameters():
     trainer.attest_estimator(estimator)
 
 
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        [("random_state", 42)],
+        object(),
+    ],
+    ids=["pair-list", "opaque-object"],
+)
+def test_estimator_attestation_rejects_non_mapping_parameters(
+    monkeypatch,
+    parameters,
+):
+    trainer = ResidualTrainer()
+    estimator = ai_training.default_estimator()
+    monkeypatch.setattr(
+        estimator,
+        "get_params",
+        lambda deep=False: parameters,
+    )
+
+    with pytest.raises(ai_training.TrainingContractError, match="parameters"):
+        trainer.attest_estimator(estimator)
+
+
+def test_estimator_attestation_seals_parameter_mapping_access_errors(
+    monkeypatch,
+):
+    class FailingGetMapping(dict):
+        def get(self, key, default=None):
+            raise RuntimeError("mapping access failed")
+
+    trainer = ResidualTrainer()
+    estimator = ai_training.default_estimator()
+    monkeypatch.setattr(
+        estimator,
+        "get_params",
+        lambda deep=False: FailingGetMapping(random_state=42),
+    )
+
+    with pytest.raises(ai_training.TrainingContractError, match="parameters"):
+        trainer.attest_estimator(estimator)
+
+
+def _cyclic_parameter_payload():
+    cyclic = []
+    cyclic.append(cyclic)
+    return {"callbacks": cyclic, "random_state": 42}
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        [("random_state", 42)],
+        object(),
+        {1: "non-string-key", "random_state": 42},
+        {"callbacks": ("not", "strict-json"), "random_state": 42},
+        _cyclic_parameter_payload(),
+    ],
+    ids=[
+        "pair-list",
+        "opaque-object",
+        "non-string-key",
+        "tuple-value",
+        "cyclic-value",
+    ],
+)
+def test_sealed_xgboost_spec_rejects_invalid_parameter_payloads(
+    monkeypatch,
+    parameters,
+):
+    estimator_type = ai_training._load_xgb_regressor()
+    monkeypatch.setattr(
+        estimator_type,
+        "get_params",
+        lambda self, deep=False: parameters,
+    )
+
+    with pytest.raises(ai_training.TrainingContractError, match="parameters"):
+        ai_training.sealed_xgboost_spec()
+
+
 def test_default_sealed_estimator_fits_and_predicts_with_frozen_parameters():
     trainer = ResidualTrainer()
 
@@ -1284,6 +1365,21 @@ def test_estimator_attestation_rejects_type_mismatch():
         trainer.attest_estimator(MeanResidualEstimator())
 
 
+def test_estimator_attestation_rejects_xgboost_subclass():
+    estimator_type = ai_training._load_xgb_regressor()
+
+    class XGBRegressorSubclass(estimator_type):
+        pass
+
+    trainer = ResidualTrainer()
+    estimator = XGBRegressorSubclass(
+        **dict(ai_training._DEFAULT_ESTIMATOR_PARAMETERS)
+    )
+
+    with pytest.raises(ai_training.TrainingContractError, match="type"):
+        trainer.attest_estimator(estimator)
+
+
 def test_constant_residual_estimator_is_not_the_sealed_xgboost_estimator():
     trainer = ResidualTrainer()
     fallback = trainer._fallback_estimator(np.array([1.0, 2.0]))
@@ -1312,6 +1408,69 @@ def test_sealed_xgboost_spec_rejects_ambiguous_distribution_mapping(
         ai_training.importlib.metadata,
         "packages_distributions",
         lambda: {"xgboost": ["xgboost", "xgboost-alternate"]},
+    )
+
+    with pytest.raises(ai_training.TrainingContractError, match="distribution"):
+        ai_training.sealed_xgboost_spec()
+
+
+@pytest.mark.parametrize(
+    ("distributions", "normalized"),
+    [
+        (["XGBoost"], "xgboost"),
+        (["xgboost", "XGBoost"], "xgboost"),
+        (["XG_Boost", "xg.boost", "xg--boost"], "xg-boost"),
+    ],
+    ids=["case", "equivalent-names", "separators"],
+)
+def test_sealed_xgboost_spec_normalizes_distribution_names(
+    monkeypatch,
+    distributions,
+    normalized,
+):
+    version_calls = []
+    monkeypatch.setattr(
+        ai_training.importlib.metadata,
+        "packages_distributions",
+        lambda: {"xgboost": distributions},
+    )
+    monkeypatch.setattr(
+        ai_training.importlib.metadata,
+        "version",
+        lambda distribution: version_calls.append(distribution) or "3.2.0",
+    )
+
+    spec = ai_training.sealed_xgboost_spec()
+
+    assert spec.distributions == ((normalized, "3.2.0"),)
+    assert version_calls == [normalized]
+
+
+@pytest.mark.parametrize(
+    "distribution",
+    ["", "   ", ".xgboost", "xgboost-", "xgboost/other", object()],
+    ids=[
+        "empty",
+        "whitespace",
+        "leading-separator",
+        "trailing-separator",
+        "slash",
+        "non-string",
+    ],
+)
+def test_sealed_xgboost_spec_rejects_invalid_distribution_names(
+    monkeypatch,
+    distribution,
+):
+    monkeypatch.setattr(
+        ai_training.importlib.metadata,
+        "packages_distributions",
+        lambda: {"xgboost": [distribution]},
+    )
+    monkeypatch.setattr(
+        ai_training.importlib.metadata,
+        "version",
+        lambda name: "3.2.0",
     )
 
     with pytest.raises(ai_training.TrainingContractError, match="distribution"):
@@ -1356,6 +1515,60 @@ def test_estimator_attestation_rejects_distribution_version_change(monkeypatch):
         trainer.attest_estimator(estimator)
 
 
+@pytest.mark.parametrize(
+    "package_map",
+    [
+        {},
+        {"xgboost": ["other-distribution"]},
+        {"xgboost": ["xgboost", "other-distribution"]},
+    ],
+    ids=["missing", "changed", "ambiguous"],
+)
+def test_estimator_attestation_rechecks_runtime_distribution_mapping(
+    monkeypatch,
+    package_map,
+):
+    trainer = ResidualTrainer()
+    estimator = ai_training.default_estimator()
+    sealed_version = dict(trainer.sealed_estimator_spec.distributions)["xgboost"]
+    monkeypatch.setattr(
+        ai_training.importlib.metadata,
+        "packages_distributions",
+        lambda: package_map,
+    )
+    monkeypatch.setattr(
+        ai_training.importlib.metadata,
+        "version",
+        lambda distribution: sealed_version,
+    )
+
+    with pytest.raises(ai_training.TrainingContractError, match="distribution"):
+        trainer.attest_estimator(estimator)
+
+
+def test_estimator_attestation_accepts_equivalent_runtime_distribution_name(
+    monkeypatch,
+):
+    trainer = ResidualTrainer()
+    estimator = ai_training.default_estimator()
+    sealed_version = dict(trainer.sealed_estimator_spec.distributions)["xgboost"]
+    version_calls = []
+    monkeypatch.setattr(
+        ai_training.importlib.metadata,
+        "packages_distributions",
+        lambda: {"xgboost": ["XGBoost"]},
+    )
+    monkeypatch.setattr(
+        ai_training.importlib.metadata,
+        "version",
+        lambda distribution: version_calls.append(distribution) or sealed_version,
+    )
+
+    trainer.attest_estimator(estimator)
+
+    assert version_calls == ["xgboost"]
+
+
 def test_estimator_attestation_rejects_implementation_hash_change(monkeypatch):
     trainer = ResidualTrainer()
     estimator = ai_training.default_estimator()
@@ -1395,6 +1608,28 @@ def test_default_estimator_is_attested_after_construction_and_before_fit(
     )
 
     assert events[:3] == ["attest", "attest", "fit"]
+
+
+def test_fit_estimator_propagates_attestation_mismatch_before_fit(monkeypatch):
+    trainer = ResidualTrainer()
+    estimator = ai_training.default_estimator()
+    estimator.set_params(max_depth=99)
+    fit_calls = []
+
+    def recording_fit(features, target):
+        fit_calls.append((features, target))
+        return estimator
+
+    monkeypatch.setattr(trainer, "estimator_factory", lambda: estimator)
+    monkeypatch.setattr(estimator, "fit", recording_fit)
+
+    with pytest.raises(ai_training.TrainingContractError, match="parameters"):
+        trainer._fit_estimator(
+            pd.DataFrame({"feature": [0.0, 1.0]}),
+            np.array([0.0, 1.0]),
+        )
+
+    assert fit_calls == []
 
 
 def test_training_parameter_metadata_never_persists_secret_object_content():

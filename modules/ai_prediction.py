@@ -468,7 +468,7 @@ class ResidualPredictor:
             return None
         parameters = get_params(deep=False)
         if not isinstance(parameters, Mapping):
-            return None
+            raise TypeError("model parameters must be a mapping")
         return parameters.get("missing")
 
     @staticmethod

@@ -32,6 +32,18 @@ class UnreadableParametersModel(OffsetModel):
         raise RuntimeError("parameters unavailable")
 
 
+class NonMappingParametersModel(OffsetModel):
+    def __init__(self):
+        self.predict_calls = 0
+
+    def get_params(self, deep=False):
+        return [("missing", -1.0e30)]
+
+    def predict(self, features):
+        self.predict_calls += 1
+        return super().predict(features)
+
+
 class RecordingLagModel:
     def predict(self, features):
         self.lag_values = features["lag_1"].tolist()
@@ -511,6 +523,38 @@ def test_unreadable_model_parameters_fall_back_before_prediction():
         predicted.loc[0, "fallback_reason"]
         == "prediction_failed:RuntimeError"
     )
+
+
+def test_non_mapping_model_parameters_fall_back_before_prediction():
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                ["2025-12-10 00:00", "2025-12-10 00:30"]
+            ),
+            "wind_speed_local": [3.0, 4.0],
+            "slope": [-1.0e30, -1.0e30],
+        }
+    )
+    model = NonMappingParametersModel()
+    bundle = ModelBundle(
+        target_name="wind_speed",
+        feature_columns=["slope_feature"],
+        model=model,
+    )
+
+    predicted = ResidualPredictor({"wind_speed": bundle}).predict(
+        frame,
+        target_name="wind_speed",
+        physical_col="wind_speed_local",
+    )
+
+    np.testing.assert_array_equal(
+        predicted["wind_speed_final"],
+        frame["wind_speed_local"],
+    )
+    assert not predicted["used_ai"].to_numpy(dtype=bool).any()
+    assert predicted["fallback_reason"].eq("prediction_failed:TypeError").all()
+    assert model.predict_calls == 0
 
 
 def test_predictor_clips_residual_then_rejects_out_of_bounds_candidates():

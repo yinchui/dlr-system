@@ -1390,6 +1390,7 @@ class DlrPipeline:
                                     preparation.evaluation_set_hash
                                 ),
                                 training_contract_hash=runtime_contract_hash,
+                                backend_id=expected_backend_ids[key],
                                 feature_version=compatibility.feature_version,
                                 champion=(
                                     load_result.metadata

@@ -231,6 +231,8 @@ class TrainingPreparation:
 @dataclass(frozen=True)
 class TrainingContract:
     version: str
+    backend_id: str
+    estimator_spec_digest: str
     trainer_descriptor_json: str
     estimator_descriptor_json: str
     dependency_versions: tuple[tuple[str, str], ...]
@@ -248,6 +250,8 @@ class TrainingContract:
         return _stable_json_hash(
             {
                 "version": self.version,
+                "backend_id": self.backend_id,
+                "estimator_spec_digest": self.estimator_spec_digest,
                 "trainer": json.loads(self.trainer_descriptor_json),
                 "estimator": json.loads(self.estimator_descriptor_json),
                 "dependencies": dict(self.dependency_versions),
@@ -1801,6 +1805,16 @@ class ResidualTrainer:
         }
         self.training_contract = TrainingContract(
             version=_TRAINING_CONTRACT_VERSION,
+            backend_id=(
+                self.sealed_estimator_spec.backend_id
+                if self.sealed_estimator_spec is not None
+                else _NON_PRODUCTION_BACKEND_ID
+            ),
+            estimator_spec_digest=(
+                self.sealed_estimator_spec.digest()
+                if self.sealed_estimator_spec is not None
+                else _NON_PRODUCTION_BACKEND_ID
+            ),
             trainer_descriptor_json=_canonical_json(trainer_descriptor),
             estimator_descriptor_json=self._factory_contract.descriptor_json,
             dependency_versions=tuple(sorted(dependencies.items())),
@@ -1864,6 +1878,10 @@ class ResidualTrainer:
         self._assert_factory_contract()
         return {
             "version": _TRAINING_CONTRACT_VERSION,
+            "backend_id": self.training_contract.backend_id,
+            "estimator_spec_digest": (
+                self.training_contract.estimator_spec_digest
+            ),
             "trainer_descriptor_hash": hashlib.sha256(
                 self.training_contract.trainer_descriptor_json.encode("utf-8")
             ).hexdigest(),

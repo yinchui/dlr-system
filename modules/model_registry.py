@@ -81,6 +81,7 @@ _ATTEMPT_ENTRY_FIELDS = frozenset(
         "policy_version",
         "min_mae_improvement",
         "training_contract_hash",
+        "backend_id",
         "feature_version",
         "champion_context_hash",
         "fingerprint",
@@ -609,6 +610,7 @@ class ModelAttempt:
     policy_version: str
     min_mae_improvement: float
     training_contract_hash: str
+    backend_id: str
     feature_version: str
     champion_context_hash: Optional[str] = None
 
@@ -619,6 +621,7 @@ class ModelAttempt:
             "input_data_hash",
             "policy_version",
             "training_contract_hash",
+            "backend_id",
             "feature_version",
         ):
             _require_nonempty_string(getattr(self, name), name)
@@ -647,6 +650,7 @@ class ModelAttempt:
             "policy_version": self.policy_version,
             "min_mae_improvement": self.min_mae_improvement,
             "training_contract_hash": self.training_contract_hash,
+            "backend_id": self.backend_id,
             "feature_version": self.feature_version,
             "champion_context_hash": self.champion_context_hash,
         }
@@ -1021,6 +1025,7 @@ class ModelRegistry:
             "input_data_hash": champion.input_data_hash,
             "evaluation_set_hash": champion.evaluation_set_hash,
             "training_contract_hash": champion.training_contract_hash,
+            "backend_id": champion.backend_id,
             "compatibility": champion.compatibility.to_dict(),
         }
         return hashlib.sha256(_json_bytes(payload)).hexdigest()
@@ -1032,6 +1037,7 @@ class ModelRegistry:
         input_data_hash: str,
         evaluation_set_hash: Optional[str],
         training_contract_hash: str,
+        backend_id: str,
         feature_version: str,
         champion: Optional[ModelMetadata] = None,
     ) -> ModelAttempt:
@@ -1046,6 +1052,7 @@ class ModelRegistry:
             policy_version=_ATTEMPT_POLICY_VERSION,
             min_mae_improvement=self.min_mae_improvement,
             training_contract_hash=training_contract_hash,
+            backend_id=backend_id,
             feature_version=feature_version,
             champion_context_hash=self._champion_context_hash(champion),
         )
@@ -1406,6 +1413,44 @@ class ModelRegistry:
             expected_backend_id,
         )
 
+    def _load_current_locked(self, key: ModelKey) -> ModelLoadResult:
+        target_dir = self._target_dir(key)
+        if not self._safe_directory(target_dir.parent, create=False):
+            return self._fallback("model_not_found")
+        if not target_dir.is_symlink():
+            if target_dir.exists() or target_dir.is_symlink():
+                return self._fallback("corrupt_manifest")
+            return self._fallback("model_not_found")
+        generation_dir = self._active_generation(key)
+        metadata_path = generation_dir / "metadata.json"
+        self._validate_artifact_path(metadata_path)
+        try:
+            metadata = ModelMetadata.from_dict(
+                json.loads(metadata_path.read_text(encoding="utf-8"))
+            )
+        except (
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ):
+            return self._fallback("corrupt_metadata")
+        if (
+            metadata.key != key
+            or metadata.backend_id != SEALED_XGBOOST_BACKEND_ID
+            or metadata.training_contract_hash == _LEGACY_TRAINING_CONTRACT_HASH
+        ):
+            return self._fallback("invalid_model_contract")
+        return self._read_generation(
+            key,
+            generation_dir,
+            metadata.compatibility,
+            metadata.training_contract_hash,
+            metadata.backend_id,
+        )
+
     def load(
         self,
         key: ModelKey,
@@ -1629,6 +1674,7 @@ class ModelRegistry:
             input_data_hash=attempt.input_data_hash,
             evaluation_set_hash=attempt.evaluation_set_hash,
             training_contract_hash=attempt.training_contract_hash,
+            backend_id=attempt.backend_id,
             feature_version=attempt.feature_version,
             champion=champion if current.bundle is not None else None,
         )
@@ -1689,6 +1735,7 @@ class ModelRegistry:
             or attempt.training_contract_hash
             != candidate.metadata.training_contract_hash
             or attempt.training_contract_hash != bundle_contract_hash
+            or attempt.backend_id != candidate.metadata.backend_id
             or attempt.feature_version
             != candidate.metadata.compatibility.feature_version
             or attempt.policy_version != _ATTEMPT_POLICY_VERSION
@@ -1729,12 +1776,7 @@ class ModelRegistry:
                 training_outcome=candidate.metadata.training_outcome,
             )
             try:
-                current = self._load_locked(
-                    candidate.key,
-                    candidate.metadata.compatibility,
-                    candidate.metadata.training_contract_hash,
-                    candidate.metadata.backend_id,
-                )
+                current = self._load_current_locked(candidate.key)
             except UnsafeModelPathError:
                 return PromotionDecision(False, "unsafe_model_path")
             if admission_reason:
@@ -1806,6 +1848,29 @@ class ModelRegistry:
                         candidate,
                         "evaluation_set_mismatch",
                         attempt,
+                    )
+                runtime_contract_changed = (
+                    candidate.metadata.training_contract_hash
+                    != champion.training_contract_hash
+                    or candidate.metadata.backend_id != champion.backend_id
+                )
+                if runtime_contract_changed:
+                    regression = (
+                        candidate.metadata.metrics["corrected_mae"]
+                        - champion.metrics["corrected_mae"]
+                    )
+                    if regression > 1e-12:
+                        return self._record_rejection_locked(
+                            current,
+                            candidate,
+                            "insufficient_mae_improvement",
+                            attempt,
+                        )
+                    return self._publish_decision(
+                        candidate,
+                        status="active",
+                        reason="promoted_contract_refresh",
+                        champion=champion,
                     )
                 if candidate.metadata.model_version == champion.model_version:
                     return self._record_rejection_locked(

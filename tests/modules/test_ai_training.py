@@ -822,6 +822,43 @@ def test_runtime_contract_scope_tracks_each_runtime_dependency(
     assert changed_hash != original_hash
 
 
+def test_runtime_contract_scope_tracks_sealed_backend_id(monkeypatch):
+    physical_col = "wind_speed_local"
+    original_trainer = ResidualTrainer()
+    original_hash = ai_training.training_runtime_contract_hash_for_scope(
+        original_trainer,
+        target="wind_speed",
+        physical_col=physical_col,
+        truth_col="wind_speed_truth",
+        feature_columns=original_trainer.feature_builder.feature_columns(
+            physical_col
+        ),
+        cadence_minutes=30,
+    )
+
+    monkeypatch.setattr(
+        ai_training,
+        "SEALED_XGBOOST_BACKEND_ID",
+        "xgboost-residual-v2",
+    )
+    changed_trainer = ResidualTrainer()
+    changed_hash = ai_training.training_runtime_contract_hash_for_scope(
+        changed_trainer,
+        target="wind_speed",
+        physical_col=physical_col,
+        truth_col="wind_speed_truth",
+        feature_columns=changed_trainer.feature_builder.feature_columns(
+            physical_col
+        ),
+        cadence_minutes=30,
+    )
+
+    assert changed_trainer.sealed_estimator_spec.backend_id != (
+        original_trainer.sealed_estimator_spec.backend_id
+    )
+    assert changed_hash != original_hash
+
+
 def test_runtime_contract_tracks_builtin_training_dependencies(monkeypatch):
     trainer, _, preparation = _temporal_preparation()
     original_hash = ai_training.training_runtime_contract_hash(

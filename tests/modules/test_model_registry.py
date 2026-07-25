@@ -196,6 +196,7 @@ def model_attempt(
     input_data_hash="a" * 64,
     evaluation_set_hash="e" * 64,
     training_contract_hash="c" * 64,
+    backend_id=SEALED_BACKEND_ID,
     feature_version="features-a",
     champion=None,
 ):
@@ -204,6 +205,7 @@ def model_attempt(
         input_data_hash=input_data_hash,
         evaluation_set_hash=evaluation_set_hash,
         training_contract_hash=training_contract_hash,
+        backend_id=backend_id,
         feature_version=feature_version,
         champion=champion,
     )
@@ -1572,6 +1574,44 @@ def test_attempt_fingerprint_includes_threshold_contract_and_feature_version(tmp
     assert low_threshold.was_rejected(changed_features) is False
 
 
+def test_attempt_fingerprint_includes_backend_and_invalidates_rejection(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    attempt_options = {
+        "input_data_hash": "a" * 64,
+        "evaluation_set_hash": "e" * 64,
+        "training_contract_hash": "c" * 64,
+        "feature_version": "features-a",
+    }
+    recorded = registry.build_attempt(
+        key,
+        backend_id="xgboost-residual-v1",
+        **attempt_options,
+    )
+    changed_backend = registry.build_attempt(
+        key,
+        backend_id="xgboost-residual-v2",
+        **attempt_options,
+    )
+    rejected = registry.promote(
+        model_candidate(
+            key,
+            corrected_mae=WEATHER_METRICS["baseline_mae"],
+            input_data_hash=attempt_options["input_data_hash"],
+            evaluation_set_hash=attempt_options["evaluation_set_hash"],
+            training_contract_hash=attempt_options[
+                "training_contract_hash"
+            ],
+        ),
+        attempt=recorded,
+    )
+
+    assert rejected.reason == "candidate_not_better_than_physical"
+    assert registry.was_rejected(recorded) is True
+    assert changed_backend.fingerprint != recorded.fingerprint
+    assert registry.was_rejected(changed_backend) is False
+
+
 def test_rejection_sidecar_preserves_active_and_historical_generations(tmp_path):
     key = ModelKey("project-a", "line-a", "001", "wind_speed")
     registry = ModelRegistry(tmp_path)
@@ -1747,6 +1787,30 @@ def test_attempt_contract_must_match_candidate_and_bundle(tmp_path):
     )
 
     with pytest.raises(ValueError, match="training contract|attempt contract"):
+        registry.promote(candidate, attempt=attempt)
+
+    assert not registry.path_for(key).exists()
+    assert not registry.attempt_path_for(key).exists()
+
+
+def test_attempt_backend_must_match_candidate_and_bundle(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    candidate = model_candidate(
+        key,
+        corrected_mae=WEATHER_METRICS["baseline_mae"],
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+    )
+    attempt = model_attempt(
+        registry,
+        key,
+        input_data_hash="a" * 64,
+        evaluation_set_hash="e" * 64,
+        backend_id="xgboost-residual-v2",
+    )
+
+    with pytest.raises(ValueError, match="attempt contract"):
         registry.promote(candidate, attempt=attempt)
 
     assert not registry.path_for(key).exists()
@@ -2717,6 +2781,36 @@ def test_concurrent_candidates_recheck_champion_inside_key_lock(tmp_path):
     assert loaded.metadata.model_version == "version-3"
     assert loaded.metadata.metrics["corrected_mae"] == 0.6
     assert not [path for path in tmp_path.rglob("*") if path.name.endswith(".tmp")]
+
+
+def test_cross_contract_candidate_cannot_replace_better_locked_champion(tmp_path):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = ModelRegistry(tmp_path)
+    better = model_candidate(
+        key,
+        model_version="better-contract-a",
+        corrected_mae=0.5,
+        training_contract_hash="a" * 64,
+    )
+    worse = model_candidate(
+        key,
+        model_version="worse-contract-b",
+        corrected_mae=1.5,
+        training_contract_hash="b" * 64,
+    )
+    assert registry.promote(better).promoted is True
+
+    decision = registry.promote(worse)
+
+    assert decision.promoted is False
+    assert decision.reason == "insufficient_mae_improvement"
+    loaded = load_model(
+        registry,
+        key,
+        training_contract_hash="a" * 64,
+    )
+    assert loaded.metadata.model_version == "better-contract-a"
+    assert loaded.metadata.metrics["corrected_mae"] == 0.5
 
 
 def test_file_lock_serializes_competing_promotions_across_processes(tmp_path):

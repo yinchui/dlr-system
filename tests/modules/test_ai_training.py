@@ -1208,6 +1208,27 @@ def test_default_trainer_has_sealed_xgboost_spec():
     assert len(spec.digest()) == 64
 
 
+@pytest.mark.parametrize(
+    "build_backend",
+    [ai_training.sealed_xgboost_spec, ResidualTrainer],
+    ids=["public-spec-builder", "trainer"],
+)
+def test_sealed_xgboost_backend_rejects_classifier_identity_before_init(
+    monkeypatch,
+    build_backend,
+):
+    from xgboost.sklearn import XGBClassifier
+
+    monkeypatch.setattr(
+        ai_training,
+        "_load_xgb_regressor",
+        lambda: XGBClassifier,
+    )
+
+    with pytest.raises(ai_training.TrainingContractError, match="identity"):
+        build_backend()
+
+
 @pytest.mark.parametrize("factory", [MeanResidualEstimator, ai_training.default_estimator])
 def test_explicit_estimator_factory_is_not_production_eligible(factory):
     trainer = ResidualTrainer(estimator_factory=factory)

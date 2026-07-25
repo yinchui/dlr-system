@@ -60,6 +60,9 @@ _DEFAULT_ESTIMATOR_PARAMETERS = (
     ("n_jobs", 1),
     ("missing", -1.0e30),
 )
+_SEALED_XGBOOST_ESTIMATOR_PATH = "xgboost.XGBRegressor"
+_SEALED_XGBOOST_IMPLEMENTATION_MODULE = "xgboost.sklearn"
+_SEALED_XGBOOST_ESTIMATOR_NAME = "XGBRegressor"
 _MAX_CONTRACT_DEPTH = 12
 _MAX_CONTRACT_ITEMS = 256
 _MAX_CONTRACT_NODES = 2_048
@@ -548,7 +551,33 @@ def _estimator_implementation_sha256(estimator_type: type) -> str:
 
 def _sealed_xgboost_backend() -> tuple[SealedEstimatorSpec, type]:
     try:
+        import xgboost
+        from xgboost.sklearn import XGBRegressor as supported_estimator_type
+
         estimator_type = _load_xgb_regressor()
+        public_module, separator, public_name = (
+            _SEALED_XGBOOST_ESTIMATOR_PATH.rpartition(".")
+        )
+        identity_matches = (
+            separator == "."
+            and public_module == xgboost.__name__
+            and public_name == _SEALED_XGBOOST_ESTIMATOR_NAME
+            and supported_estimator_type.__module__
+            == _SEALED_XGBOOST_IMPLEMENTATION_MODULE
+            and supported_estimator_type.__name__
+            == _SEALED_XGBOOST_ESTIMATOR_NAME
+            and getattr(xgboost, public_name) is supported_estimator_type
+            and estimator_type is supported_estimator_type
+        )
+    except Exception as exc:
+        raise TrainingContractError(
+            "sealed xgboost estimator class identity could not be verified"
+        ) from exc
+    if not identity_matches:
+        raise TrainingContractError(
+            "sealed xgboost estimator class identity does not match policy"
+        )
+    try:
         estimator = estimator_type(**dict(_DEFAULT_ESTIMATOR_PARAMETERS))
     except Exception as exc:
         raise TrainingContractError(
@@ -564,7 +593,7 @@ def _sealed_xgboost_backend() -> tuple[SealedEstimatorSpec, type]:
         SealedEstimatorSpec(
             schema_version=1,
             backend_id="xgboost-residual-v1",
-            estimator_path="xgboost.XGBRegressor",
+            estimator_path=_SEALED_XGBOOST_ESTIMATOR_PATH,
             parameters_json=parameters_json,
             random_seed=42,
             distributions=tuple(sorted(distributions.items())),

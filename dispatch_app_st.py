@@ -825,7 +825,7 @@ with tab_line:
                 hovermode='x unified',
                 xaxis=dict(tickformat="%Y-%m-%d\n%H:%M")
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             # --- 图表 2: 单塔详情 ---
             st.markdown("##### 🔍 单塔微气象与修正详情")
@@ -889,7 +889,7 @@ with tab_line:
                 fig_tower.update_yaxes(title_text="温度 (°C) / 风速 (m/s)", secondary_y=False)
                 fig_tower.update_yaxes(title_text="载流量 (A)", secondary_y=True)
 
-                st.plotly_chart(fig_tower, use_container_width=True)
+                st.plotly_chart(fig_tower, width="stretch")
 
             # --- 图表 3: 热力图 ---
             with st.expander("查看全线风速分布热力图"):
@@ -907,7 +907,7 @@ with tab_line:
                     height=600,
                     xaxis=dict(tickformat="%Y-%m-%d\n%H:%M")  # 显示日期
                 )
-                st.plotly_chart(fig_heat, use_container_width=True)
+                st.plotly_chart(fig_heat, width="stretch")
 
 # ==============================================================================
 # Tab 2: 气象修正与AI预测
@@ -976,7 +976,7 @@ with tab_correction:
                     height=350, hovermode='x unified',
                     xaxis=dict(tickformat="%Y-%m-%d\n%H:%M")
                 )
-                st.plotly_chart(fig_wind_cmp, use_container_width=True)
+                st.plotly_chart(fig_wind_cmp, width="stretch")
 
             # ---- 太阳辐射修正对比 ----
             corr_cfg = st.session_state.get('correction_config', {})
@@ -1009,7 +1009,7 @@ with tab_correction:
                     height=350, hovermode='x unified',
                     xaxis=dict(tickformat="%Y-%m-%d\n%H:%M")
                 )
-                st.plotly_chart(fig_solar_cmp, use_container_width=True)
+                st.plotly_chart(fig_solar_cmp, width="stretch")
 
                 sc1, sc2, sc3 = st.columns(3)
                 sc1.metric("原始平均辐射", f"{np.mean(selected_solar_orig):.1f} W/m²")
@@ -1039,7 +1039,7 @@ with tab_correction:
                 height=400,
                 xaxis=dict(tickformat="%Y-%m-%d\n%H:%M")
             )
-            st.plotly_chart(fig_factor_heat, use_container_width=True)
+            st.plotly_chart(fig_factor_heat, width="stretch")
 
             # ---- 载流量修正影响 ----
             st.divider()
@@ -1131,7 +1131,7 @@ with tab_correction:
                 fig_ai.update_yaxes(
                     title_text="温度 (°C)", secondary_y=True
                 )
-                st.plotly_chart(fig_ai, use_container_width=True)
+                st.plotly_chart(fig_ai, width="stretch")
 
                 wind_mae = getattr(metrics, 'wind_speed_mae', None)
                 temp_mae = getattr(metrics, 'ambient_temp_mae', None)

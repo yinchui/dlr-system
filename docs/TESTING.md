@@ -1,304 +1,163 @@
-# DLR动态增容评估系统 - 测试指南
+# DLR 动态增容评估系统测试指南
 
-## 测试状态
+测试必须从仓库根目录运行。推荐 Python 3.11，并先安装 `requirements.txt`。
 
-✅ **所有测试通过：9/9**
+## 完整质量门禁
 
-```
-tests/config/test_config.py ............................ PASSED
-tests/modules/test_ai_prediction.py ..................... PASSED
-tests/modules/test_data_processor.py (3 tests) .......... PASSED
-tests/modules/test_thermal_engine.py .................... PASSED
-tests/modules/test_visualization.py ..................... PASSED
-tests/modules/test_weather_correction.py ................ PASSED
-tests/utils/test_validators.py ......................... PASSED
-```
-
----
-
-## 快速测试
-
-### 运行所有测试
 ```bash
-cd /Volumes/YC/项目/沙戈荒项目/界面/DLR动态增容评估系统/12.24
-python3 -m pytest
+python3 -m pytest -q
+python3 -m ruff check --target-version py311 .
+python3 -m py_compile modules/*.py utils/*.py config/*.py dispatch_app_st.py thermal_functions.py pages/弧垂后验证.py
+git diff --check
 ```
 
-### 运行特定测试
+不要在最终验收时只运行新增测试；测试总数以当前 `pytest` 输出为准，不在文档中维护易失效的固定计数。
+
+## IEEE 738 回归
+
+稳态 Drake 金标准、低风速自然对流、风向归一、太阳热增益、电阻插值和输入不变性：
+
 ```bash
-# 测试配置
-python3 -m pytest tests/config/ -v
-
-# 测试核心模块
-python3 -m pytest tests/modules/ -v
-
-# 测试工具函数
-python3 -m pytest tests/utils/ -v
+python3 -m pytest tests/modules/test_thermal_engine_ieee738.py -q
 ```
 
----
+关键稳态参考值约为：
 
-## Sealed XGBoost 生产模型验收
+- 自然对流 `42.42 W/m`；
+- 低/高雷诺数强制对流 `82.10/77.06 W/m`；
+- 辐射 `39.11 W/m`；
+- 太阳热增益 `22.45 W/m`；
+- 额定电流 `1025 A`。
 
-DLR 生产模型持久化只支持默认的 sealed XGBoost 后端 `xgboost-residual-v1`。自定义 trainer 或 `estimator_factory` 仍可用于不持久化的训练单元测试，但不能成为 AI 数据源，不能写入模型，也不能写入质量拒绝缓存；生产流水线会按杆塔和目标回退到物理气象。
+暂态 10 秒子步、125°C/15 分钟额定值、材料热容量和非法输入：
 
-启动和每次拟合时都会校验以下合同：
+```bash
+python3 -m pytest tests/modules/test_thermal_transient.py -q
+```
 
-- estimator 必须是精确的 `xgboost.XGBRegressor` 类型；
-- 参数必须与冻结策略完全一致：`objective=reg:squarederror`、`n_estimators=120`、`max_depth=3`、`learning_rate=0.05`、`subsample=0.9`、`colsample_bytree=0.9`、`random_state=42`、`n_jobs=1`、`missing=-1e30`；
-- 当前安装的 XGBoost distribution 版本和实现文件 SHA-256 必须与 sealed spec 一致；当前验收环境为 XGBoost `3.2.0`，代码不把该版本写死，而是在运行时读取并绑定；
-- Python、NumPy、Pandas、joblib、XGBoost、后端标识或 sealed spec 变化时，旧模型和旧拒绝记录按 `project/line/tower/target` 独立失效，不影响其他杆塔；
-- 依赖或后端恢复正常后，操作性失败和不受支持后端不会阻止后续重试。
+## 气象、地形与 DLR 编排
 
-真实后端训练、保存和复用验收：
+```bash
+python3 -m pytest \
+  tests/modules/test_data_processor.py \
+  tests/modules/test_weather_upload.py \
+  tests/modules/test_weather_correction.py \
+  tests/modules/test_terrain.py \
+  tests/modules/test_line_analyzer.py \
+  tests/integration/test_dlr_pipeline.py -q
+```
+
+这些测试验证：
+
+- 新旧气象文件格式转换、时区、杆塔编号、物理边界和重复键；
+- 上传字节只冻结一次，持久化内容只有 SHA-256 和规范化数据；
+- DEM 坐标/CRS 查询及缺失覆盖，地形修正只执行一次；
+- 风向只作为导线夹角，不乘入风速；
+- 真实气象不会进入热核；
+- 页面选择的导线参数显式传入 DLR；
+- 暂态失败使用同一导线、同一气象时刻的稳态结果保守回退；
+- `DlrPipelineResult` 是不可变快照，数组视图只读。
+
+## Sealed XGBoost 生命周期
+
+生产模型只接受运行时合同验证通过的 sealed `xgboost.XGBRegressor`。模型按项目、线路、杆塔和目标隔离；模型文件、元数据、manifest、拒绝记录和 generation 都受原子写入及文件锁保护。
+
+真实后端训练、保存和下次运行复用：
 
 ```bash
 python3 -m pytest tests/integration/test_sealed_xgboost_lifecycle.py -q
+python3 -m pytest tests/integration/test_weather_ai_dlr_e2e.py -q
 ```
 
-sealed 后端边界、依赖失效、质量拒绝缓存和重试覆盖位于 DLR 集成套件：
+训练、注册与攻击边界：
 
 ```bash
-python3 -m pytest tests/integration/test_dlr_pipeline.py -q
-python3 -m pytest tests/modules/test_ai_training.py tests/modules/test_model_registry.py tests/integration/test_dlr_pipeline.py -q
+python3 -m pytest \
+  tests/modules/test_ai_training.py \
+  tests/modules/test_ai_prediction.py \
+  tests/modules/test_model_registry.py -q
 ```
 
-Task 11 的 sealed 后端实现通过最终双阶段审查后，下一项实施任务是 Task 12“结构化审计和原子结果写入”。
+重点合同：
 
----
+- 特征滞后不得跨杆塔；指标只比较修正气象与真实气象；
+- 小样本全量训练可保存首个 provisional，但不能替换 champion；
+- 时间留出候选必须在同一独立评价集上改善；
+- XGBoost 类型、冻结参数、随机种子、依赖版本和实现哈希必须一致；
+- 路径穿越、符号链接、非私有权限、checksum 或 manifest 不一致时失败关闭；
+- 单塔模型损坏、不兼容、裁剪或预测失败只回退对应目标；
+- 相同物理输入在首次训练和后续模型加载时产生相同 DLR 和 `input_hash`。
+- `input_hash` 只表示有效热核数值路径；每塔非有效海拔、运行上下文和未使用导线字段不改变哈希，暂态窗口按实际气象范围裁剪并规范化负零。
+- 暂态失败回退稳态后，哈希与未请求暂态的同一稳态路径一致；失败状态由 `transient_fallbacks` 和审计信息区分。
 
-## 测试覆盖的功能
+## 审计与弧垂后验证
 
-### 1. 配置模块 (config/)
-- ✅ 导线参数库加载
-- ✅ 修正参数默认值
-- ✅ 应用标题配置
-
-### 2. 数据处理 (modules/data_processor.py)
-- ✅ 气象数据标准化
-- ✅ 时间戳解析和转换
-- ✅ 数据插值到指定时间间隔
-- ✅ 地形数据查询表构建
-
-### 3. 地形处理 (modules/terrain.py)
-- ✅ TIF文件读取
-- ✅ DEM数据加载
-- ✅ 坡度和坡向计算
-- ✅ 杆塔坐标加载
-
-### 4. 热力计算引擎 (modules/thermal_engine.py)
-- ✅ IEEE 738-2023标准实现
-- ✅ 地形微气候修正
-- ✅ 稳态电流计算
-- ✅ 批量载流量计算
-- ✅ 修正后风速输出
-
-### 5. 气象修正 (modules/weather_correction.py)
-- ✅ 垂直修正（风速、温度）
-- ✅ 地形修正（坡度、坡向）
-- ✅ 沙漠环境修正（湿度、辐射）
-- ✅ 风向修正（6段分段系数）
-
-### 6. AI预测 (modules/ai_prediction.py)
-- ✅ 模型加载和管理
-- ✅ 特征工程（时间特征、滞后特征）
-- ✅ 残差预测
-- ✅ 物理模型+AI混合预测
-
-### 7. 可视化 (modules/visualization.py)
-- ✅ 动态载流量图表
-- ✅ 静态额定值对比
-- ✅ 修正前后对比图
-- ✅ 预测结果对比图
-
-### 8. 数据验证 (utils/validators.py)
-- ✅ 气象数据列验证
-- ✅ 杆塔数据列验证
-- ✅ 监测数据列验证
-
-### 9. 文件导出 (utils/file_handler.py)
-- ✅ CSV导出（UTF-8-BOM）
-- ✅ Excel导出
-
----
-
-## 手动功能测试
-
-创建 `manual_test.py` 进行端到端测试：
-
-```python
-import pandas as pd
-import numpy as np
-from modules.data_processor import build_weather_dataset
-from modules.weather_correction import WeatherCorrectionService, CorrectionOptions
-from modules.thermal_engine import ThermalCalculator, LineAnalyzer
-
-# 1. 测试数据处理
-print("1. 测试数据处理...")
-df = pd.DataFrame({
-    "位置": [36, 36],
-    "日期": ["2025-12-10", "2025-12-10"],
-    "时刻": ["00:00", "01:00"],
-    "环境温度": [20.0, 21.0],
-    "风速": [3.2, 3.5],
-    "风向": [90.0, 95.0],
-    "太阳辐射强度": [0.0, 30.0],
-    "相对湿度": [40.0, 41.0],
-    "海拔": [1100.0, 1100.0],
-})
-dataset = build_weather_dataset(df)
-print(f"   ✓ 数据集包含 {len(dataset.positions)} 个位置")
-print(f"   ✓ 时间点数量: {len(dataset.timestamps)}")
-
-# 2. 测试气象修正
-print("\n2. 测试气象修正...")
-corrector = WeatherCorrectionService()
-terrain_lookup = {36: {"slope": 15.0, "aspect": 180.0, "elevation": 1100.0}}
-corrected = corrector.apply(df, terrain_lookup, CorrectionOptions(line_azimuth_deg=90.0))
-print(f"   ✓ 原始风速: {df['风速'].values}")
-print(f"   ✓ 修正后风速: {corrected['wind_speed_corrected'].values}")
-print(f"   ✓ 风向修正系数: {corrected['wind_angle_factor'].values}")
-
-# 3. 测试热力计算
-print("\n3. 测试热力计算...")
-calculator = ThermalCalculator()
-analyzer = LineAnalyzer(calculator)
-result = analyzer.calculate_max_current_for_points(
-    observation_points=np.array([36]),
-    elevations=np.array([1100.0]),
-    temps=np.array([[20.0, 21.0]]),
-    winds=np.array([[3.0, 3.2]]),
-    angles=np.array([[90.0, 95.0]]),
-    solar=np.array([0.0, 50.0]),
-    times=np.array([0.0, 1.0]),
-    terrain_data={0: {"slope": 15.0, "aspect": 180.0, "elevation": 1100.0}}
-)
-print(f"   ✓ 载流量: {result['max_currents'][0]}")
-print(f"   ✓ 修正后风速: {result['corrected_winds'][0]}")
-
-# 4. 测试AI预测接口
-print("\n4. 测试AI预测接口...")
-from modules.ai_prediction import ResidualPredictor, ModelBundle
-
-class DummyModel:
-    def predict(self, X):
-        return [0.5] * len(X)
-
-predictor = ResidualPredictor({
-    "wind_speed": ModelBundle(
-        target_name="wind_speed",
-        feature_columns=["hour_sin", "hour_cos", "wind_speed_physical"],
-        model=DummyModel()
-    )
-})
-test_df = pd.DataFrame({
-    "timestamp": pd.to_datetime(["2025-12-10 00:00", "2025-12-10 01:00"]),
-    "wind_speed_physical": [3.0, 4.0],
-})
-predicted = predictor.predict(test_df, "wind_speed", "wind_speed_physical")
-print(f"   ✓ 物理预测: {test_df['wind_speed_physical'].values}")
-print(f"   ✓ 残差: {predicted['wind_speed_residual'].values}")
-print(f"   ✓ 最终预测: {predicted['wind_speed_final'].values}")
-
-print("\n✅ 所有手动测试通过！")
-```
-
-运行：
 ```bash
-python3 manual_test.py
+python3 -m pytest \
+  tests/utils/test_audit_log.py \
+  tests/modules/test_sag_validation.py \
+  tests/integration/test_sag_snapshot_bridge.py \
+  tests/pages/test_sag_validation_page.py \
+  tests/integration/test_sag_post_validation_e2e.py -q
 ```
 
----
+覆盖范围：
 
-## 测试覆盖率（可选）
+- JSONL 并发写入、原子结果保存、bytes 拒绝及失败清理；
+- 倾角 CSV/XLSX、空表、无效角度、时间匹配和杆塔选择；
+- `H = wL/(2 tan θ)`、`Tm = T1 + (H1-H)/(EAα)` 和三候选最小电流；
+- 自适应阈值以及 NORMAL/RISK/RECOVERY/INVALID 逐塔状态机；
+- 无效点不推进恢复计数，风险快降、恢复慢升；
+- 快照深冻结，失败发布不覆盖旧快照；
+- 可见结果不含参数来源、default 或 assumption 字段；
+- 上传解析、规范化、行级异常和落盘失败均有审计，审计失败不改变数值；
+- 后验证执行前后主 DLR 数据深度相等；
+- 页面切换文件、杆塔或 DLR 快照时清除旧结果。
 
-安装coverage工具：
+倾角最小样例：
+
+```csv
+倾角
+1.00
+1.08
+```
+
+可选字段为 `杆塔`/`tower_id` 和 `时间`/`timestamp`。机械默认参数只用于后台保守计算，不得在测试或界面中当作实测值。
+
+## 浏览器验收
+
+启动服务：
+
 ```bash
-pip3 install coverage
+python3 -m streamlit run dispatch_app_st.py --server.headless true --server.port 8510
 ```
 
-生成覆盖率报告：
+先确认健康检查：
+
 ```bash
-# 运行测试并收集覆盖率
-python3 -m coverage run -m pytest
-
-# 查看覆盖率报告
-python3 -m coverage report
-
-# 生成HTML报告
-python3 -m coverage html
-open htmlcov/index.html
+curl --fail http://localhost:8510/_stcore/health
 ```
 
----
+桌面和移动视口都要检查：
 
-## 持续集成建议
+- 主页面原有布局、侧边栏、标签页和图表无重叠或截断；
+- 侧边栏“AI预测配置”中存在真实气象上传入口；
+- AI 图表没有随机残差，指标单位为 `m/s` 和 `°C`；
+- 确保气象文件包含每塔完整且无歧义的经纬度，或主流程已有完整杆塔坐标；上传真实气象后 `models/` 产生按线路/杆塔/目标隔离的 bundle，下一次无真实气象时可加载；
+- 弧垂页面无主快照时正常启动；有快照时只需上传倾角即可运行；
+- 弧垂结果不显示默认参数来源标签，下载按钮在普通重跑后仍存在；
+- 浏览器控制台和 Streamlit 终端没有异常。
 
-在 `.github/workflows/test.yml` 中添加：
+移动视口建议至少覆盖 `390 x 844`，桌面视口建议至少覆盖 `1440 x 900`。
 
-```yaml
-name: Tests
+## 运行产物
 
-on: [push, pull_request]
+默认目录：
 
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
-        with:
-          python-version: '3.9'
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Run tests
-        run: pytest -v
+```text
+models/                         XGBoost 模型、元数据和 manifest
+runtime/logs/dlr-audit.jsonl   模型与弧垂结构化审计
+runtime/results/sag/           弧垂后台 JSON 结果
 ```
 
----
-
-## 故障排查
-
-### 问题：ModuleNotFoundError
-```bash
-# 确保在项目根目录
-cd /Volumes/YC/项目/沙戈荒项目/界面/DLR动态增容评估系统/12.24
-
-# 检查Python路径
-python3 -c "import sys; print(sys.path)"
-
-# 安装依赖
-pip3 install -r requirements.txt
-```
-
-### 问题：测试失败
-```bash
-# 查看详细错误信息
-python3 -m pytest -vv --tb=long
-
-# 只运行失败的测试
-python3 -m pytest --lf
-```
-
-### 问题：导入错误
-```bash
-# 验证模块可以导入
-python3 -c "from modules.thermal_engine import ThermalCalculator"
-python3 -c "from config.config import APP_TITLE"
-```
-
----
-
-## 下一步
-
-现在核心模块已经完成并测试通过，接下来可以：
-
-1. **创建Streamlit应用** - 构建多页面Web界面
-2. **集成测试** - 测试完整的数据流程
-3. **性能测试** - 测试大数据量处理
-4. **用户验收测试** - 使用真实数据验证
-
----
-
-**测试文档更新日期：** 2026-03-17
-**测试通过率：** 100% (9/9)
+自动化测试必须使用 `tmp_path` 或环境变量覆盖这些目录，不应在仓库中留下模型、日志、结果或原始上传文件。

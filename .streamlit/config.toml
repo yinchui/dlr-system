@@ -4,3 +4,7 @@ port = 8501
 
 [theme]
 base = "dark"
+
+[theme.sidebar]
+primaryColor = "#FF2B2B"
+textColor = "#FAFAFA"

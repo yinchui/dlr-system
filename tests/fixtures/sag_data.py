@@ -67,4 +67,3 @@ def make_inclination_row(**changes):
     }
     values.update(changes)
     return pd.Series(values)
-

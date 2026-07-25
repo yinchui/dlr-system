@@ -2390,7 +2390,7 @@ def test_pipeline_rejects_fully_overlapping_truth_content_but_calculates_dlr(
     )
 
 
-def test_pipeline_allows_same_source_hash_when_weather_content_differs(tmp_path):
+def test_pipeline_rejects_same_source_hash_when_weather_content_differs(tmp_path):
     physical = _weather("physical")
     truth = _weather("truth", truth_offset=True)
     truth["source_file_hash"] = physical["source_file_hash"]
@@ -2406,9 +2406,35 @@ def test_pipeline_allows_same_source_hash_when_weather_content_differs(tmp_path)
     )
 
     assert result.max_currents.shape == (2, 2)
-    assert len(result.model_report.trained_targets) == 4
-    assert all(
-        fallback.reason != "truth_rejected_overlapping_content"
+    assert not result.model_report.trained_targets
+    assert any(
+        fallback.reason == "truth_rejected_overlapping_source_hash"
+        for fallback in result.model_report.fallbacks
+    )
+
+
+def test_pipeline_rejects_shared_hash_from_full_upload_lineage(tmp_path):
+    physical = _weather("physical")
+    truth = _weather("truth", truth_offset=True)
+    physical["source_file_hash"] = "physical-retained-row"
+    truth["source_file_hash"] = "truth-retained-row"
+    physical.attrs["source_file_hashes"] = ("physical-only", "shared-file")
+    truth.attrs["source_file_hashes"] = ("truth-only", "shared-file")
+
+    result = DlrPipeline(model_root=tmp_path).run(
+        physical=physical,
+        truth=truth,
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    assert result.max_currents.shape == (2, 2)
+    assert not result.model_report.trained_targets
+    assert any(
+        fallback.reason == "truth_rejected_overlapping_source_hash"
         for fallback in result.model_report.fallbacks
     )
 
@@ -2507,6 +2533,7 @@ def test_pipeline_result_is_a_defensive_snapshot_with_read_only_arrays(
         max_currents=max_currents,
         model_report=base.model_report,
         weather_metrics=base.weather_metrics,
+        input_hash=base.input_hash,
     )
     physical.loc[0, "object_payload"]["values"].append(99)
     physical.attrs["nested"]["values"].append(99)
@@ -2563,6 +2590,31 @@ def test_pipeline_result_is_a_defensive_snapshot_with_read_only_arrays(
     np.testing.assert_array_equal(legacy["corrected_winds"], expected_winds)
 
 
+def test_pipeline_result_rejects_invalid_input_hash(tmp_path):
+    base = DlrPipeline(model_root=tmp_path).run(
+        physical=_weather("physical"),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=False,
+        conductor=_conductor(),
+    )
+    result_kwargs = {
+        "physical_weather": base.physical_weather,
+        "terrain_corrected_weather": base.terrain_corrected_weather,
+        "final_weather": base.final_weather,
+        "comparison_weather": base.comparison_weather,
+        "thermal_result": base.thermal_result,
+        "max_currents": base.max_currents,
+        "model_report": base.model_report,
+        "weather_metrics": base.weather_metrics,
+    }
+
+    for invalid_hash in ("", "not-a-hash", "A" * 64):
+        with pytest.raises(ValueError, match="64 位小写 SHA-256"):
+            DlrPipelineResult(**result_kwargs, input_hash=invalid_hash)
+
+
 def test_legacy_projection_remains_independent_and_mutable(tmp_path):
     result = DlrPipeline(model_root=tmp_path).run(
         physical=_weather("physical"),
@@ -2605,6 +2657,31 @@ class _FailingTransientAdapter(_SpyThermalAdapter):
         raise RuntimeError("transient failed")
 
 
+class _InvalidTransientMetadataAdapter(_SpyThermalAdapter):
+    def calculate_transient_from_long_frame(
+        self, weather, *, base_params, request, steady_result
+    ):
+        return {
+            "max_currents": np.asarray(steady_result["max_currents"]),
+            "window_start_hour": "invalid",
+            "window_end_hour": 1.0,
+        }
+
+
+class _NonFiniteTransientResultAdapter(_SpyThermalAdapter):
+    def calculate_transient_from_long_frame(
+        self, weather, *, base_params, request, steady_result
+    ):
+        return {
+            "max_currents": np.full_like(
+                np.asarray(steady_result["max_currents"], dtype=float),
+                np.nan,
+            ),
+            "window_start_hour": 0.0,
+            "window_end_hour": 1.0,
+        }
+
+
 def test_transient_failure_falls_back_to_same_steady_result(tmp_path):
     adapter = _FailingTransientAdapter()
     result = DlrPipeline(model_root=tmp_path, thermal_adapter=adapter).run(
@@ -2622,6 +2699,66 @@ def test_transient_failure_falls_back_to_same_steady_result(tmp_path):
         result.max_currents,
     )
     assert result.transient_fallbacks == ("transient_failed:RuntimeError",)
+
+
+def test_invalid_transient_metadata_falls_back_and_uses_steady_input_hash(tmp_path):
+    steady = DlrPipeline(
+        model_root=tmp_path / "steady",
+        thermal_adapter=_InvalidTransientMetadataAdapter(),
+    ).run(
+        physical=_weather("physical"),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=False,
+        conductor=_conductor(),
+    )
+    fallback = DlrPipeline(
+        model_root=tmp_path / "fallback",
+        thermal_adapter=_InvalidTransientMetadataAdapter(),
+    ).run(
+        physical=_weather("physical"),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=False,
+        conductor=_conductor(),
+        transient_request={"window_minutes": 15},
+    )
+
+    np.testing.assert_array_equal(
+        fallback.thermal_result["transient_result"]["max_currents"],
+        fallback.max_currents,
+    )
+    assert fallback.transient_fallbacks == ("transient_failed:ValueError",)
+    assert fallback.input_hash == steady.input_hash
+
+
+def test_nonfinite_transient_currents_fall_back_to_steady_result(tmp_path):
+    conductor = _conductor() | {
+        "materials": [
+            {"type": "aluminum", "density": 1.116},
+            {"type": "steel", "density": 0.5126},
+        ]
+    }
+    fallback = DlrPipeline(
+        model_root=tmp_path,
+        thermal_adapter=_NonFiniteTransientResultAdapter(),
+    ).run(
+        physical=_weather("physical"),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=False,
+        conductor=conductor,
+        transient_request={"window_minutes": 15},
+    )
+
+    np.testing.assert_array_equal(
+        fallback.thermal_result["transient_result"]["max_currents"],
+        fallback.max_currents,
+    )
+    assert fallback.transient_fallbacks == ("transient_failed:ValueError",)
 
 
 def test_all_weather_stages_keep_the_full_project_line_tower_key(tmp_path):

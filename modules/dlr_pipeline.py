@@ -314,6 +314,7 @@ class DlrPipelineResult:
     _max_currents: np.ndarray
     model_report: ModelRunReport
     weather_metrics: WeatherMetrics
+    input_hash: str
     transient_fallbacks: tuple[str, ...] = ()
 
     def __init__(
@@ -326,6 +327,7 @@ class DlrPipelineResult:
         max_currents: np.ndarray,
         model_report: ModelRunReport,
         weather_metrics: WeatherMetrics,
+        input_hash: str,
         transient_fallbacks: tuple[str, ...] = (),
     ):
         if not isinstance(thermal_result, Mapping):
@@ -349,6 +351,13 @@ class DlrPipelineResult:
         object.__setattr__(
             self, "transient_fallbacks", tuple(transient_fallbacks)
         )
+        if not isinstance(input_hash, str):
+            raise TypeError("input_hash must be a string")
+        if len(input_hash) != 64 or any(
+            character not in "0123456789abcdef" for character in input_hash
+        ):
+            raise ValueError("input_hash 必须是 64 位小写 SHA-256")
+        object.__setattr__(self, "input_hash", input_hash)
 
     @property
     def physical_weather(self) -> pd.DataFrame:
@@ -649,6 +658,126 @@ def _stable_hash(value: Any) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _dlr_input_hash(
+    final_weather: pd.DataFrame,
+    *,
+    conductor: Mapping[str, Any],
+    transient_window: Optional[Mapping[str, Any]],
+) -> str:
+    weather_columns = (
+        "tower_id",
+        "timestamp",
+        "ambient_temp",
+        "wind_speed",
+        "wind_angle_deg",
+        "solar_radiation",
+        "elevation",
+    )
+    missing = [
+        column for column in weather_columns if column not in final_weather.columns
+    ]
+    if missing:
+        raise ValueError(f"DLR 哈希缺少热核输入列: {', '.join(missing)}")
+    weather = final_weather.loc[:, weather_columns].copy()
+    weather["tower_id"] = weather["tower_id"].astype(str)
+    weather["timestamp"] = pd.to_datetime(
+        weather["timestamp"], utc=True
+    ).astype("int64")
+    for column in weather_columns[2:]:
+        values = pd.to_numeric(weather[column], errors="raise").astype(float)
+        if not np.isfinite(values.to_numpy()).all():
+            raise ValueError(f"DLR 哈希热核输入列 {column} 必须为有限值")
+        weather[column] = values.mask(values == 0.0, 0.0)
+    weather = weather.sort_values(
+        ["tower_id", "timestamp"], kind="mergesort", ignore_index=True
+    )
+    weather["elevation"] = weather.groupby(
+        "tower_id", sort=False
+    )["elevation"].transform("first")
+    conductor_values = dict(conductor)
+    steady_conductor = {
+        key: ThermalCalculator._finite_number(conductor_values, key)
+        for key in (
+            "D0",
+            "R_low_25",
+            "R_high_75",
+            "R_high_200",
+            "emissivity",
+            "absorptivity",
+        )
+    }
+    steady_conductor["max_allow_temp"] = ThermalCalculator._finite_number(
+        conductor_values,
+        "max_allow_temp",
+        80.0,
+    )
+    steady_conductor = {
+        key: 0.0 if value == 0.0 else value
+        for key, value in steady_conductor.items()
+    }
+    transient_inputs = None
+    if transient_window is not None:
+        window_values = dict(transient_window)
+        window_start = ThermalCalculator._finite_number(
+            window_values, "window_start_hour"
+        )
+        window_end = ThermalCalculator._finite_number(
+            window_values, "window_end_hour"
+        )
+        if window_end < window_start:
+            raise ValueError("window_end_hour 必须不小于 window_start_hour")
+        timestamp_ns = weather["timestamp"].to_numpy(dtype=np.int64)
+        weather_end = float(timestamp_ns.max() - timestamp_ns.min()) / 3.6e12
+        effective_start = max(window_start, 0.0)
+        effective_end = min(window_end, weather_end)
+        if effective_end < effective_start:
+            effective_window = {"empty": True}
+        else:
+            effective_window = {
+                "window_start_hour": (
+                    0.0 if effective_start == 0.0 else effective_start
+                ),
+                "window_end_hour": (
+                    0.0 if effective_end == 0.0 else effective_end
+                ),
+            }
+        transient_inputs = {
+            "window": effective_window,
+            "heat_capacity_j_per_m_c": (
+                ThermalCalculator().calculate_heat_capacity(conductor_values)
+            ),
+        }
+        explicit_initial = None
+        if "T_s" in conductor_values:
+            explicit_initial = ThermalCalculator._finite_number(
+                conductor_values, "T_s"
+            )
+        initial_temperatures = []
+        for tower_id, tower in weather.groupby("tower_id", sort=False):
+            initial_temp = (
+                explicit_initial
+                if explicit_initial is not None
+                else float(tower["ambient_temp"].iloc[0])
+            )
+            initial_temperatures.append(
+                {
+                    "tower_id": str(tower_id),
+                    "initial_temp_c": (
+                        0.0 if initial_temp == 0.0 else initial_temp
+                    ),
+                }
+            )
+        transient_inputs["initial_temperatures"] = initial_temperatures
+    return _stable_hash(
+        {
+            "version": "dlr-thermal-input-v2",
+            "weather": weather.to_dict(orient="records"),
+            "conductor": steady_conductor,
+            "transient": transient_inputs,
+        }
+    )
 
 
 def _array_fingerprint(value: Any) -> dict[str, Any]:
@@ -1297,7 +1426,19 @@ class DlrPipeline:
         if model_ready and truth is not None and not sealed_preparation_failed:
             try:
                 truth_frame = self._weather_frame(truth, role="truth")
-                if _weather_content_overlaps(physical_input, truth_frame):
+                physical_lineage = set(
+                    _line_source_lineage(physical, physical_input)
+                )
+                truth_lineage = set(_line_source_lineage(truth, truth_frame))
+                if physical_lineage.intersection(truth_lineage):
+                    fallbacks.append(
+                        ModelFallback(
+                            None,
+                            "truth_rejected_overlapping_source_hash",
+                        )
+                    )
+                    truth_frame = None
+                elif _weather_content_overlaps(physical_input, truth_frame):
                     fallbacks.append(
                         ModelFallback(
                             None,
@@ -1625,6 +1766,7 @@ class DlrPipeline:
         thermal_result = dict(steady_result)
         max_currents = np.asarray(steady_result["max_currents"], dtype=float)
         transient_fallbacks = ()
+        input_hash = None
         if transient_request is not None:
             try:
                 transient_result = (
@@ -1637,7 +1779,32 @@ class DlrPipeline:
                 )
                 if not isinstance(transient_result, Mapping):
                     raise TypeError("暂态结果必须是映射")
-                thermal_result["transient_result"] = dict(transient_result)
+                transient_currents = np.asarray(
+                    transient_result.get("max_currents"), dtype=float
+                )
+                if transient_currents.shape != max_currents.shape:
+                    raise ValueError("暂态载流量维度必须与稳态结果一致")
+                if (
+                    not np.isfinite(transient_currents).all()
+                    or np.any(transient_currents < 0.0)
+                ):
+                    raise ValueError("暂态载流量必须为有限非负值")
+                transient_window = {
+                    "window_start_hour": transient_result[
+                        "window_start_hour"
+                    ],
+                    "window_end_hour": transient_result["window_end_hour"],
+                }
+                input_hash = _dlr_input_hash(
+                    final_weather,
+                    conductor=conductor,
+                    transient_window=transient_window,
+                )
+                validated_transient = dict(transient_result)
+                validated_transient["max_currents"] = (
+                    transient_currents.copy()
+                )
+                thermal_result["transient_result"] = validated_transient
             except Exception as exc:
                 reason = f"transient_failed:{type(exc).__name__}"
                 transient_fallbacks = (reason,)
@@ -1646,6 +1813,12 @@ class DlrPipeline:
                     "fallback_reason": reason,
                     "used_steady_fallback": True,
                 }
+        if input_hash is None:
+            input_hash = _dlr_input_hash(
+                final_weather,
+                conductor=conductor,
+                transient_window=None,
+            )
         report = ModelRunReport(
             trained_targets=tuple(trained_targets),
             loaded_targets=tuple(loaded_targets),
@@ -1664,4 +1837,5 @@ class DlrPipeline:
             model_report=report,
             weather_metrics=self._metrics(comparison),
             transient_fallbacks=transient_fallbacks,
+            input_hash=input_hash,
         )

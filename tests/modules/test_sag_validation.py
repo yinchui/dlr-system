@@ -7,7 +7,14 @@ import pytest
 from modules.sag_validation import (
     ParameterSource,
     SagValidationSnapshot,
+    SagState,
+    SagValidationConfig,
+    SagValidationService,
+    adaptive_temperature_threshold,
     build_sag_snapshot,
+    compute_derating,
+    horizontal_tension,
+    infer_mean_temperature,
     normalize_inclination_dataframe,
     resolve_sag_parameters,
 )
@@ -294,3 +301,195 @@ def test_snapshot_requires_completed_dlr_ratings():
 
     with pytest.raises(ValueError, match="max_currents"):
         build_sag_snapshot(line_data, drake_conductor())
+
+
+def test_patent_tension_and_temperature_formula():
+    tension = horizontal_tension(
+        weight_n_m=10.0,
+        span_m=100.0,
+        angle_deg=45.0,
+    )
+    mean_temperature = infer_mean_temperature(
+        current_tension_n=tension,
+        reference_tension_n=1000.0,
+        elastic_modulus_pa=1.0e11,
+        area_m2=1.0e-4,
+        thermal_expansion_per_c=1.0e-5,
+        reference_temp_c=20.0,
+    )
+
+    assert tension == pytest.approx(500.0)
+    assert mean_temperature == pytest.approx(25.0)
+
+
+def test_checked_current_is_minimum_of_three_candidates():
+    result = compute_derating(
+        ambient_temp_c=20.0,
+        theoretical_temp_c=60.0,
+        measured_temp_c=80.0,
+        original_current_a=1000.0,
+        recalculated_current_a=900.0,
+    )
+
+    assert result.factor == pytest.approx((40.0 / 60.0) ** 0.5)
+    assert result.checked_current_a == pytest.approx(
+        min(1000.0, 900.0, 1000.0 * (40.0 / 60.0) ** 0.5)
+    )
+
+
+def test_adaptive_threshold_increases_with_each_uncertainty_source():
+    stable = adaptive_temperature_threshold(
+        base_threshold_c=5.0,
+        angle_samples=[1.0, 1.0, 1.0],
+        wind_samples=[3.0, 3.0, 3.0],
+        span_m=100.0,
+        historical_errors=[0.0, 0.0, 0.0],
+    )
+
+    assert adaptive_temperature_threshold(
+        base_threshold_c=5.0,
+        angle_samples=[0.5, 1.0, 1.5],
+        wind_samples=[3.0, 3.0, 3.0],
+        span_m=100.0,
+        historical_errors=[0.0, 0.0, 0.0],
+    ) > stable
+    assert adaptive_temperature_threshold(
+        base_threshold_c=5.0,
+        angle_samples=[1.0, 1.0, 1.0],
+        wind_samples=[1.0, 3.0, 5.0],
+        span_m=100.0,
+        historical_errors=[0.0, 0.0, 0.0],
+    ) > stable
+    assert adaptive_temperature_threshold(
+        base_threshold_c=5.0,
+        angle_samples=[1.0, 1.0, 1.0],
+        wind_samples=[3.0, 3.0, 3.0],
+        span_m=600.0,
+        historical_errors=[0.0, 0.0, 0.0],
+    ) > stable
+    assert adaptive_temperature_threshold(
+        base_threshold_c=5.0,
+        angle_samples=[1.0, 1.0, 1.0],
+        wind_samples=[3.0, 3.0, 3.0],
+        span_m=100.0,
+        historical_errors=[0.0, 4.0, 8.0],
+    ) > stable
+
+
+def _state_config():
+    return SagValidationConfig(
+        base_threshold_c=5.0,
+        recovery_ratio=0.6,
+        recovery_samples=2,
+        recovery_alpha=0.5,
+        convergence_tolerance_a=0.1,
+    )
+
+
+def _state_row(
+    *,
+    tower_id="001",
+    timestamp=0,
+    angle_deg=45.0,
+    theoretical_temp_c=15.0,
+):
+    return {
+        "tower_id": tower_id,
+        "timestamp": timestamp,
+        "sample_index": int(timestamp) if isinstance(timestamp, int) else 0,
+        "angle_deg": angle_deg,
+        "span_m": 100.0,
+        "unit_weight_n_m": 10.0,
+        "reference_tension_n": 1000.0,
+        "reference_temp_c": 20.0,
+        "elastic_modulus_pa": 1.0e11,
+        "area_m2": 1.0e-4,
+        "thermal_expansion_per_c": 1.0e-5,
+        "ambient_temp_c": 0.0,
+        "theoretical_temp_c": theoretical_temp_c,
+        "original_current_a": 1000.0,
+        "recalculated_current_a": 900.0,
+        "wind_speed": 3.0,
+    }
+
+
+def test_trigger_requires_error_strictly_above_threshold():
+    result = SagValidationService(config=_state_config()).validate_batch(
+        pd.DataFrame([_state_row(theoretical_temp_c=20.0)])
+    )
+
+    assert result[0].measured_temp_c == pytest.approx(25.0)
+    assert result[0].temperature_error_c == pytest.approx(5.0)
+    assert result[0].threshold_c == pytest.approx(5.0)
+    assert result[0].state is SagState.NORMAL
+    assert result[0].final_current_a == pytest.approx(1000.0)
+
+
+def test_invalid_sample_does_not_advance_recovery_state():
+    rows = [
+        _state_row(timestamp=0, theoretical_temp_c=15.0),
+        _state_row(timestamp=1, angle_deg=0.0, theoretical_temp_c=23.0),
+        _state_row(timestamp=2, theoretical_temp_c=23.0),
+        _state_row(timestamp=3, theoretical_temp_c=23.0),
+    ]
+
+    results = SagValidationService(config=_state_config()).validate_batch(
+        pd.DataFrame(rows)
+    )
+
+    assert results[0].state is SagState.RISK
+    assert results[1].state is SagState.INVALID
+    assert results[1].final_current_a == results[0].final_current_a
+    assert results[2].state is not SagState.NORMAL
+    assert results[2].state is SagState.RISK
+    assert results[3].state is SagState.RECOVERY
+    assert results[3].final_current_a > results[0].final_current_a
+    assert results[3].final_current_a < results[3].original_current_a
+
+
+def test_state_is_isolated_per_tower():
+    rows = [
+        _state_row(tower_id="001", timestamp=0, theoretical_temp_c=15.0),
+        _state_row(tower_id="002", timestamp=0, theoretical_temp_c=23.0),
+    ]
+
+    results = SagValidationService(config=_state_config()).validate_batch(
+        pd.DataFrame(rows)
+    )
+
+    assert results[0].state is SagState.RISK
+    assert results[1].state is SagState.NORMAL
+    assert results[1].final_current_a == pytest.approx(1000.0)
+
+
+def test_invalid_record_is_isolated_and_all_outputs_remain_finite():
+    rows = [
+        _state_row(timestamp=0, angle_deg=float("nan")),
+        _state_row(timestamp=1, theoretical_temp_c=23.0),
+    ]
+
+    results = SagValidationService(config=_state_config()).validate_batch(
+        pd.DataFrame(rows)
+    )
+
+    assert results[0].state is SagState.INVALID
+    assert results[0].error_code
+    assert results[1].state is SagState.NORMAL
+    for result in results:
+        assert np.isfinite(result.final_current_a)
+        assert np.isfinite(result.original_current_a)
+
+
+def test_finite_but_nonphysical_inferred_temperature_is_invalid():
+    rows = [
+        _state_row(timestamp=0, angle_deg=0.05),
+        _state_row(timestamp=1, theoretical_temp_c=23.0),
+    ]
+
+    results = SagValidationService(config=_state_config()).validate_batch(
+        pd.DataFrame(rows)
+    )
+
+    assert results[0].state is SagState.INVALID
+    assert results[0].error_code == "nonphysical_temperature"
+    assert results[1].state is SagState.NORMAL

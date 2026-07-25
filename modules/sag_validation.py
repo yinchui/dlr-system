@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import uuid
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional
@@ -18,6 +18,8 @@ _ANGLE_COLUMNS = ("angle_deg", "inclination", "inclination_angle")
 _TOWER_COLUMNS = ("tower_id", "tower")
 _TIMESTAMP_COLUMNS = ("timestamp", "datetime")
 _EARTH_RADIUS_M = 6_371_008.8
+_ABSOLUTE_ZERO_C = -273.15
+_MAX_SAG_TEMPERATURE_C = 1000.0
 
 
 class ParameterSource(str, Enum):
@@ -742,3 +744,710 @@ def resolve_sag_parameters(
         recalculated_current_a=recalculated_current,
         operating_current_a=operating_current,
     )
+
+
+class SagState(str, Enum):
+    NORMAL = "normal"
+    RISK = "risk"
+    RECOVERY = "recovery"
+    INVALID = "invalid"
+
+
+@dataclass(frozen=True)
+class SagValidationConfig:
+    formula_version: str = str(SAG_VALIDATION_DEFAULTS["formula_version"])
+    min_angle_deg: float = float(SAG_VALIDATION_DEFAULTS["min_angle_deg"])
+    max_angle_deg: float = float(SAG_VALIDATION_DEFAULTS["max_angle_deg"])
+    base_threshold_c: float = float(SAG_VALIDATION_DEFAULTS["base_threshold_c"])
+    recovery_ratio: float = float(SAG_VALIDATION_DEFAULTS["recovery_ratio"])
+    recovery_samples: int = int(SAG_VALIDATION_DEFAULTS["recovery_samples"])
+    recovery_alpha: float = float(SAG_VALIDATION_DEFAULTS["recovery_alpha"])
+    convergence_tolerance_a: float = 1.0
+    threshold_reference_span_m: float = 300.0
+    angle_mad_weight: float = 2.0
+    wind_mad_weight: float = 0.25
+    span_weight: float = 1.0
+    history_error_weight: float = 0.25
+    history_window: int = 12
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.formula_version, str) or not self.formula_version:
+            raise ValueError("formula_version must be a non-empty string")
+        numeric_positive = (
+            "min_angle_deg",
+            "max_angle_deg",
+            "base_threshold_c",
+            "convergence_tolerance_a",
+            "threshold_reference_span_m",
+        )
+        for name in numeric_positive:
+            if _positive_float(getattr(self, name)) is None:
+                raise ValueError(f"{name} must be positive and finite")
+        if self.min_angle_deg >= self.max_angle_deg or self.max_angle_deg >= 90.0:
+            raise ValueError("angle bounds must satisfy 0 < min < max < 90")
+        for name in (
+            "angle_mad_weight",
+            "wind_mad_weight",
+            "span_weight",
+            "history_error_weight",
+        ):
+            if _nonnegative_float(getattr(self, name)) is None:
+                raise ValueError(f"{name} must be finite and non-negative")
+        for name in ("recovery_ratio", "recovery_alpha"):
+            value = _finite_float(getattr(self, name))
+            if value is None or not 0.0 < value < 1.0:
+                raise ValueError(f"{name} must be between zero and one")
+        for name in ("recovery_samples", "history_window"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+
+
+@dataclass(frozen=True)
+class DeratingResult:
+    factor: float
+    derated_current_a: float
+    checked_current_a: float
+
+
+@dataclass(frozen=True)
+class SagValidationResult:
+    result_id: str
+    tower_id: str
+    timestamp: Any
+    sample_index: int
+    state: SagState
+    angle_deg: float
+    horizontal_tension_n: float
+    measured_temp_c: float
+    theoretical_temp_c: float
+    ambient_temp_c: float
+    temperature_error_c: float
+    threshold_c: float
+    derating_factor: float
+    original_current_a: float
+    recalculated_current_a: float
+    checked_current_a: float
+    final_current_a: float
+    formula_version: str
+    valid: bool = True
+    error_code: str = ""
+    fallback_reason: str = ""
+    parameter_sources: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, SagState):
+            raise TypeError("state must be a SagState")
+        if not isinstance(self.sample_index, int) or self.sample_index < 0:
+            raise ValueError("sample_index must be a non-negative integer")
+        for name in (
+            "angle_deg",
+            "horizontal_tension_n",
+            "measured_temp_c",
+            "theoretical_temp_c",
+            "ambient_temp_c",
+            "temperature_error_c",
+            "threshold_c",
+            "derating_factor",
+            "original_current_a",
+            "recalculated_current_a",
+            "checked_current_a",
+            "final_current_a",
+        ):
+            value = _finite_float(getattr(self, name))
+            if value is None:
+                raise ValueError(f"{name} must be finite")
+            object.__setattr__(self, name, value)
+        if not isinstance(self.valid, bool):
+            raise TypeError("valid must be a bool")
+        object.__setattr__(
+            self,
+            "parameter_sources",
+            _deep_freeze(dict(self.parameter_sources)),
+        )
+
+
+@dataclass(frozen=True)
+class SagValidationBatchResult:
+    rows: tuple[SagValidationResult, ...]
+    formula_version: str
+    source_run_id: str = ""
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        return self.rows[index]
+
+
+@dataclass
+class _TowerState:
+    state: SagState = SagState.NORMAL
+    last_output_a: Optional[float] = None
+    recovery_count: int = 0
+    angle_history: tuple[float, ...] = ()
+    wind_history: tuple[float, ...] = ()
+    error_history: tuple[float, ...] = ()
+
+
+def _required_finite(value: Any, name: str) -> float:
+    result = _finite_float(value)
+    if result is None:
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
+def _required_positive(value: Any, name: str) -> float:
+    result = _positive_float(value)
+    if result is None:
+        raise ValueError(f"{name} must be positive and finite")
+    return result
+
+
+def _required_nonnegative(value: Any, name: str) -> float:
+    result = _nonnegative_float(value)
+    if result is None:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return result
+
+
+def horizontal_tension(
+    *, weight_n_m: float, span_m: float, angle_deg: float
+) -> float:
+    weight = _required_positive(weight_n_m, "weight_n_m")
+    span = _required_positive(span_m, "span_m")
+    angle = _required_finite(angle_deg, "angle_deg")
+    if not 0.0 < angle < 90.0:
+        raise ValueError("angle_deg must be between zero and 90 degrees")
+    tangent = math.tan(math.radians(angle))
+    if not math.isfinite(tangent) or tangent <= 0.0:
+        raise ValueError("angle_deg produces an invalid tangent")
+    result = weight * span / (2.0 * tangent)
+    if not math.isfinite(result) or result <= 0.0:
+        raise ValueError("horizontal tension is invalid")
+    return result
+
+
+def infer_mean_temperature(
+    *,
+    current_tension_n: float,
+    reference_tension_n: float,
+    elastic_modulus_pa: float,
+    area_m2: float,
+    thermal_expansion_per_c: float,
+    reference_temp_c: float,
+) -> float:
+    current_tension = _required_positive(current_tension_n, "current_tension_n")
+    reference_tension = _required_positive(
+        reference_tension_n, "reference_tension_n"
+    )
+    elastic_modulus = _required_positive(
+        elastic_modulus_pa, "elastic_modulus_pa"
+    )
+    area = _required_positive(area_m2, "area_m2")
+    expansion = _required_positive(
+        thermal_expansion_per_c, "thermal_expansion_per_c"
+    )
+    reference_temp = _required_finite(reference_temp_c, "reference_temp_c")
+    denominator = elastic_modulus * area * expansion
+    if not math.isfinite(denominator) or denominator <= 0.0:
+        raise ValueError("temperature denominator is invalid")
+    result = reference_temp + (reference_tension - current_tension) / denominator
+    if not math.isfinite(result):
+        raise ValueError("inferred mean temperature is invalid")
+    return result
+
+
+def compute_derating(
+    *,
+    ambient_temp_c: float,
+    theoretical_temp_c: float,
+    measured_temp_c: float,
+    original_current_a: float,
+    recalculated_current_a: float,
+) -> DeratingResult:
+    ambient = _required_finite(ambient_temp_c, "ambient_temp_c")
+    theoretical = _required_finite(theoretical_temp_c, "theoretical_temp_c")
+    measured = _required_finite(measured_temp_c, "measured_temp_c")
+    original = _required_nonnegative(original_current_a, "original_current_a")
+    recalculated = _required_nonnegative(
+        recalculated_current_a, "recalculated_current_a"
+    )
+    denominator = measured - ambient
+    numerator = theoretical - ambient
+    if denominator <= 0.0 or numerator < 0.0:
+        raise ValueError("temperature rise margin is invalid")
+    ratio = min(1.0, max(0.0, numerator / denominator))
+    factor = math.sqrt(ratio)
+    derated = original * factor
+    checked = min(original, recalculated, derated)
+    if not np.isfinite([factor, derated, checked]).all():
+        raise ValueError("derating result is not finite")
+    return DeratingResult(factor, derated, checked)
+
+
+def _median_absolute_deviation(values) -> float:
+    finite = np.asarray(
+        [value for value in (_finite_float(item) for item in values) if value is not None],
+        dtype=float,
+    )
+    if finite.size < 2:
+        return 0.0
+    median = float(np.median(finite))
+    return float(np.median(np.abs(finite - median)))
+
+
+def adaptive_temperature_threshold(
+    *,
+    base_threshold_c: float,
+    angle_samples=(),
+    wind_samples=(),
+    span_m: float,
+    historical_errors=(),
+    reference_span_m: float = 300.0,
+    angle_mad_weight: float = 2.0,
+    wind_mad_weight: float = 0.25,
+    span_weight: float = 1.0,
+    history_error_weight: float = 0.25,
+) -> float:
+    base = _required_nonnegative(base_threshold_c, "base_threshold_c")
+    span = _required_positive(span_m, "span_m")
+    reference_span = _required_positive(reference_span_m, "reference_span_m")
+    weights = tuple(
+        _required_nonnegative(value, name)
+        for name, value in (
+            ("angle_mad_weight", angle_mad_weight),
+            ("wind_mad_weight", wind_mad_weight),
+            ("span_weight", span_weight),
+            ("history_error_weight", history_error_weight),
+        )
+    )
+    angle_uncertainty = _median_absolute_deviation(angle_samples)
+    wind_uncertainty = _median_absolute_deviation(wind_samples)
+    span_uncertainty = max(0.0, span / reference_span - 1.0)
+    finite_errors = [
+        abs(value)
+        for value in (_finite_float(item) for item in historical_errors)
+        if value is not None
+    ]
+    history_uncertainty = float(np.median(finite_errors)) if finite_errors else 0.0
+    threshold = (
+        base
+        + weights[0] * angle_uncertainty
+        + weights[1] * wind_uncertainty
+        + weights[2] * span_uncertainty
+        + weights[3] * history_uncertainty
+    )
+    if not math.isfinite(threshold):
+        raise ValueError("adaptive threshold is invalid")
+    return threshold
+
+
+def _direct_parameters(row: Mapping[str, Any]) -> ResolvedSagParameters:
+    def sourced_positive(name: str) -> SourcedValue:
+        return SourcedValue(
+            _required_positive(row.get(name), name),
+            ParameterSource.MEASURED,
+            "validation_input",
+        )
+
+    def sourced_finite(name: str) -> SourcedValue:
+        return SourcedValue(
+            _required_finite(row.get(name), name),
+            ParameterSource.MEASURED,
+            "validation_input",
+        )
+
+    def sourced_nonnegative(name: str) -> SourcedValue:
+        return SourcedValue(
+            _required_nonnegative(row.get(name), name),
+            ParameterSource.MEASURED,
+            "validation_input",
+        )
+
+    original = sourced_nonnegative("original_current_a")
+    recalculated_value = row.get("recalculated_current_a", original.value)
+    return ResolvedSagParameters(
+        span_m=sourced_positive("span_m"),
+        unit_weight_n_m=sourced_positive("unit_weight_n_m"),
+        reference_tension_n=sourced_positive("reference_tension_n"),
+        reference_temp_c=sourced_finite("reference_temp_c"),
+        elastic_modulus_pa=sourced_positive("elastic_modulus_pa"),
+        area_m2=sourced_positive("area_m2"),
+        thermal_expansion_per_c=sourced_positive("thermal_expansion_per_c"),
+        ambient_temp_c=sourced_finite("ambient_temp_c"),
+        theoretical_temp_c=sourced_finite("theoretical_temp_c"),
+        original_current_a=original,
+        recalculated_current_a=SourcedValue(
+            _required_nonnegative(
+                recalculated_value, "recalculated_current_a"
+            ),
+            ParameterSource.MEASURED,
+            "validation_input",
+        ),
+    )
+
+
+class SagValidationService:
+    def __init__(
+        self,
+        *,
+        config: Optional[SagValidationConfig] = None,
+        temperature_solver: Optional[
+            Callable[[Mapping[str, Any], float], float]
+        ] = None,
+        current_recalculator: Optional[Callable[[Mapping[str, Any]], float]] = None,
+    ) -> None:
+        self.config = config or SagValidationConfig()
+        if not isinstance(self.config, SagValidationConfig):
+            raise TypeError("config must be a SagValidationConfig")
+        self.temperature_solver = temperature_solver
+        self.current_recalculator = current_recalculator
+        self._tower_states: dict[str, _TowerState] = {}
+
+    def _parameter_sources(
+        self, parameters: ResolvedSagParameters
+    ) -> Mapping[str, str]:
+        return {
+            field.name: value.source.value
+            for field in fields(parameters)
+            if isinstance((value := getattr(parameters, field.name)), SourcedValue)
+        }
+
+    def _threshold(
+        self,
+        memory: _TowerState,
+        *,
+        angle_deg: float,
+        wind_speed: float,
+        span_m: float,
+    ) -> float:
+        config = self.config
+        return adaptive_temperature_threshold(
+            base_threshold_c=config.base_threshold_c,
+            angle_samples=(*memory.angle_history, angle_deg),
+            wind_samples=(*memory.wind_history, wind_speed),
+            span_m=span_m,
+            historical_errors=memory.error_history,
+            reference_span_m=config.threshold_reference_span_m,
+            angle_mad_weight=config.angle_mad_weight,
+            wind_mad_weight=config.wind_mad_weight,
+            span_weight=config.span_weight,
+            history_error_weight=config.history_error_weight,
+        )
+
+    def _remember_valid(
+        self,
+        memory: _TowerState,
+        *,
+        angle_deg: float,
+        wind_speed: float,
+        error_c: float,
+    ) -> None:
+        window = self.config.history_window
+        memory.angle_history = (*memory.angle_history, angle_deg)[-window:]
+        memory.wind_history = (*memory.wind_history, wind_speed)[-window:]
+        memory.error_history = (*memory.error_history, error_c)[-window:]
+
+    def _invalid_result(
+        self,
+        *,
+        row: Mapping[str, Any],
+        tower_id: str,
+        sample_index: int,
+        memory: _TowerState,
+        error_code: str,
+        parameters: Optional[ResolvedSagParameters] = None,
+    ) -> SagValidationResult:
+        original = _nonnegative_float(row.get("original_current_a"))
+        if parameters is not None:
+            original = parameters.original_current_a.value
+        if original is None:
+            original = memory.last_output_a if memory.last_output_a is not None else 0.0
+        final = memory.last_output_a if memory.last_output_a is not None else original
+        recalculated = (
+            parameters.recalculated_current_a.value
+            if parameters is not None
+            else original
+        )
+        ambient = (
+            parameters.ambient_temp_c.value if parameters is not None else 0.0
+        )
+        theoretical = (
+            parameters.theoretical_temp_c.value
+            if parameters is not None
+            else ambient
+        )
+        sources = self._parameter_sources(parameters) if parameters else {}
+        return SagValidationResult(
+            result_id=uuid.uuid4().hex,
+            tower_id=tower_id,
+            timestamp=row.get("timestamp", sample_index),
+            sample_index=sample_index,
+            state=SagState.INVALID,
+            angle_deg=_finite_float(row.get("angle_deg")) or 0.0,
+            horizontal_tension_n=0.0,
+            measured_temp_c=theoretical,
+            theoretical_temp_c=theoretical,
+            ambient_temp_c=ambient,
+            temperature_error_c=0.0,
+            threshold_c=self.config.base_threshold_c,
+            derating_factor=1.0,
+            original_current_a=original,
+            recalculated_current_a=recalculated,
+            checked_current_a=final,
+            final_current_a=final,
+            formula_version=self.config.formula_version,
+            valid=False,
+            error_code=error_code,
+            fallback_reason=error_code,
+            parameter_sources=sources,
+        )
+
+    def _validate_row(
+        self,
+        row: Mapping[str, Any],
+        *,
+        sample_index: int,
+        snapshot: Optional[SagValidationSnapshot],
+        conductor: Optional[Mapping[str, Any]],
+    ) -> SagValidationResult:
+        try:
+            tower_id = normalize_tower_id(row.get("tower_id"))
+        except (TypeError, ValueError):
+            tower_id = str(row.get("tower_id", f"invalid-{sample_index}"))
+        memory = self._tower_states.setdefault(tower_id, _TowerState())
+        angle = _finite_float(row.get("angle_deg"))
+        if (
+            angle is None
+            or angle < self.config.min_angle_deg
+            or angle > self.config.max_angle_deg
+        ):
+            return self._invalid_result(
+                row=row,
+                tower_id=tower_id,
+                sample_index=sample_index,
+                memory=memory,
+                error_code="invalid_angle",
+            )
+
+        parameters = None
+        try:
+            if snapshot is None:
+                parameters = _direct_parameters(row)
+            else:
+                parameters = resolve_sag_parameters(
+                    inclination_row=row,
+                    snapshot=snapshot,
+                    conductor=conductor,
+                    temperature_solver=self.temperature_solver,
+                    current_recalculator=self.current_recalculator,
+                )
+            tension = horizontal_tension(
+                weight_n_m=parameters.unit_weight_n_m.value,
+                span_m=parameters.span_m.value,
+                angle_deg=angle,
+            )
+            measured_temp = infer_mean_temperature(
+                current_tension_n=tension,
+                reference_tension_n=parameters.reference_tension_n.value,
+                elastic_modulus_pa=parameters.elastic_modulus_pa.value,
+                area_m2=parameters.area_m2.value,
+                thermal_expansion_per_c=parameters.thermal_expansion_per_c.value,
+                reference_temp_c=parameters.reference_temp_c.value,
+            )
+            if any(
+                temperature <= _ABSOLUTE_ZERO_C
+                or temperature > _MAX_SAG_TEMPERATURE_C
+                for temperature in (
+                    parameters.ambient_temp_c.value,
+                    parameters.theoretical_temp_c.value,
+                    measured_temp,
+                )
+            ):
+                return self._invalid_result(
+                    row=row,
+                    tower_id=tower_id,
+                    sample_index=sample_index,
+                    memory=memory,
+                    error_code="nonphysical_temperature",
+                    parameters=parameters,
+                )
+            error_c = measured_temp - parameters.theoretical_temp_c.value
+            wind_speed = _nonnegative_float(row.get("wind_speed"))
+            if wind_speed is None and snapshot is not None:
+                tower_index, time_index = _sample_indices(row, snapshot)
+                if tower_index is not None and time_index is not None:
+                    wind_speed = snapshot.wind_speeds[tower_index][time_index]
+            if wind_speed is None:
+                wind_speed = 0.0
+            threshold = self._threshold(
+                memory,
+                angle_deg=angle,
+                wind_speed=wind_speed,
+                span_m=parameters.span_m.value,
+            )
+            if not np.isfinite([tension, measured_temp, error_c, threshold]).all():
+                raise ValueError("non_finite_formula_result")
+        except Exception as exc:
+            return self._invalid_result(
+                row=row,
+                tower_id=tower_id,
+                sample_index=sample_index,
+                memory=memory,
+                error_code=f"calculation_failed:{type(exc).__name__}",
+                parameters=parameters,
+            )
+
+        original = parameters.original_current_a.value
+        recalculated = parameters.recalculated_current_a.value
+        risk = (
+            measured_temp > parameters.theoretical_temp_c.value
+            and error_c > threshold
+        )
+        factor = 1.0
+        checked = original
+        if risk:
+            try:
+                derating = compute_derating(
+                    ambient_temp_c=parameters.ambient_temp_c.value,
+                    theoretical_temp_c=parameters.theoretical_temp_c.value,
+                    measured_temp_c=measured_temp,
+                    original_current_a=original,
+                    recalculated_current_a=recalculated,
+                )
+            except Exception as exc:
+                return self._invalid_result(
+                    row=row,
+                    tower_id=tower_id,
+                    sample_index=sample_index,
+                    memory=memory,
+                    error_code=f"derating_failed:{type(exc).__name__}",
+                    parameters=parameters,
+                )
+            factor = derating.factor
+            checked = derating.checked_current_a
+            final = checked
+            state = SagState.RISK
+            memory.recovery_count = 0
+        else:
+            recovery_threshold = threshold * self.config.recovery_ratio
+            below_recovery = error_c < recovery_threshold
+            if memory.state is SagState.RISK:
+                if below_recovery:
+                    memory.recovery_count += 1
+                else:
+                    memory.recovery_count = 0
+                if memory.recovery_count >= self.config.recovery_samples:
+                    previous = (
+                        memory.last_output_a
+                        if memory.last_output_a is not None
+                        else original
+                    )
+                    final = (
+                        self.config.recovery_alpha * original
+                        + (1.0 - self.config.recovery_alpha) * previous
+                    )
+                    state = SagState.RECOVERY
+                else:
+                    final = (
+                        memory.last_output_a
+                        if memory.last_output_a is not None
+                        else original
+                    )
+                    state = SagState.RISK
+            elif memory.state is SagState.RECOVERY:
+                previous = (
+                    memory.last_output_a
+                    if memory.last_output_a is not None
+                    else original
+                )
+                if below_recovery:
+                    final = (
+                        self.config.recovery_alpha * original
+                        + (1.0 - self.config.recovery_alpha) * previous
+                    )
+                    if abs(original - final) < self.config.convergence_tolerance_a:
+                        final = original
+                        state = SagState.NORMAL
+                        memory.recovery_count = 0
+                    else:
+                        state = SagState.RECOVERY
+                else:
+                    final = previous
+                    state = SagState.RECOVERY
+            else:
+                final = original
+                state = SagState.NORMAL
+                memory.recovery_count = 0
+
+        if not np.isfinite([factor, checked, final]).all():
+            return self._invalid_result(
+                row=row,
+                tower_id=tower_id,
+                sample_index=sample_index,
+                memory=memory,
+                error_code="non_finite_output",
+                parameters=parameters,
+            )
+        memory.state = state
+        memory.last_output_a = float(final)
+        self._remember_valid(
+            memory,
+            angle_deg=angle,
+            wind_speed=wind_speed,
+            error_c=error_c,
+        )
+        return SagValidationResult(
+            result_id=uuid.uuid4().hex,
+            tower_id=tower_id,
+            timestamp=row.get("timestamp", sample_index),
+            sample_index=sample_index,
+            state=state,
+            angle_deg=angle,
+            horizontal_tension_n=tension,
+            measured_temp_c=measured_temp,
+            theoretical_temp_c=parameters.theoretical_temp_c.value,
+            ambient_temp_c=parameters.ambient_temp_c.value,
+            temperature_error_c=error_c,
+            threshold_c=threshold,
+            derating_factor=factor,
+            original_current_a=original,
+            recalculated_current_a=recalculated,
+            checked_current_a=checked,
+            final_current_a=final,
+            formula_version=self.config.formula_version,
+            parameter_sources=self._parameter_sources(parameters),
+        )
+
+    def validate_batch(
+        self,
+        records,
+        *,
+        snapshot: Optional[SagValidationSnapshot] = None,
+        conductor: Optional[Mapping[str, Any]] = None,
+    ) -> SagValidationBatchResult:
+        if isinstance(records, pd.DataFrame):
+            rows = records.to_dict(orient="records")
+        else:
+            try:
+                rows = [dict(row) for row in records]
+            except (TypeError, ValueError) as exc:
+                raise TypeError("records must contain mapping rows") from exc
+        results = tuple(
+            self._validate_row(
+                row,
+                sample_index=index,
+                snapshot=snapshot,
+                conductor=conductor,
+            )
+            for index, row in enumerate(rows)
+        )
+        return SagValidationBatchResult(
+            rows=results,
+            formula_version=self.config.formula_version,
+            source_run_id=snapshot.source_run_id if snapshot is not None else "",
+        )

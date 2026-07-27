@@ -2197,6 +2197,30 @@ class _SpyThermalAdapter:
         }
 
 
+def test_pipeline_publishes_factored_steady_ratings_and_metadata(tmp_path):
+    result = DlrPipeline(
+        model_root=tmp_path,
+        thermal_adapter=_SpyThermalAdapter(),
+    ).run(
+        physical=_weather("physical"),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=False,
+        conductor=_conductor(),
+    )
+    expected = np.full((2, 2), 800.0)
+
+    np.testing.assert_array_equal(result.max_currents, expected)
+    np.testing.assert_array_equal(
+        result.thermal_result["max_currents"], expected
+    )
+    assert result.thermal_result["safety_factor"] == 0.8
+    legacy = result.to_legacy_line_data()
+    np.testing.assert_array_equal(legacy["max_currents"], expected)
+    assert legacy["safety_factor"] == 0.8
+
+
 def _assert_model_preparation_fallback(result, exception_name):
     assert result.max_currents.shape == (2, 2)
     assert result.model_report.loaded_targets == ()
@@ -2657,6 +2681,20 @@ class _FailingTransientAdapter(_SpyThermalAdapter):
         raise RuntimeError("transient failed")
 
 
+class _SuccessfulTransientAdapter(_SpyThermalAdapter):
+    def calculate_transient_from_long_frame(
+        self, weather, *, base_params, request, steady_result
+    ):
+        return {
+            "max_currents": np.full_like(
+                np.asarray(steady_result["max_currents"], dtype=float),
+                1200.0,
+            ),
+            "window_start_hour": 0.0,
+            "window_end_hour": 1.0,
+        }
+
+
 class _InvalidTransientMetadataAdapter(_SpyThermalAdapter):
     def calculate_transient_from_long_frame(
         self, weather, *, base_params, request, steady_result
@@ -2698,7 +2736,47 @@ def test_transient_failure_falls_back_to_same_steady_result(tmp_path):
         result.thermal_result["transient_result"]["max_currents"],
         result.max_currents,
     )
+    np.testing.assert_array_equal(
+        result.max_currents,
+        np.full((2, 2), 800.0),
+    )
+    assert not np.array_equal(
+        result.max_currents,
+        np.full((2, 2), 640.0),
+    )
     assert result.transient_fallbacks == ("transient_failed:RuntimeError",)
+
+
+def test_successful_transient_ratings_are_factored_once(tmp_path):
+    conductor = _conductor() | {
+        "materials": [
+            {"type": "aluminum", "density": 1.116},
+            {"type": "steel", "density": 0.5126},
+        ]
+    }
+    result = DlrPipeline(
+        model_root=tmp_path,
+        thermal_adapter=_SuccessfulTransientAdapter(),
+    ).run(
+        physical=_weather("physical"),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=False,
+        conductor=conductor,
+        transient_request={"start_hour": 0.0, "end_hour": 1.0},
+    )
+
+    np.testing.assert_array_equal(
+        result.max_currents,
+        np.full((2, 2), 800.0),
+    )
+    np.testing.assert_array_equal(
+        result.thermal_result["transient_result"]["max_currents"],
+        np.full((2, 2), 960.0),
+    )
+    assert result.thermal_result["safety_factor"] == 0.8
+    assert not result.transient_fallbacks
 
 
 def test_invalid_transient_metadata_falls_back_and_uses_steady_input_hash(tmp_path):

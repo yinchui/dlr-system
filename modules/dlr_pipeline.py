@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 from pyproj import CRS
 
-from config.config import DEFAULT_INTERVAL_MINUTES, MODEL_DIR
+from config.config import DEFAULT_INTERVAL_MINUTES, DLR_SAFETY_FACTOR, MODEL_DIR
 from modules.ai_prediction import FeatureBuilder, ResidualPredictor
 from modules.ai_training import (
     ResidualTrainer,
@@ -285,6 +285,13 @@ def _readonly_array(value: Any, *, dtype=None) -> np.ndarray:
     return result
 
 
+def _publish_dlr_currents(values: Any) -> np.ndarray:
+    currents = np.asarray(values, dtype=float)
+    if not np.isfinite(currents).all() or np.any(currents < 0.0):
+        raise ValueError("DLR 额定值必须为有限非负值")
+    return currents * DLR_SAFETY_FACTOR
+
+
 def _freeze_snapshot(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return _readonly_array(value)
@@ -474,6 +481,7 @@ class DlrPipelineResult:
                 "wind_dir_factors": np.ones(expected_shape, dtype=float),
             },
             "max_currents": max_currents,
+            "safety_factor": float(self._thermal_result["safety_factor"]),
             "corrected_winds": corrected_winds,
             "local_temps": local_temps,
             "sunrise": sunrise,
@@ -1764,7 +1772,12 @@ class DlrPipeline:
             base_params=conductor,
         )
         thermal_result = dict(steady_result)
-        max_currents = np.asarray(steady_result["max_currents"], dtype=float)
+        raw_steady_currents = np.asarray(
+            steady_result["max_currents"], dtype=float
+        )
+        max_currents = _publish_dlr_currents(raw_steady_currents)
+        thermal_result["max_currents"] = max_currents.copy()
+        thermal_result["safety_factor"] = DLR_SAFETY_FACTOR
         transient_fallbacks = ()
         input_hash = None
         if transient_request is not None:
@@ -1782,13 +1795,11 @@ class DlrPipeline:
                 transient_currents = np.asarray(
                     transient_result.get("max_currents"), dtype=float
                 )
-                if transient_currents.shape != max_currents.shape:
+                if transient_currents.shape != raw_steady_currents.shape:
                     raise ValueError("暂态载流量维度必须与稳态结果一致")
-                if (
-                    not np.isfinite(transient_currents).all()
-                    or np.any(transient_currents < 0.0)
-                ):
-                    raise ValueError("暂态载流量必须为有限非负值")
+                published_transient_currents = _publish_dlr_currents(
+                    transient_currents
+                )
                 transient_window = {
                     "window_start_hour": transient_result[
                         "window_start_hour"
@@ -1802,7 +1813,7 @@ class DlrPipeline:
                 )
                 validated_transient = dict(transient_result)
                 validated_transient["max_currents"] = (
-                    transient_currents.copy()
+                    published_transient_currents
                 )
                 thermal_result["transient_result"] = validated_transient
             except Exception as exc:

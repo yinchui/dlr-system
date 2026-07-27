@@ -1861,7 +1861,13 @@ class ModelRegistry:
         self,
         candidate: ModelCandidate,
         status: str,
+        *,
+        serialized_model: Optional[bytes] = None,
     ) -> tuple[ModelMetadata, Optional[bool]]:
+        if serialized_model is not None and (
+            not isinstance(serialized_model, bytes) or not serialized_model
+        ):
+            raise ValueError("serialized_model must be non-empty bytes or None")
         key = candidate.key
         target_dir = self._target_dir(key)
         target_parent = target_dir.parent
@@ -1882,11 +1888,14 @@ class ModelRegistry:
         temp_link = target_parent / f".{key.target}.{token}.tmp"
         committed = False
         try:
-            _ensure_private_regular_file(temp_model)
-            joblib.dump(candidate.bundle, temp_model, compress=3)
-            _enforce_private_mode(temp_model, _PRIVATE_FILE_MODE)
-            with temp_model.open("rb") as stream:
-                os.fsync(stream.fileno())
+            if serialized_model is None:
+                _ensure_private_regular_file(temp_model)
+                joblib.dump(candidate.bundle, temp_model, compress=3)
+                _enforce_private_mode(temp_model, _PRIVATE_FILE_MODE)
+                with temp_model.open("rb") as stream:
+                    os.fsync(stream.fileno())
+            else:
+                _write_bytes(temp_model, serialized_model)
             model_checksum = _sha256_path(temp_model)
             active_metadata = replace(
                 candidate.metadata,

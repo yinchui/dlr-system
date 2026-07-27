@@ -1,0 +1,60 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any, Mapping, Optional
+
+from config.config import (
+    MODEL_DIR,
+    SUPABASE_MODEL_SETTING_NAMES,
+    load_supabase_model_config,
+)
+from modules.model_registry import ModelRegistry
+from modules.supabase_model_registry import (
+    SupabaseModelRegistry,
+    SupabaseModelStore,
+)
+
+
+def _runtime_streamlit_secrets() -> Mapping[str, object]:
+    import streamlit as st
+    from streamlit.errors import StreamlitSecretNotFoundError
+
+    try:
+        return {
+            name: st.secrets.get(name)
+            for name in SUPABASE_MODEL_SETTING_NAMES
+        }
+    except StreamlitSecretNotFoundError:
+        return {}
+
+
+def create_model_registry(
+    model_dir: Path | str = MODEL_DIR,
+    *,
+    secrets: Optional[Mapping[str, object]] = None,
+    environ: Optional[Mapping[str, str]] = None,
+    audit_logger: Optional[Any] = None,
+    audit_run_id: Optional[str] = None,
+    audit_result_id: Optional[str] = None,
+) -> ModelRegistry:
+    secret_values = (
+        _runtime_streamlit_secrets() if secrets is None else secrets
+    )
+    config = load_supabase_model_config(
+        secrets=secret_values,
+        environ=os.environ if environ is None else environ,
+    )
+    audit_options = {
+        "audit_logger": audit_logger,
+        "audit_run_id": audit_run_id,
+        "audit_result_id": audit_result_id,
+    }
+    if config is None:
+        return ModelRegistry(model_dir, **audit_options)
+    store = SupabaseModelStore.from_credentials(
+        config.url,
+        config.secret_key,
+        bucket=config.bucket,
+    )
+    return SupabaseModelRegistry(store, **audit_options)

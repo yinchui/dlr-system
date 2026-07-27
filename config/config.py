@@ -1,8 +1,98 @@
 # config/config.py
 import os
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Mapping, Optional
+from urllib.parse import urlsplit
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SUPABASE_MODEL_SETTING_NAMES = (
+    "DLR_SUPABASE_URL",
+    "DLR_SUPABASE_SECRET_KEY",
+    "DLR_SUPABASE_MODEL_BUCKET",
+)
+_SUPABASE_PROJECT_HOST = re.compile(r"^[a-z0-9]{20}\.supabase\.co$")
+
+
+@dataclass(frozen=True)
+class SupabaseModelConfig:
+    url: str
+    secret_key: str = field(repr=False)
+    bucket: str = "dlr-models"
+
+
+def _optional_setting(
+    name: str,
+    *,
+    secrets: Mapping[str, object],
+    environ: Mapping[str, str],
+) -> Optional[str]:
+    value = secrets.get(name)
+    if value is None:
+        value = environ.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    normalized = value.strip()
+    return normalized or None
+
+
+def _validated_supabase_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("Supabase URL is invalid") from None
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or parsed.hostname is None
+        or _SUPABASE_PROJECT_HOST.fullmatch(parsed.hostname) is None
+    ):
+        raise ValueError("Supabase URL must be a root HTTPS project URL")
+    return f"https://{parsed.hostname}"
+
+
+def load_supabase_model_config(
+    *,
+    secrets: Optional[Mapping[str, object]] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Optional[SupabaseModelConfig]:
+    secret_values = secrets or {}
+    environment = os.environ if environ is None else environ
+    url = _optional_setting(
+        "DLR_SUPABASE_URL",
+        secrets=secret_values,
+        environ=environment,
+    )
+    secret_key = _optional_setting(
+        "DLR_SUPABASE_SECRET_KEY",
+        secrets=secret_values,
+        environ=environment,
+    )
+    if url is None and secret_key is None:
+        return None
+    if url is None or secret_key is None:
+        raise ValueError(
+            "DLR_SUPABASE_URL and DLR_SUPABASE_SECRET_KEY must be configured together"
+        )
+    bucket = _optional_setting(
+        "DLR_SUPABASE_MODEL_BUCKET",
+        secrets=secret_values,
+        environ=environment,
+    )
+    return SupabaseModelConfig(
+        url=_validated_supabase_url(url),
+        secret_key=secret_key,
+        bucket=bucket or "dlr-models",
+    )
 
 
 def resolve_runtime_path(env_name, default):

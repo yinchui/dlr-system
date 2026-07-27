@@ -1,3 +1,5 @@
+import pytest
+
 from config import config
 
 
@@ -34,3 +36,80 @@ def test_conductor_catalog_includes_sag_mechanical_defaults():
         assert all(conductor[key] > 0 for key in required_keys)
 
     assert config.STANDARD_CONDUCTORS["ACSR Drake (795 kcmil)"]["area_m2"] > 0
+
+
+def test_supabase_model_config_is_absent_when_url_and_secret_are_absent():
+    assert config.load_supabase_model_config(secrets={}, environ={}) is None
+
+
+def test_supabase_model_config_reads_root_secrets_and_defaults_bucket():
+    secret = "server-secret-value"
+
+    result = config.load_supabase_model_config(
+        secrets={
+            "DLR_SUPABASE_URL": "https://ciapxhuldarsupmvrgwu.supabase.co/",
+            "DLR_SUPABASE_SECRET_KEY": secret,
+        },
+        environ={},
+    )
+
+    assert result.url == "https://ciapxhuldarsupmvrgwu.supabase.co"
+    assert result.secret_key == secret
+    assert result.bucket == "dlr-models"
+    assert secret not in repr(result)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"DLR_SUPABASE_URL": "https://ciapxhuldarsupmvrgwu.supabase.co"},
+        {"DLR_SUPABASE_SECRET_KEY": "server-secret-value"},
+    ],
+)
+def test_supabase_model_config_rejects_partial_credentials(values):
+    with pytest.raises(ValueError, match="must be configured together") as error:
+        config.load_supabase_model_config(secrets=values, environ={})
+
+    assert "server-secret-value" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://ciapxhuldarsupmvrgwu.supabase.co",
+        "https://user:password@ciapxhuldarsupmvrgwu.supabase.co",
+        "https://ciapxhuldarsupmvrgwu.supabase.co:443",
+        "https://ciapxhuldarsupmvrgwu.supabase.co/rest/v1",
+        "https://ciapxhuldarsupmvrgwu.supabase.co?key=value",
+        "https://ciapxhuldarsupmvrgwu.supabase.co#fragment",
+        "https://example.com",
+        "https://bad_ref.supabase.co",
+    ],
+)
+def test_supabase_model_config_rejects_unsafe_or_unexpected_url(url):
+    secret = "server-secret-value"
+
+    with pytest.raises(ValueError, match="Supabase URL") as error:
+        config.load_supabase_model_config(
+            secrets={
+                "DLR_SUPABASE_URL": url,
+                "DLR_SUPABASE_SECRET_KEY": secret,
+            },
+            environ={},
+        )
+
+    assert secret not in str(error.value)
+
+
+def test_supabase_model_config_uses_environment_when_secrets_are_absent():
+    result = config.load_supabase_model_config(
+        secrets={},
+        environ={
+            "DLR_SUPABASE_URL": "https://ciapxhuldarsupmvrgwu.supabase.co",
+            "DLR_SUPABASE_SECRET_KEY": "environment-secret",
+            "DLR_SUPABASE_MODEL_BUCKET": "private-models",
+        },
+    )
+
+    assert result.bucket == "private-models"
+    assert result.secret_key == "environment-secret"

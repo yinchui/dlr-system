@@ -392,4 +392,4 @@ def test_streamlit_pipeline_enables_runtime_model_auditing():
     )
 
     assert "JsonAuditLogger(AUDIT_LOG_DIR)" in app_source
-    assert "ModelRegistry(" in app_source
+    assert "create_model_registry(" in app_source

@@ -19,7 +19,7 @@ from modules.dlr_pipeline import (
     derive_line_identity,
     publish_dlr_currents,
 )
-from modules.model_registry import ModelRegistry
+from modules.model_registry_factory import create_model_registry
 from modules.sag_validation import publish_sag_snapshot
 from modules import terrain as terrain_module
 from modules.weather_correction import CorrectionOptions, WeatherCorrectionService
@@ -708,8 +708,8 @@ with tab_line:
             status_text.text("正在修正气象并进行热平衡计算...")
             dlr_run_id = uuid.uuid4().hex
             pipeline = DlrPipeline(
-                registry=ModelRegistry(
-                    MODEL_DIR,
+                registry=create_model_registry(
+                    model_dir=MODEL_DIR,
                     audit_logger=JsonAuditLogger(AUDIT_LOG_DIR),
                     audit_run_id=dlr_run_id,
                     audit_result_id=dlr_run_id,

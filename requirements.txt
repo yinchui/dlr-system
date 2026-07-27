@@ -1,6 +1,7 @@
 streamlit>=1.60,<2
 numpy
 pandas
+pytz>=2024.1,<2027
 plotly
 openpyxl
 Pillow

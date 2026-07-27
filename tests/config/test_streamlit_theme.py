@@ -21,3 +21,14 @@ def test_requirements_declare_streamlit_version_for_current_page_api():
     }
 
     assert "streamlit>=1.60,<2" in requirements
+
+
+def test_requirements_declare_pytz_for_direct_runtime_import():
+    requirements_path = Path(__file__).resolve().parents[2] / "requirements.txt"
+    requirements = {
+        line.strip()
+        for line in requirements_path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+
+    assert "pytz>=2024.1,<2027" in requirements

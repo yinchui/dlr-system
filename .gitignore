@@ -4,6 +4,10 @@ __pycache__/
 .venv/
 .idea/
 .claude/
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
 *.pyc
 nul
 data/

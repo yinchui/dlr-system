@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 import modules.sag_validation as sag_validation_module
+from modules.dlr_pipeline import DlrPipeline
 from modules.sag_validation import (
     build_visible_sag_result,
     publish_sag_snapshot,
@@ -16,6 +17,48 @@ from modules.sag_validation import (
 )
 from tests.fixtures.sag_data import drake_conductor, make_line_data
 from utils.audit_log import JsonAuditLogger
+
+
+class _FixedCurrentThermalAdapter:
+    def __init__(self):
+        self.raw_currents = None
+
+    def calculate_from_long_frame(self, weather, *, base_params):
+        shape = (
+            weather["tower_id"].nunique(),
+            weather["timestamp"].nunique(),
+        )
+        self.raw_currents = np.full(shape, 1000.0)
+        return {
+            "max_currents": self.raw_currents.copy(),
+            "corrected_winds": np.ones(shape),
+            "local_temps": np.full(shape, 25.0),
+        }
+
+
+def _minimal_pipeline_weather():
+    timestamps = pd.to_datetime(
+        [
+            "2026-07-23 00:00",
+            "2026-07-23 00:30",
+            "2026-07-23 00:00",
+            "2026-07-23 00:30",
+        ]
+    ).tz_localize("Asia/Shanghai")
+    return pd.DataFrame(
+        {
+            "tower_id": ["001", "001", "002", "002"],
+            "timestamp": timestamps,
+            "ambient_temp": [25.0, 26.0, 24.0, 25.0],
+            "wind_speed": [2.0, 2.5, 3.0, 3.5],
+            "wind_direction": [90.0, 100.0, 110.0, 120.0],
+            "solar_radiation": [0.0, 10.0, 0.0, 20.0],
+            "humidity": [30.0, 31.0, 32.0, 33.0],
+            "elevation": [1000.0, 1000.0, 1010.0, 1010.0],
+            "dataset_role": ["physical"] * 4,
+            "source_file_hash": ["sag-bridge-weather"] * 4,
+        }
+    )
 
 
 def _angle_only_frame():
@@ -26,6 +69,38 @@ def _empty_xlsx_bytes():
     buffer = BytesIO()
     pd.DataFrame(columns=["倾角"]).to_excel(buffer, index=False)
     return buffer.getvalue()
+
+
+def test_sag_snapshot_receives_only_factored_pipeline_ratings(tmp_path):
+    adapter = _FixedCurrentThermalAdapter()
+    conductor = drake_conductor()
+    result = DlrPipeline(
+        model_root=tmp_path,
+        thermal_adapter=adapter,
+    ).run(
+        physical=_minimal_pipeline_weather(),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=False,
+        conductor=conductor,
+    )
+    legacy = result.to_legacy_line_data()
+    snapshot = publish_sag_snapshot(
+        {},
+        legacy,
+        conductor,
+        source_run_id="dlr-factored-run",
+        line_id="line-a",
+    )
+    raw = np.full((2, 2), 1000.0)
+    expected = np.full((2, 2), 800.0)
+
+    np.testing.assert_array_equal(adapter.raw_currents, raw)
+    np.testing.assert_array_equal(snapshot.original_currents, expected)
+
+    legacy["max_currents"][:] = 0.0
+    np.testing.assert_array_equal(snapshot.original_currents, expected)
 
 
 def test_completed_dlr_publishes_deep_copied_sag_snapshot(tmp_path):

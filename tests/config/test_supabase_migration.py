@@ -142,6 +142,12 @@ def test_activation_rpc_has_fixed_signature_and_security_boundary():
         r"\s+from\s+public\s*;",
         sql,
     )
+    for role in ("anon", "authenticated"):
+        assert re.search(
+            rf"revoke\s+all\s+on\s+function\s+{function_identity}"
+            rf"\s+from\s+{role}\s*;",
+            sql,
+        )
     assert re.search(
         rf"grant\s+execute\s+on\s+function\s+{function_identity}"
         r"\s+to\s+service_role\s*;",

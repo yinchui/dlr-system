@@ -217,6 +217,34 @@ revoke all on function public.activate_dlr_model_generation(
     uuid
 ) from public;
 
+revoke all on function public.activate_dlr_model_generation(
+    uuid,
+    text,
+    text,
+    text,
+    text,
+    text,
+    text,
+    text,
+    jsonb,
+    text,
+    uuid
+) from anon;
+
+revoke all on function public.activate_dlr_model_generation(
+    uuid,
+    text,
+    text,
+    text,
+    text,
+    text,
+    text,
+    text,
+    jsonb,
+    text,
+    uuid
+) from authenticated;
+
 grant execute on function public.activate_dlr_model_generation(
     uuid,
     text,

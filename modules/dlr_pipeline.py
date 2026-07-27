@@ -285,7 +285,7 @@ def _readonly_array(value: Any, *, dtype=None) -> np.ndarray:
     return result
 
 
-def _publish_dlr_currents(values: Any) -> np.ndarray:
+def publish_dlr_currents(values: Any) -> np.ndarray:
     currents = np.asarray(values, dtype=float)
     if not np.isfinite(currents).all() or np.any(currents < 0.0):
         raise ValueError("DLR 额定值必须为有限非负值")
@@ -1775,7 +1775,7 @@ class DlrPipeline:
         raw_steady_currents = np.asarray(
             steady_result["max_currents"], dtype=float
         )
-        max_currents = _publish_dlr_currents(raw_steady_currents)
+        max_currents = publish_dlr_currents(raw_steady_currents)
         thermal_result["max_currents"] = max_currents.copy()
         thermal_result["safety_factor"] = DLR_SAFETY_FACTOR
         transient_fallbacks = ()
@@ -1797,7 +1797,7 @@ class DlrPipeline:
                 )
                 if transient_currents.shape != raw_steady_currents.shape:
                     raise ValueError("暂态载流量维度必须与稳态结果一致")
-                published_transient_currents = _publish_dlr_currents(
+                published_transient_currents = publish_dlr_currents(
                     transient_currents
                 )
                 transient_window = {

@@ -2221,6 +2221,19 @@ def test_pipeline_publishes_factored_steady_ratings_and_metadata(tmp_path):
     assert legacy["safety_factor"] == 0.8
 
 
+@pytest.mark.parametrize(
+    "invalid_currents",
+    (
+        np.asarray([np.nan]),
+        np.asarray([np.inf]),
+        np.asarray([-1.0]),
+    ),
+)
+def test_dlr_publication_rejects_invalid_currents(invalid_currents):
+    with pytest.raises(ValueError, match="有限非负值"):
+        dlr_pipeline_module.publish_dlr_currents(invalid_currents)
+
+
 def _assert_model_preparation_fallback(result, exception_name):
     assert result.max_currents.shape == (2, 2)
     assert result.model_report.loaded_targets == ()

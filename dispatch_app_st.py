@@ -7,9 +7,18 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
 from thermal_functions import ThermalCalculator, EnvironmentGenerator, LineAnalyzer
-from config.config import AUDIT_LOG_DIR, MODEL_DIR, STANDARD_CONDUCTORS
+from config.config import (
+    AUDIT_LOG_DIR,
+    DLR_SAFETY_FACTOR,
+    MODEL_DIR,
+    STANDARD_CONDUCTORS,
+)
 from modules.data_processor import normalize_weather_input_dataframe
-from modules.dlr_pipeline import DlrPipeline, derive_line_identity
+from modules.dlr_pipeline import (
+    DlrPipeline,
+    derive_line_identity,
+    publish_dlr_currents,
+)
 from modules.model_registry import ModelRegistry
 from modules.sag_validation import publish_sag_snapshot
 from modules import terrain as terrain_module
@@ -438,7 +447,10 @@ def calculate_legacy_line_data(
         base_params=conductor_params,
         terrain_data=None,
     )
-    line_data['max_currents'] = calc_results['max_currents']
+    line_data['max_currents'] = publish_dlr_currents(
+        calc_results['max_currents']
+    )
+    line_data['safety_factor'] = DLR_SAFETY_FACTOR
     line_data['corrected_winds'] = calc_results['corrected_winds']
     line_data['local_temps'] = calc_results['local_temps']
     return line_data

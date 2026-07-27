@@ -100,6 +100,32 @@ def test_migration_creates_registry_tables_with_scope_and_constraints():
     )
 
 
+def test_jsonb_integrity_constraints_are_replayable_and_fail_closed():
+    sql = _normalized_sql()
+
+    assert (
+        "alter table public.dlr_model_generations drop constraint if exists "
+        "dlr_model_generations_metadata_check;"
+    ) in sql
+    assert (
+        "alter table public.dlr_model_rejections drop constraint if exists "
+        "dlr_model_rejections_attempt_check;"
+    ) in sql
+    assert re.search(
+        r"add constraint dlr_model_generations_metadata_check check \(\(.*?"
+        r"metadata \?& array\[.*?'project_id'.*?'line_id'.*?'tower_id'.*?"
+        r"'target'.*?'model_version'.*?'checksum'.*?'status'.*?\].*?"
+        r"\) is true\);",
+        sql,
+    )
+    assert re.search(
+        r"add constraint dlr_model_rejections_attempt_check check \(\(.*?"
+        r"attempt \?& array\[.*?'project_id'.*?'line_id'.*?'tower_id'.*?"
+        r"'target'.*?\].*?\) is true\);",
+        sql,
+    )
+
+
 def test_migration_enables_rls_without_client_policies():
     sql = _normalized_sql()
 

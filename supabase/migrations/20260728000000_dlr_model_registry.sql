@@ -31,18 +31,7 @@ create table if not exists public.dlr_model_generations (
     constraint dlr_model_generations_status_check
         check (status in ('active_provisional', 'active')),
     constraint dlr_model_generations_checksum_check
-        check (model_checksum ~ '^[0-9a-f]{64}$'),
-    constraint dlr_model_generations_metadata_check
-        check (
-            jsonb_typeof(metadata) = 'object'
-            and metadata ->> 'project_id' = project_id
-            and metadata ->> 'line_id' = line_id
-            and metadata ->> 'tower_id' = tower_id
-            and metadata ->> 'target' = target
-            and metadata ->> 'model_version' = model_version
-            and metadata ->> 'checksum' = model_checksum
-            and metadata ->> 'status' = status
-        )
+        check (model_checksum ~ '^[0-9a-f]{64}$')
 );
 
 create table if not exists public.dlr_model_heads (
@@ -92,16 +81,50 @@ create table if not exists public.dlr_model_rejections (
             or champion_context_hash ~ '^[0-9a-f]{64}$'
         ),
     constraint dlr_model_rejections_reason_check
-        check (length(btrim(reason)) > 0),
-    constraint dlr_model_rejections_attempt_check
-        check (
-            jsonb_typeof(attempt) = 'object'
-            and attempt ->> 'project_id' = project_id
-            and attempt ->> 'line_id' = line_id
-            and attempt ->> 'tower_id' = tower_id
-            and attempt ->> 'target' = target
-        )
+        check (length(btrim(reason)) > 0)
 );
+
+alter table public.dlr_model_generations
+    drop constraint if exists dlr_model_generations_metadata_check;
+alter table public.dlr_model_generations
+    add constraint dlr_model_generations_metadata_check
+    check ((
+        jsonb_typeof(metadata) = 'object'
+        and metadata ?& array[
+            'project_id',
+            'line_id',
+            'tower_id',
+            'target',
+            'model_version',
+            'checksum',
+            'status'
+        ]
+        and metadata ->> 'project_id' = project_id
+        and metadata ->> 'line_id' = line_id
+        and metadata ->> 'tower_id' = tower_id
+        and metadata ->> 'target' = target
+        and metadata ->> 'model_version' = model_version
+        and metadata ->> 'checksum' = model_checksum
+        and metadata ->> 'status' = status
+    ) is true);
+
+alter table public.dlr_model_rejections
+    drop constraint if exists dlr_model_rejections_attempt_check;
+alter table public.dlr_model_rejections
+    add constraint dlr_model_rejections_attempt_check
+    check ((
+        jsonb_typeof(attempt) = 'object'
+        and attempt ?& array[
+            'project_id',
+            'line_id',
+            'tower_id',
+            'target'
+        ]
+        and attempt ->> 'project_id' = project_id
+        and attempt ->> 'line_id' = line_id
+        and attempt ->> 'tower_id' = tower_id
+        and attempt ->> 'target' = target
+    ) is true);
 
 alter table public.dlr_model_generations enable row level security;
 alter table public.dlr_model_heads enable row level security;

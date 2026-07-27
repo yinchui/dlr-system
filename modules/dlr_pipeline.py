@@ -1025,6 +1025,23 @@ def derive_line_id(
     return derive_line_identity(weather, tower_coords=tower_coords).line_id
 
 
+def _begin_registry_pipeline_run(registry: Any) -> None:
+    begin = getattr(registry, "begin_pipeline_run", None)
+    if callable(begin):
+        begin()
+
+
+def _end_registry_pipeline_run(registry: Any) -> None:
+    end = getattr(registry, "end_pipeline_run", None)
+    if callable(end):
+        end()
+
+
+def _registry_model_operations_available(registry: Any) -> bool:
+    available = getattr(registry, "model_operations_available", None)
+    return True if not callable(available) else bool(available())
+
+
 class DlrPipeline:
     def __init__(
         self,
@@ -1347,6 +1364,7 @@ class DlrPipeline:
         compatibility = None
         keys = []
         registry = None
+        registry_run = None
         loaded = {}
         loaded_targets = []
         trained_targets = []
@@ -1405,6 +1423,8 @@ class DlrPipeline:
                             )
                         )
                         registry = self._registry_for_ai()
+                        registry_run = registry
+                        _begin_registry_pipeline_run(registry)
                         loaded = registry.load_many(
                             keys,
                             expected_compatibility={
@@ -1473,6 +1493,12 @@ class DlrPipeline:
             if aligned is not None:
                 matched = aligned.loc[aligned["truth_timestamp"].notna()].copy()
                 for key in keys:
+                    if (
+                        model_persistence_allowed
+                        and registry is not None
+                        and not _registry_model_operations_available(registry)
+                    ):
+                        break
                     load_result = loaded.get(key)
                     loaded_provisional = (
                         load_result is not None
@@ -1556,7 +1582,10 @@ class DlrPipeline:
                                     else None
                                 ),
                             )
-                            if registry.was_rejected(attempt):
+                            was_rejected = registry.was_rejected(attempt)
+                            if not _registry_model_operations_available(registry):
+                                break
+                            if was_rejected:
                                 continue
                             if loaded_provisional and (
                                 preparation.input_data_hash
@@ -1653,6 +1682,9 @@ class DlrPipeline:
                                     f"training_failed:{type(exc).__name__}",
                                 )
                             )
+
+        if registry_run is not None:
+            _end_registry_pipeline_run(registry_run)
 
         prediction = terrain_corrected.copy(deep=True)
         for target in _TARGETS:

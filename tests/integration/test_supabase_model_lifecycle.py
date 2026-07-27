@@ -151,6 +151,10 @@ class _MemoryStore:
         artifact: bytes,
     ) -> str:
         self.events.append("upload")
+        if self.activation_mode == "upload_transport_error":
+            raise supabase_registry_module.SupabaseTransportError(
+                "storage unavailable"
+            )
         if self.activation_mode == "upload_error":
             raise OSError("storage unavailable")
         path = (
@@ -180,6 +184,10 @@ class _MemoryStore:
             return False
         if self.activation_mode == "activation_error":
             raise OSError("rpc unavailable")
+        if self.activation_mode == "activation_transport_error":
+            raise supabase_registry_module.SupabaseTransportError(
+                "rpc unavailable"
+            )
         generation = RemoteGeneration(
             generation_id=generation_id,
             key=key,
@@ -365,6 +373,72 @@ def test_transport_failure_aborts_only_the_current_load_many_call(tmp_path):
 
     assert store.current_calls == 2
     assert retried.fallback_reason == "model_not_found"
+
+
+def test_pipeline_run_circuit_blocks_follow_up_remote_reads(tmp_path):
+    store = _FirstTransportFailureStore()
+    registry = SupabaseModelRegistry(store, cache_dir=tmp_path)
+    keys = [
+        ModelKey("project-a", "line-a", tower_id, "wind_speed")
+        for tower_id in ("001", "002", "003")
+    ]
+
+    registry.begin_pipeline_run()
+    results = registry.load_many(
+        keys,
+        expected_compatibility={key: _compatibility() for key in keys},
+        expected_training_contract_hash={key: CONTRACT_HASH for key in keys},
+        expected_backend_id={key: BACKEND_ID for key in keys},
+    )
+    rejected = registry.was_rejected(_attempt(registry, _candidate(keys[0])))
+
+    assert store.current_calls == 1
+    assert registry.model_operations_available() is False
+    assert rejected is False
+    assert {
+        result.fallback_reason for result in results.values()
+    } == {"load_failed:SupabaseTransportError"}
+
+    registry.end_pipeline_run()
+    retried = _load(registry, keys[0])
+
+    assert store.current_calls == 2
+    assert retried.fallback_reason == "model_not_found"
+
+
+def test_transport_upload_failure_opens_pipeline_run_circuit(tmp_path):
+    store = _MemoryStore()
+    store.activation_mode = "upload_transport_error"
+    registry = SupabaseModelRegistry(store, cache_dir=tmp_path)
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    registry.begin_pipeline_run()
+    decision = registry.promote(_candidate(key))
+
+    assert decision.promoted is False
+    assert decision.reason == "remote_upload_failed"
+    assert registry.model_operations_available() is False
+    assert store.events.count("upload") == 1
+
+    registry.end_pipeline_run()
+    assert registry.model_operations_available() is True
+
+
+def test_uncommitted_activation_transport_failure_opens_run_circuit(tmp_path):
+    store = _MemoryStore()
+    store.activation_mode = "activation_transport_error"
+    registry = SupabaseModelRegistry(store, cache_dir=tmp_path)
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+
+    registry.begin_pipeline_run()
+    decision = registry.promote(_candidate(key))
+
+    assert decision.promoted is False
+    assert decision.reason == "remote_activation_failed"
+    assert registry.model_operations_available() is False
+    assert store.events.count("activate") == 1
+
+    registry.end_pipeline_run()
 
 
 def test_missing_remote_object_is_isolated_to_its_key(tmp_path):

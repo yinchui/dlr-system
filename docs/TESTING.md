@@ -136,6 +136,14 @@ python3 -m pytest \
 
 可选字段为 `杆塔`/`tower_id` 和 `时间`/`timestamp`。机械默认参数只用于后台保守计算，不得在测试或界面中当作实测值。
 
+## Supabase 模型持久化
+
+- Storage generation 上传必须使用 `upsert=false`，相同 UUID 不能覆盖已激活对象；
+- migration 必须可在已部署项目重放，并让 metadata/attempt 缺失 JSONB 必填键时约束明确返回 false；
+- 响应损坏、checksum 错误和单对象 404 继续按 key 隔离；
+- 明确传输故障在一次 DLR 运行内只允许首次远端尝试，后续训练/写入停止并回退物理气象；
+- 运行结束后熔断复位，下一次独立 DLR 运行必须重新尝试远端。
+
 ## 浏览器验收
 
 启动服务：

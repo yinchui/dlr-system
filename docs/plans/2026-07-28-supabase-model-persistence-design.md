@@ -97,11 +97,17 @@ dlr-models
 - RPC 成功前不向 pipeline 报告晋级成功；
 - 单次运行内缓存已下载 generation，避免重复请求。
 
-`DlrPipeline` 的 registry 协议不变，仍调用：
+`DlrPipeline` 保留原有模型操作，并在其外增加可选运行边界和可用性查询：
 
 ```text
-load_many -> build_attempt -> was_rejected -> promote -> load
+begin_pipeline_run
+  -> load_many -> model_operations_available
+  -> build_attempt -> was_rejected -> model_operations_available
+  -> promote -> load
+end_pipeline_run
 ```
+
+普通本地 `ModelRegistry` 不实现这些可选钩子，行为不变；Supabase registry 用运行边界限制传输故障的影响范围。
 
 ## 6. 发布与并发
 
@@ -109,7 +115,7 @@ load_many -> build_attempt -> was_rejected -> promote -> load
 
 1. 读取当前远端 head，记录 expected generation UUID。
 2. 使用现有 `ModelRegistry` 在临时目录重新校验候选和 champion，并做晋级决策。
-3. 将本地已校验的 active artifact 上传到新的不可变 Storage path。
+3. 将本地已校验的 active artifact 以 `upsert=false` 上传到新的不可变 Storage path。
 4. 调用 `activate_dlr_model_generation` RPC。
 5. RPC 在事务内锁定 scope head，核对 expected generation，插入 generation 并切换 head。
 6. CAS 冲突时本次晋级返回 `remote_head_conflict`，不覆盖另一个运行刚发布的模型。
@@ -135,6 +141,8 @@ CAS 失败可能留下不可见 orphan 对象，但不会被应用加载；后�
 ## 8. 故障处理
 
 - Supabase 查询或下载失败：抛出操作性 I/O 错误，由 pipeline 对应 key 回退物理气象。
+- 一次 DLR 运行内首个明确传输故障打开运行级熔断，停止后续远端模型 I/O 和训练发布；运行结束后复位，下一次运行重新探测。
+- 响应合同损坏、checksum 错误和 Storage 单对象 404 不打开熔断，仍按模型 key 隔离。
 - 远端没有 head：返回 `model_not_found`；有真实值时按原流程训练。
 - Storage 上传失败：远端 head 不改变，本地候选不作为本次 AI 来源。
 - RPC CAS 冲突：返回 `remote_head_conflict`，保留远端胜出版本。
@@ -161,6 +169,7 @@ SQL RPC 固定 `search_path`，仅授予 `service_role` 执行权限。
 - 用内存 fake store 覆盖首次发布、重启后加载、拒绝缓存和 CAS 冲突。
 - 用真实 joblib 字节验证 checksum、metadata scope 和损坏隔离。
 - 验证远端失败不激活候选，物理 DLR 仍可输出。
+- 验证读侧和写侧传输故障在同一次 DLR 运行内不会按模型数量放大，下一次运行仍会重试。
 - 验证配置工厂在完整 secrets 时选择 Supabase，缺一项时报错，均缺失时本地回退。
 - 保留全部现有 `ModelRegistry`、XGBoost 生命周期、DLR 和弧垂测试。
 - 在真实 Supabase 项目执行一个最小 round trip，确认表、bucket、上传、下载和 head 查询。

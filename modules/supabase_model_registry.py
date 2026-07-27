@@ -316,7 +316,7 @@ class SupabaseModelStore:
                 artifact,
                 file_options={
                     "content-type": "application/octet-stream",
-                    "upsert": "true",
+                    "upsert": "false",
                 },
             )
         except Exception:
@@ -460,6 +460,8 @@ class SupabaseModelRegistry(ModelRegistry):
         self._remote_generation_ids: dict[ModelKey, Optional[str]] = {}
         self._hydrated_generation_ids: dict[ModelKey, str] = {}
         self._hydrated_local_generations: dict[ModelKey, Path] = {}
+        self._pipeline_run_active = False
+        self._pipeline_transport_failed = False
         super().__init__(
             cache_dir,
             min_mae_improvement=min_mae_improvement,
@@ -473,6 +475,34 @@ class SupabaseModelRegistry(ModelRegistry):
 
     def _load_many_should_abort(self, exc: Exception) -> bool:
         return isinstance(exc, SupabaseTransportError)
+
+    def begin_pipeline_run(self) -> None:
+        self._pipeline_run_active = True
+        self._pipeline_transport_failed = False
+
+    def end_pipeline_run(self) -> None:
+        self._pipeline_run_active = False
+        self._pipeline_transport_failed = False
+
+    def model_operations_available(self) -> bool:
+        return not (
+            self._pipeline_run_active and self._pipeline_transport_failed
+        )
+
+    def _trip_pipeline_transport_circuit(self) -> None:
+        if self._pipeline_run_active:
+            self._pipeline_transport_failed = True
+
+    def _remote_call(self, operation: Callable[[], Any]) -> Any:
+        if not self.model_operations_available():
+            raise SupabaseTransportError(
+                "Supabase model transport circuit is open"
+            )
+        try:
+            return operation()
+        except SupabaseTransportError:
+            self._trip_pipeline_transport_circuit()
+            raise
 
     def _cached_generation_is_current(
         self,
@@ -503,7 +533,7 @@ class SupabaseModelRegistry(ModelRegistry):
     def _hydrate_current_locked(
         self, key: ModelKey
     ) -> Optional[RemoteGeneration]:
-        remote = self.store.current(key)
+        remote = self._remote_call(lambda: self.store.current(key))
         if remote is not None and not isinstance(remote, RemoteGeneration):
             raise OSError("invalid Supabase model current generation")
         self._remote_generation_ids[key] = (
@@ -516,7 +546,7 @@ class SupabaseModelRegistry(ModelRegistry):
         if self._cached_generation_is_current(key, remote):
             return remote
 
-        artifact = self.store.download(remote)
+        artifact = self._remote_call(lambda: self.store.download(remote))
         try:
             bundle = joblib.load(io.BytesIO(artifact))
         except Exception:
@@ -591,7 +621,9 @@ class SupabaseModelRegistry(ModelRegistry):
                     attempt,
                     champion_context_hash=self._champion_context_hash(champion),
                 )
-                return self.store.was_rejected(current_attempt)
+                return self._remote_call(
+                    lambda: self.store.was_rejected(current_attempt)
+                )
         except Exception:
             return False
 
@@ -602,7 +634,7 @@ class SupabaseModelRegistry(ModelRegistry):
     ) -> None:
         if reason not in _DETERMINISTIC_REJECTION_REASONS:
             raise ValueError("only deterministic rejections may be persisted")
-        self.store.record_rejection(attempt, reason)
+        self._remote_call(lambda: self.store.record_rejection(attempt, reason))
 
     @staticmethod
     def _remote_failure(
@@ -665,6 +697,12 @@ class SupabaseModelRegistry(ModelRegistry):
         reason: str,
         champion: Optional[ModelMetadata] = None,
     ) -> PromotionDecision:
+        if not self.model_operations_available():
+            return PromotionDecision(
+                False,
+                "remote_transport_unavailable",
+                champion,
+            )
         if candidate.key not in self._remote_generation_ids:
             return PromotionDecision(False, "remote_state_unavailable", champion)
         expected_generation_id = self._remote_generation_ids[candidate.key]
@@ -683,10 +721,12 @@ class SupabaseModelRegistry(ModelRegistry):
 
         generation_id = str(uuid.uuid4())
         try:
-            storage_path = self.store.upload(
-                generation_id,
-                candidate.key,
-                artifact,
+            storage_path = self._remote_call(
+                lambda: self.store.upload(
+                    generation_id,
+                    candidate.key,
+                    artifact,
+                )
             )
         except OSError:
             return self._remote_failure(
@@ -701,9 +741,33 @@ class SupabaseModelRegistry(ModelRegistry):
                 storage_path,
                 expected_generation_id=expected_generation_id,
             )
-        except OSError:
+        except SupabaseTransportError:
             try:
                 reconciled = self.store.current(candidate.key)
+            except SupabaseTransportError:
+                self._trip_pipeline_transport_circuit()
+                reconciled = None
+            except OSError:
+                reconciled = None
+            if (
+                isinstance(reconciled, RemoteGeneration)
+                and reconciled.generation_id == generation_id
+                and reconciled.key == candidate.key
+                and reconciled.storage_path == storage_path
+                and reconciled.model_checksum == staged.metadata.checksum
+                and reconciled.metadata == staged.metadata
+            ):
+                activated = True
+            else:
+                self._trip_pipeline_transport_circuit()
+                return self._remote_failure(
+                    "remote_activation_failed", champion, remote_decision
+                )
+        except OSError:
+            try:
+                reconciled = self._remote_call(
+                    lambda: self.store.current(candidate.key)
+                )
             except OSError:
                 reconciled = None
             if (

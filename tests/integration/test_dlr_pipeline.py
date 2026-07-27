@@ -1396,6 +1396,51 @@ class _ContractCaptureRegistry:
         }
 
 
+class _UnavailableRunRegistry(_ContractCaptureRegistry):
+    def __init__(self):
+        super().__init__()
+        self.run_events = []
+
+    def begin_pipeline_run(self):
+        self.run_events.append("begin")
+
+    def end_pipeline_run(self):
+        self.run_events.append("end")
+
+    @staticmethod
+    def model_operations_available():
+        return False
+
+    @staticmethod
+    def was_rejected(*_args, **_kwargs):
+        raise AssertionError("training must stop after the registry circuit opens")
+
+    @staticmethod
+    def promote(*_args, **_kwargs):
+        raise AssertionError("promotion must stop after the registry circuit opens")
+
+
+def test_pipeline_skips_training_after_registry_run_circuit_opens(tmp_path):
+    registry = _UnavailableRunRegistry()
+
+    result = DlrPipeline(model_root=tmp_path, registry=registry).run(
+        physical=_weather("physical"),
+        truth=_weather("truth"),
+        project_id="project-a",
+        line_id="line-a",
+        interval_minutes=60,
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    assert registry.run_events == ["begin", "end"]
+    assert result.model_report.trained_targets == ()
+    assert result.model_report.used_targets == ()
+    assert result.max_currents.size > 0
+    assert np.isfinite(result.max_currents).all()
+
+
 def test_pipeline_loads_with_target_scoped_sealed_contracts(tmp_path):
     registry = _ContractCaptureRegistry()
 

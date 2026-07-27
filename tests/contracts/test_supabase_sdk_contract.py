@@ -175,7 +175,7 @@ def test_real_sdk_builders_accept_all_production_call_shapes_without_io():
         b"sealed model",
         file_options={
             "content-type": "application/octet-stream",
-            "upsert": "true",
+            "upsert": "false",
         },
     )
     inspect.signature(bucket.download).bind(path)

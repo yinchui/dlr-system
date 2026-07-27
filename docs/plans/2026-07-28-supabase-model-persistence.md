@@ -123,7 +123,7 @@ Using a fake Supabase SDK client, verify:
 - table responses are validated rather than trusted;
 - metadata scope must match the requested key;
 - Storage download SHA-256 must match both row and metadata;
-- upload uses immutable UUID paths, binary content type, and idempotent overwrite only for that UUID path;
+- upload uses immutable UUID paths, binary content type, and `upsert=false` so a reused UUID cannot overwrite an activated object;
 - RPC receives the expected head and complete metadata;
 - SDK exceptions are translated to `OSError` without including secret values;
 - rejection lookup and upsert use the complete scope and fingerprint.

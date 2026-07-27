@@ -472,7 +472,7 @@ def test_store_uploads_to_immutable_binary_generation_path():
         {
             "file_options": {
                 "content-type": "application/octet-stream",
-                "upsert": "true",
+                "upsert": "false",
             }
         },
     )
@@ -509,7 +509,7 @@ def test_store_uses_distinct_paths_for_distinct_generation_uuids():
             {
                 "file_options": {
                     "content-type": "application/octet-stream",
-                    "upsert": "true",
+                    "upsert": "false",
                 }
             },
         ),
@@ -521,7 +521,7 @@ def test_store_uses_distinct_paths_for_distinct_generation_uuids():
             {
                 "file_options": {
                     "content-type": "application/octet-stream",
-                    "upsert": "true",
+                    "upsert": "false",
                 }
             },
         ),

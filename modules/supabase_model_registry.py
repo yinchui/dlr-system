@@ -253,7 +253,7 @@ class SupabaseModelStore:
         if not isinstance(artifact, bytes) or not artifact:
             raise ValueError("artifact must be non-empty bytes")
         try:
-            self._client.storage.from_(self.bucket).upload(
+            response = self._client.storage.from_(self.bucket).upload(
                 path,
                 artifact,
                 file_options={
@@ -263,6 +263,16 @@ class SupabaseModelStore:
             )
         except Exception:
             raise OSError("Supabase model upload failed") from None
+        try:
+            response_path = (
+                response.get("path")
+                if isinstance(response, Mapping)
+                else getattr(response, "path")
+            )
+        except Exception:
+            raise OSError("invalid Supabase model upload response") from None
+        if response_path != path:
+            raise OSError("invalid Supabase model upload response")
         return path
 
     def activate(
@@ -550,6 +560,40 @@ class SupabaseModelRegistry(ModelRegistry):
         self._hydrated_generation_ids[key] = generation_id
         self._hydrated_local_generations[key] = active_path
 
+    def _serialize_remote_candidate(
+        self,
+        candidate: ModelCandidate,
+        *,
+        status: str,
+    ) -> tuple[ModelCandidate, bytes]:
+        buffer = io.BytesIO()
+        joblib.dump(candidate.bundle, buffer, compress=3)
+        artifact = buffer.getvalue()
+        if not artifact:
+            raise ValueError("serialized candidate is empty")
+        metadata = replace(
+            candidate.metadata,
+            checksum=hashlib.sha256(artifact).hexdigest(),
+            status=status,
+        )
+        bundle = joblib.load(io.BytesIO(artifact))
+        staged = ModelCandidate(
+            key=candidate.key,
+            bundle=bundle,
+            metadata=metadata,
+        )
+        self._validate_promotion_contract(staged, None)
+        return staged, artifact
+
+    def _mark_remote_activation_for_hydration(
+        self,
+        key: ModelKey,
+        generation_id: str,
+    ) -> None:
+        self._remote_generation_ids[key] = generation_id
+        self._hydrated_generation_ids.pop(key, None)
+        self._hydrated_local_generations.pop(key, None)
+
     def _publish_decision(
         self,
         candidate: ModelCandidate,
@@ -561,35 +605,18 @@ class SupabaseModelRegistry(ModelRegistry):
         if candidate.key not in self._remote_generation_ids:
             return PromotionDecision(False, "remote_state_unavailable", champion)
         expected_generation_id = self._remote_generation_ids[candidate.key]
-        local = super()._publish_decision(
-            candidate,
-            status=status,
-            reason=reason,
-            champion=champion,
-        )
-        if not local.promoted or local.metadata is None:
-            return local
         try:
-            generation_dir = self._active_generation(candidate.key)
-            header, header_reason = self._read_generation_header(
-                candidate.key, generation_dir
+            staged, artifact = self._serialize_remote_candidate(
+                candidate,
+                status=status,
             )
-            if (
-                header is None
-                or header_reason
-                or header.metadata != local.metadata
-                or not self._generation_model_checksum_is_valid(header)
-            ):
-                return self._remote_failure(
-                    "remote_candidate_validation_failed", champion, local
-                )
-            artifact = header.model_path.read_bytes()
-        except UnsafeModelPathError:
-            return self._remote_failure("unsafe_model_path", champion, local)
         except Exception:
-            return self._remote_failure(
-                "remote_candidate_validation_failed", champion, local
+            return PromotionDecision(
+                False,
+                "remote_candidate_validation_failed",
+                champion,
             )
+        remote_decision = PromotionDecision(True, reason, staged.metadata)
 
         generation_id = str(uuid.uuid4())
         try:
@@ -599,12 +626,15 @@ class SupabaseModelRegistry(ModelRegistry):
                 artifact,
             )
         except OSError:
-            return self._remote_failure("remote_upload_failed", champion, local)
+            return self._remote_failure(
+                "remote_upload_failed", champion, remote_decision
+            )
+        activated = False
         try:
             activated = self.store.activate(
                 generation_id,
                 candidate.key,
-                local.metadata,
+                staged.metadata,
                 storage_path,
                 expected_generation_id=expected_generation_id,
             )
@@ -618,15 +648,34 @@ class SupabaseModelRegistry(ModelRegistry):
                 and reconciled.generation_id == generation_id
                 and reconciled.key == candidate.key
                 and reconciled.storage_path == storage_path
-                and reconciled.model_checksum == local.metadata.checksum
-                and reconciled.metadata == local.metadata
+                and reconciled.model_checksum == staged.metadata.checksum
+                and reconciled.metadata == staged.metadata
             ):
-                self._remember_activation(candidate.key, generation_id)
-                return local
-            return self._remote_failure(
-                "remote_activation_failed", champion, local
-            )
+                activated = True
+            else:
+                return self._remote_failure(
+                    "remote_activation_failed", champion, remote_decision
+                )
         if not activated:
-            return self._remote_failure("remote_head_conflict", champion, local)
+            return self._remote_failure(
+                "remote_head_conflict", champion, remote_decision
+            )
+        try:
+            active_metadata, prune_audit_persisted = super()._publish_locked(
+                staged,
+                status=status,
+                serialized_model=artifact,
+            )
+            if active_metadata != staged.metadata:
+                raise ValueError("local cache metadata changed after activation")
+        except Exception:
+            self._mark_remote_activation_for_hydration(
+                candidate.key,
+                generation_id,
+            )
+            return remote_decision
         self._remember_activation(candidate.key, generation_id)
-        return local
+        return replace(
+            remote_decision,
+            audit_persisted=prune_audit_persisted,
+        )

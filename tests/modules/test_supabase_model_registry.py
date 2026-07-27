@@ -368,18 +368,22 @@ def test_store_download_requires_bytes_and_matching_sha256():
 def test_store_uploads_to_immutable_binary_generation_path():
     key = ModelKey("project-a", "line-a", "001", "wind_speed")
     artifact = b"sealed model"
+    expected_path = (
+        "project-a/line-a/001/wind_speed/"
+        f"{GENERATION_ID}/model.joblib"
+    )
     client = _Client(
-        storage_responses=[{"path": "ignored"}, {"path": "ignored"}]
+        storage_responses=[
+            {"path": expected_path},
+            SimpleNamespace(path=expected_path),
+        ]
     )
     store = SupabaseModelStore(client)
 
     path = store.upload(GENERATION_ID, key, artifact)
     repeated_path = store.upload(GENERATION_ID, key, artifact)
 
-    assert path == (
-        "project-a/line-a/001/wind_speed/"
-        f"{GENERATION_ID}/model.joblib"
-    )
+    assert path == expected_path
     assert repeated_path == path
     expected_call = (
         "upload",
@@ -399,13 +403,24 @@ def test_store_uploads_to_immutable_binary_generation_path():
 def test_store_uses_distinct_paths_for_distinct_generation_uuids():
     key = ModelKey("project-a", "line-a", "001", "wind_speed")
     other_generation_id = "33333333-3333-4333-8333-333333333333"
-    client = _Client(storage_responses=[{}, {}])
+    first_path = (
+        "project-a/line-a/001/wind_speed/"
+        f"{GENERATION_ID}/model.joblib"
+    )
+    second_path = (
+        "project-a/line-a/001/wind_speed/"
+        f"{other_generation_id}/model.joblib"
+    )
+    client = _Client(
+        storage_responses=[{"path": first_path}, {"path": second_path}]
+    )
     store = SupabaseModelStore(client)
 
-    first_path = store.upload(GENERATION_ID, key, b"first")
-    second_path = store.upload(other_generation_id, key, b"second")
+    first_result = store.upload(GENERATION_ID, key, b"first")
+    second_result = store.upload(other_generation_id, key, b"second")
 
-    assert first_path != second_path
+    assert first_result == first_path
+    assert second_result == second_path
     assert client.storage_calls == [
         (
             "upload",
@@ -432,6 +447,24 @@ def test_store_uses_distinct_paths_for_distinct_generation_uuids():
             },
         ),
     ]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        {},
+        {"path": "wrong/model.joblib"},
+        SimpleNamespace(path="wrong/model.joblib"),
+        object(),
+    ],
+)
+def test_store_rejects_invalid_upload_responses(response):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    store = SupabaseModelStore(_Client(storage_responses=[response]))
+
+    with pytest.raises(OSError, match="upload response"):
+        store.upload(GENERATION_ID, key, b"sealed model")
 
 
 def test_store_activation_passes_complete_metadata_and_expected_head():

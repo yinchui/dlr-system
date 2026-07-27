@@ -13,6 +13,7 @@ from modules.model_registry import (
     ModelCompatibility,
     ModelKey,
     ModelMetadata,
+    ModelRegistry,
 )
 from modules.supabase_model_registry import (
     RemoteGeneration,
@@ -302,10 +303,12 @@ def test_remote_write_failure_never_exposes_local_candidate(
     registry = SupabaseModelRegistry(store, cache_dir=tmp_path)
 
     decision = registry.promote(_candidate(key))
+    candidate_path_exists = registry.path_for(key).exists()
     loaded = _load(registry, key)
 
     assert decision.promoted is False
     assert decision.reason == reason
+    assert candidate_path_exists is False
     assert loaded.bundle is None
     assert loaded.fallback_reason == "model_not_found"
 
@@ -329,10 +332,12 @@ def test_cas_conflict_preserves_and_loads_remote_winner(tmp_path):
     decision = registry.promote(
         _candidate(key, model_version="loser", model_value=0.1)
     )
+    loser_path_exists = registry.path_for(key).exists()
     loaded = _load(registry, key)
 
     assert decision.promoted is False
     assert decision.reason == "remote_head_conflict"
+    assert loser_path_exists is False
     assert loaded.metadata.model_version == "winner"
     assert loaded.bundle.model.predict(np.zeros((1, 2))).tolist() == [0.9]
 
@@ -348,6 +353,42 @@ def test_activation_timeout_reconciles_committed_generation(tmp_path):
     assert decision.promoted is True
     assert store.heads[key].metadata == decision.metadata
     assert store.events.count("current") >= 2
+
+
+def test_remote_activation_recovers_from_local_cache_publish_failure(
+    tmp_path,
+    monkeypatch,
+):
+    store = _MemoryStore()
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    registry = SupabaseModelRegistry(store, cache_dir=tmp_path)
+    real_publish = ModelRegistry._publish_locked
+    failed_once = False
+
+    def fail_first_local_publish(self, *args, **kwargs):
+        nonlocal failed_once
+        if self is registry and not failed_once:
+            failed_once = True
+            raise OSError("local cache unavailable")
+        return real_publish(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        ModelRegistry,
+        "_publish_locked",
+        fail_first_local_publish,
+    )
+
+    decision = registry.promote(_candidate(key, model_value=0.65))
+
+    assert decision.promoted is True
+    assert store.heads[key].metadata == decision.metadata
+    assert registry.path_for(key).exists() is False
+
+    loaded = _load(registry, key)
+
+    assert loaded.fallback_reason == ""
+    assert loaded.bundle.model.predict(np.zeros((1, 2))).tolist() == [0.65]
+    assert registry.path_for(key).is_file()
 
 
 def test_deterministic_rejection_survives_fresh_registry(tmp_path):
@@ -404,6 +445,7 @@ def test_cached_remote_generation_is_rehydrated_after_failed_local_publish(
     key = ModelKey("project-a", "line-a", "001", "wind_speed")
     registry = SupabaseModelRegistry(store, cache_dir=tmp_path)
     registry.promote(_candidate(key, model_version="winner", model_value=0.8))
+    winner_path = registry.path_for(key).resolve(strict=True)
     store.activation_mode = "activation_error"
 
     failed = registry.promote(
@@ -414,9 +456,11 @@ def test_cached_remote_generation_is_rehydrated_after_failed_local_publish(
             corrected_mae=0.5,
         )
     )
+    active_path_after_failure = registry.path_for(key).resolve(strict=True)
     loaded = _load(registry, key)
 
     assert failed.promoted is False
+    assert active_path_after_failure == winner_path
     assert loaded.metadata.model_version == "winner"
     assert loaded.bundle.model.predict(np.zeros((1, 2))).tolist() == [0.8]
 

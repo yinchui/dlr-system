@@ -113,3 +113,76 @@ def test_supabase_model_config_uses_environment_when_secrets_are_absent():
 
     assert result.bucket == "private-models"
     assert result.secret_key == "environment-secret"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("DLR_SUPABASE_URL", None),
+        ("DLR_SUPABASE_URL", "   "),
+        ("DLR_SUPABASE_URL", 42),
+        ("DLR_SUPABASE_SECRET_KEY", None),
+        ("DLR_SUPABASE_SECRET_KEY", "   "),
+        ("DLR_SUPABASE_SECRET_KEY", 42),
+        ("DLR_SUPABASE_MODEL_BUCKET", None),
+        ("DLR_SUPABASE_MODEL_BUCKET", "   "),
+        ("DLR_SUPABASE_MODEL_BUCKET", 42),
+    ],
+)
+def test_supabase_model_config_rejects_present_invalid_settings(name, value):
+    secret = "server-secret-value"
+    values = {
+        "DLR_SUPABASE_URL": "https://ciapxhuldarsupmvrgwu.supabase.co",
+        "DLR_SUPABASE_SECRET_KEY": secret,
+        "DLR_SUPABASE_MODEL_BUCKET": "private-models",
+        name: value,
+    }
+
+    with pytest.raises(ValueError, match=name) as error:
+        config.load_supabase_model_config(
+            secrets=values,
+            environ={
+                "DLR_SUPABASE_URL": "https://ciapxhuldarsupmvrgwu.supabase.co",
+                "DLR_SUPABASE_SECRET_KEY": "environment-secret",
+                "DLR_SUPABASE_MODEL_BUCKET": "environment-bucket",
+            },
+        )
+
+    assert secret not in str(error.value)
+    assert "environment-secret" not in str(error.value)
+
+
+def test_explicit_blank_secret_never_falls_back_to_environment():
+    with pytest.raises(
+        ValueError, match="DLR_SUPABASE_SECRET_KEY"
+    ) as error:
+        config.load_supabase_model_config(
+            secrets={
+                "DLR_SUPABASE_URL": (
+                    "https://ciapxhuldarsupmvrgwu.supabase.co"
+                ),
+                "DLR_SUPABASE_SECRET_KEY": "   ",
+            },
+            environ={"DLR_SUPABASE_SECRET_KEY": "environment-secret"},
+        )
+
+    assert "environment-secret" not in str(error.value)
+
+
+@pytest.mark.parametrize("bucket", [None, "   ", 42])
+def test_present_invalid_bucket_is_rejected_without_credentials(bucket):
+    with pytest.raises(
+        ValueError, match="DLR_SUPABASE_MODEL_BUCKET"
+    ):
+        config.load_supabase_model_config(
+            secrets={"DLR_SUPABASE_MODEL_BUCKET": bucket},
+            environ={},
+        )
+
+
+def test_orphaned_bucket_is_partial_supabase_configuration():
+    with pytest.raises(ValueError, match="must be configured together"):
+        config.load_supabase_model_config(
+            secrets={"DLR_SUPABASE_MODEL_BUCKET": "private-models"},
+            environ={},
+        )

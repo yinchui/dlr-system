@@ -27,6 +27,7 @@ from modules.model_registry import (
 _MODEL_BUCKET_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _REMOTE_MODEL_STATUSES = frozenset({"active_provisional", "active"})
+_SUPABASE_SERVICE_TIMEOUT_SECONDS = 5.0
 _GENERATION_COLUMNS = (
     "generation_id,project_id,line_id,tower_id,target,model_version,"
     "storage_path,model_checksum,metadata,status"
@@ -34,6 +35,41 @@ _GENERATION_COLUMNS = (
 _REJECTION_CONFLICT_COLUMNS = (
     "project_id,line_id,tower_id,target,attempt_fingerprint"
 )
+
+
+class SupabaseTransportError(OSError):
+    """Sanitized SDK request or storage transfer failure."""
+
+
+def _normalized_status_code(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return int(value)
+    return None
+
+
+def _exception_status_code(exc: Exception) -> Optional[int]:
+    for name in ("status", "status_code", "statusCode"):
+        status = _normalized_status_code(getattr(exc, name, None))
+        if status is not None:
+            return status
+    response = getattr(exc, "response", None)
+    status = _normalized_status_code(
+        getattr(response, "status_code", None)
+    )
+    if status is not None:
+        return status
+    for value in exc.args:
+        if not isinstance(value, Mapping):
+            continue
+        for name in ("status", "status_code", "statusCode"):
+            status = _normalized_status_code(value.get(name))
+            if status is not None:
+                return status
+    return None
 
 
 def _scope(key: ModelKey) -> dict[str, str]:
@@ -70,9 +106,16 @@ def _validated_rows(value: Any, name: str) -> list[Mapping[str, Any]]:
 def _execute(request_factory: Callable[[], Any], operation: str) -> Any:
     try:
         response = request_factory().execute()
+    except Exception:
+        raise SupabaseTransportError(
+            f"Supabase model {operation} failed"
+        ) from None
+    try:
         return response.data
     except Exception:
-        raise OSError(f"Supabase model {operation} failed") from None
+        raise OSError(
+            f"invalid Supabase model {operation} response"
+        ) from None
 
 
 def _artifact_path(generation_id: str, key: ModelKey) -> str:
@@ -154,9 +197,18 @@ class SupabaseModelStore:
         if not isinstance(secret_key, str) or not secret_key.strip():
             raise ValueError("Supabase secret key is required")
         try:
-            from supabase import create_client
+            from supabase import ClientOptions, create_client
 
-            client = create_client(url.strip(), secret_key.strip())
+            options = ClientOptions(
+                postgrest_client_timeout=_SUPABASE_SERVICE_TIMEOUT_SECONDS,
+                storage_client_timeout=_SUPABASE_SERVICE_TIMEOUT_SECONDS,
+                function_client_timeout=_SUPABASE_SERVICE_TIMEOUT_SECONDS,
+            )
+            client = create_client(
+                url.strip(),
+                secret_key.strip(),
+                options=options,
+            )
         except Exception:
             raise OSError("Supabase model client initialization failed") from None
         return cls(client, bucket=bucket)
@@ -235,8 +287,14 @@ class SupabaseModelStore:
                 self._client.storage.from_(self.bucket)
                 .download(generation.storage_path)
             )
-        except Exception:
-            raise OSError("Supabase model download failed") from None
+        except Exception as exc:
+            if _exception_status_code(exc) == 404:
+                raise OSError(
+                    "Supabase model download object is missing"
+                ) from None
+            raise SupabaseTransportError(
+                "Supabase model download failed"
+            ) from None
         if not isinstance(artifact, bytes):
             raise OSError("Supabase model download returned invalid bytes")
         if hashlib.sha256(artifact).hexdigest() != generation.model_checksum:
@@ -262,7 +320,9 @@ class SupabaseModelStore:
                 },
             )
         except Exception:
-            raise OSError("Supabase model upload failed") from None
+            raise SupabaseTransportError(
+                "Supabase model upload failed"
+            ) from None
         try:
             response_path = (
                 response.get("path")
@@ -410,6 +470,9 @@ class SupabaseModelRegistry(ModelRegistry):
             audit_result_id=audit_result_id,
             audit_source=audit_source,
         )
+
+    def _load_many_should_abort(self, exc: Exception) -> bool:
+        return isinstance(exc, SupabaseTransportError)
 
     def _cached_generation_is_current(
         self,

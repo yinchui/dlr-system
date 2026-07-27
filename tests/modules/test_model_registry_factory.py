@@ -1,4 +1,6 @@
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -128,6 +130,57 @@ def test_factory_rejects_partial_configuration_without_local_fallback(tmp_path):
         )
 
     assert not (tmp_path / "models").exists()
+
+
+def test_factory_rejects_explicit_blank_credentials_without_local_fallback(
+    tmp_path,
+):
+    with pytest.raises(ValueError, match="DLR_SUPABASE_URL"):
+        registry_factory.create_model_registry(
+            model_dir=tmp_path / "models",
+            secrets={
+                "DLR_SUPABASE_URL": "   ",
+                "DLR_SUPABASE_SECRET_KEY": "   ",
+            },
+            environ={},
+        )
+
+    assert not (tmp_path / "models").exists()
+
+
+def test_factory_rejects_orphaned_bucket_without_local_fallback(tmp_path):
+    with pytest.raises(ValueError, match="must be configured together"):
+        registry_factory.create_model_registry(
+            model_dir=tmp_path / "models",
+            secrets={"DLR_SUPABASE_MODEL_BUCKET": "private-models"},
+            environ={},
+        )
+
+    assert not (tmp_path / "models").exists()
+
+
+def test_runtime_streamlit_secrets_preserves_missing_keys(monkeypatch):
+    class StreamlitSecretNotFoundError(Exception):
+        pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "streamlit",
+        SimpleNamespace(
+            secrets={"DLR_SUPABASE_URL": SUPABASE_URL},
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "streamlit.errors",
+        SimpleNamespace(
+            StreamlitSecretNotFoundError=StreamlitSecretNotFoundError,
+        ),
+    )
+
+    assert registry_factory._runtime_streamlit_secrets() == {
+        "DLR_SUPABASE_URL": SUPABASE_URL,
+    }
 
 
 def test_streamlit_page_uses_registry_factory_without_exposing_secrets():

@@ -28,15 +28,15 @@ def _optional_setting(
     secrets: Mapping[str, object],
     environ: Mapping[str, str],
 ) -> Optional[str]:
-    value = secrets.get(name)
-    if value is None:
-        value = environ.get(name)
-    if value is None:
+    if name in secrets:
+        value = secrets[name]
+    elif name in environ:
+        value = environ[name]
+    else:
         return None
-    if not isinstance(value, str):
-        raise ValueError(f"{name} must be a string")
-    normalized = value.strip()
-    return normalized or None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value.strip()
 
 
 def _validated_supabase_url(url: str) -> str:
@@ -65,7 +65,7 @@ def load_supabase_model_config(
     secrets: Optional[Mapping[str, object]] = None,
     environ: Optional[Mapping[str, str]] = None,
 ) -> Optional[SupabaseModelConfig]:
-    secret_values = secrets or {}
+    secret_values = {} if secrets is None else secrets
     environment = os.environ if environ is None else environ
     url = _optional_setting(
         "DLR_SUPABASE_URL",
@@ -77,21 +77,21 @@ def load_supabase_model_config(
         secrets=secret_values,
         environ=environment,
     )
-    if url is None and secret_key is None:
-        return None
-    if url is None or secret_key is None:
-        raise ValueError(
-            "DLR_SUPABASE_URL and DLR_SUPABASE_SECRET_KEY must be configured together"
-        )
     bucket = _optional_setting(
         "DLR_SUPABASE_MODEL_BUCKET",
         secrets=secret_values,
         environ=environment,
     )
+    if url is None and secret_key is None and bucket is None:
+        return None
+    if url is None or secret_key is None:
+        raise ValueError(
+            "DLR_SUPABASE_URL and DLR_SUPABASE_SECRET_KEY must be configured together"
+        )
     return SupabaseModelConfig(
         url=_validated_supabase_url(url),
         secret_key=secret_key,
-        bucket=bucket or "dlr-models",
+        bucket="dlr-models" if bucket is None else bucket,
     )
 
 

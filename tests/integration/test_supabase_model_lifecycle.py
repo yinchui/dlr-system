@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import modules.supabase_model_registry as supabase_registry_module
 from modules.ai_prediction import ModelBundle
 from modules.ai_training import ConstantResidualEstimator
 from modules.dlr_pipeline import DlrPipeline
@@ -18,6 +19,7 @@ from modules.model_registry import (
 from modules.supabase_model_registry import (
     RemoteGeneration,
     SupabaseModelRegistry,
+    SupabaseModelStore,
 )
 
 
@@ -205,6 +207,54 @@ class _MemoryStore:
         self.recorded_reasons.append(reason)
 
 
+class _FirstTransportFailureStore(_MemoryStore):
+    def __init__(self):
+        super().__init__()
+        self.current_calls = 0
+
+    def current(self, key: ModelKey) -> RemoteGeneration | None:
+        self.current_calls += 1
+        if self.current_calls == 1:
+            error_type = getattr(
+                supabase_registry_module,
+                "SupabaseTransportError",
+                OSError,
+            )
+            raise error_type("Supabase model head query failed")
+        return super().current(key)
+
+
+class _MissingObjectError(RuntimeError):
+    status = 404
+
+
+class _MissingObjectBucket:
+    def download(self, _path):
+        raise _MissingObjectError("object not found")
+
+
+class _MissingObjectStorage:
+    def from_(self, _bucket):
+        return _MissingObjectBucket()
+
+
+class _MissingObjectClient:
+    storage = _MissingObjectStorage()
+
+
+class _MissingObjectStore(_MemoryStore):
+    def __init__(self):
+        super().__init__()
+        self.missing_key = None
+        self.sdk_store = SupabaseModelStore(_MissingObjectClient())
+
+    def download(self, generation: RemoteGeneration) -> bytes:
+        if generation.key == self.missing_key:
+            self.events.append("download")
+            return self.sdk_store.download(generation)
+        return super().download(generation)
+
+
 def test_missing_remote_head_returns_model_not_found(tmp_path):
     registry = SupabaseModelRegistry(_MemoryStore(), cache_dir=tmp_path)
     key = ModelKey("project-a", "line-a", "001", "wind_speed")
@@ -267,6 +317,7 @@ def test_corrupt_remote_generation_is_isolated_to_its_key(tmp_path):
     publisher.promote(_candidate(bad_key))
     publisher.promote(_candidate(good_key, model_value=0.9))
     store.artifacts[store.heads[bad_key].storage_path] = b"corrupt"
+    store.events.clear()
 
     fresh = SupabaseModelRegistry(store, cache_dir=tmp_path / "fresh")
     results = fresh.load_many(
@@ -285,6 +336,68 @@ def test_corrupt_remote_generation_is_isolated_to_its_key(tmp_path):
     assert results[bad_key].bundle is None
     assert results[bad_key].fallback_reason == "load_failed:OSError"
     assert results[good_key].bundle is not None
+    assert store.events.count("current") == 2
+
+
+def test_transport_failure_aborts_only_the_current_load_many_call(tmp_path):
+    store = _FirstTransportFailureStore()
+    registry = SupabaseModelRegistry(store, cache_dir=tmp_path)
+    keys = [
+        ModelKey("project-a", "line-a", tower_id, "wind_speed")
+        for tower_id in ("001", "002", "003")
+    ]
+
+    results = registry.load_many(
+        keys,
+        expected_compatibility={key: _compatibility() for key in keys},
+        expected_training_contract_hash={
+            key: CONTRACT_HASH for key in keys
+        },
+        expected_backend_id={key: BACKEND_ID for key in keys},
+    )
+
+    assert store.current_calls == 1
+    assert {
+        result.fallback_reason for result in results.values()
+    } == {"load_failed:SupabaseTransportError"}
+
+    retried = _load(registry, keys[0])
+
+    assert store.current_calls == 2
+    assert retried.fallback_reason == "model_not_found"
+
+
+def test_missing_remote_object_is_isolated_to_its_key(tmp_path):
+    store = _MissingObjectStore()
+    missing_key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    good_key = ModelKey("project-a", "line-a", "002", "wind_speed")
+    publisher = SupabaseModelRegistry(store, cache_dir=tmp_path / "publisher")
+    publisher.promote(_candidate(missing_key))
+    publisher.promote(_candidate(good_key, model_value=0.9))
+    store.missing_key = missing_key
+    store.events.clear()
+
+    results = SupabaseModelRegistry(
+        store, cache_dir=tmp_path / "fresh"
+    ).load_many(
+        [missing_key, good_key],
+        expected_compatibility={
+            missing_key: _compatibility(),
+            good_key: _compatibility(),
+        },
+        expected_training_contract_hash={
+            missing_key: CONTRACT_HASH,
+            good_key: CONTRACT_HASH,
+        },
+        expected_backend_id={
+            missing_key: BACKEND_ID,
+            good_key: BACKEND_ID,
+        },
+    )
+
+    assert results[missing_key].fallback_reason == "load_failed:OSError"
+    assert results[good_key].bundle is not None
+    assert store.events.count("current") == 2
 
 
 @pytest.mark.parametrize(

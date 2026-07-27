@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import modules.supabase_model_registry as supabase_registry_module
 from modules.model_registry import (
     ModelAttempt,
     ModelCompatibility,
@@ -180,6 +181,12 @@ class _RequestBuildingFailureClient:
 
     def rpc(self, name, payload):
         raise RuntimeError(f"rpc setup failed with {self.secret}")
+
+
+class _StorageApiError(RuntimeError):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
 
 
 def _attempt(key):
@@ -361,8 +368,80 @@ def test_store_download_requires_bytes_and_matching_sha256():
     store = SupabaseModelStore(client)
 
     assert store.download(generation) == artifact
-    with pytest.raises(OSError, match="checksum"):
+    with pytest.raises(OSError, match="checksum") as error:
         store.download(generation)
+
+    assert type(error.value) is OSError
+
+
+def test_store_treats_missing_download_object_as_per_key_corruption():
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    artifact = b"sealed model"
+    checksum = hashlib.sha256(artifact).hexdigest()
+    metadata = _metadata(key, checksum=checksum)
+    generation = RemoteGeneration(
+        generation_id=GENERATION_ID,
+        key=key,
+        model_version=metadata.model_version,
+        storage_path=(
+            "project-a/line-a/001/wind_speed/"
+            f"{GENERATION_ID}/model.joblib"
+        ),
+        model_checksum=checksum,
+        metadata=metadata,
+        status=metadata.status,
+        revision=1,
+    )
+    secret = "sb_secret_do_not_expose"
+    store = SupabaseModelStore(
+        _Client(
+            storage_responses=[
+                _StorageApiError(404, f"object missing with {secret}")
+            ]
+        )
+    )
+
+    with pytest.raises(OSError, match="object is missing") as error:
+        store.download(generation)
+
+    assert type(error.value) is OSError
+    assert secret not in str(error.value)
+
+
+@pytest.mark.parametrize("status", [None, 401, 403, 429, 500])
+def test_store_treats_systemic_download_failures_as_transport(status):
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    artifact = b"sealed model"
+    checksum = hashlib.sha256(artifact).hexdigest()
+    metadata = _metadata(key, checksum=checksum)
+    generation = RemoteGeneration(
+        generation_id=GENERATION_ID,
+        key=key,
+        model_version=metadata.model_version,
+        storage_path=(
+            "project-a/line-a/001/wind_speed/"
+            f"{GENERATION_ID}/model.joblib"
+        ),
+        model_checksum=checksum,
+        metadata=metadata,
+        status=metadata.status,
+        revision=1,
+    )
+
+    with pytest.raises(OSError) as error:
+        SupabaseModelStore(
+            _Client(
+                storage_responses=[
+                    _StorageApiError(status, "systemic failure")
+                ]
+            )
+        ).download(generation)
+
+    assert type(error.value) is getattr(
+        supabase_registry_module,
+        "SupabaseTransportError",
+        None,
+    )
 
 
 def test_store_uploads_to_immutable_binary_generation_path():
@@ -463,8 +542,10 @@ def test_store_rejects_invalid_upload_responses(response):
     key = ModelKey("project-a", "line-a", "001", "wind_speed")
     store = SupabaseModelStore(_Client(storage_responses=[response]))
 
-    with pytest.raises(OSError, match="upload response"):
+    with pytest.raises(OSError, match="upload response") as error:
         store.upload(GENERATION_ID, key, b"sealed model")
+
+    assert type(error.value) is OSError
 
 
 def test_store_activation_passes_complete_metadata_and_expected_head():
@@ -513,7 +594,7 @@ def test_store_rejects_malformed_activation_responses(response):
         f"{GENERATION_ID}/model.joblib"
     )
 
-    with pytest.raises(OSError, match="activation response"):
+    with pytest.raises(OSError, match="activation response") as error:
         SupabaseModelStore(_Client(responses=[response])).activate(
             GENERATION_ID,
             key,
@@ -521,6 +602,8 @@ def test_store_rejects_malformed_activation_responses(response):
             path,
             expected_generation_id=None,
         )
+
+    assert type(error.value) is OSError
 
 
 def test_store_rejection_lookup_and_upsert_are_fully_scoped():
@@ -635,6 +718,11 @@ def test_store_translates_sdk_failures_without_leaking_secret_values():
     with pytest.raises(OSError) as error:
         SupabaseModelStore(client).current(key)
 
+    assert type(error.value) is getattr(
+        supabase_registry_module,
+        "SupabaseTransportError",
+        None,
+    )
     assert secret not in str(error.value)
 
 
@@ -671,6 +759,11 @@ def test_store_translates_request_building_failures_without_leaking_secrets(
     with pytest.raises(OSError) as error:
         calls[operation]()
 
+    assert type(error.value) is getattr(
+        supabase_registry_module,
+        "SupabaseTransportError",
+        None,
+    )
     assert secret not in str(error.value)
 
 
@@ -706,6 +799,11 @@ def test_store_translates_storage_failures_without_leaking_secrets(operation):
     with pytest.raises(OSError) as error:
         calls[operation]()
 
+    assert type(error.value) is getattr(
+        supabase_registry_module,
+        "SupabaseTransportError",
+        None,
+    )
     assert secret not in str(error.value)
 
 
@@ -715,14 +813,25 @@ def test_store_lazily_creates_client_without_retaining_raw_credentials(
     client = _Client()
     captured = {}
 
-    def create_client(url, secret_key):
-        captured.update(url=url, secret_key=secret_key)
+    class UnitClientOptions:
+        def __init__(self, **values):
+            self.values = values
+
+    def create_client(url, secret_key, *, options):
+        captured.update(
+            url=url,
+            secret_key=secret_key,
+            options=options,
+        )
         return client
 
     monkeypatch.setitem(
         sys.modules,
         "supabase",
-        SimpleNamespace(create_client=create_client),
+        SimpleNamespace(
+            ClientOptions=UnitClientOptions,
+            create_client=create_client,
+        ),
     )
     secret = "sb_secret_do_not_retain"
 
@@ -734,6 +843,13 @@ def test_store_lazily_creates_client_without_retaining_raw_credentials(
     assert captured == {
         "url": "https://project.supabase.co",
         "secret_key": secret,
+        "options": captured["options"],
+    }
+    assert isinstance(captured["options"], UnitClientOptions)
+    assert captured["options"].values == {
+        "postgrest_client_timeout": 5.0,
+        "storage_client_timeout": 5.0,
+        "function_client_timeout": 5.0,
     }
     assert vars(store) == {"_client": client, "bucket": "dlr-models"}
     assert secret not in repr(vars(store))

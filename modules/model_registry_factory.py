@@ -21,9 +21,11 @@ def _runtime_streamlit_secrets() -> Mapping[str, object]:
     from streamlit.errors import StreamlitSecretNotFoundError
 
     try:
+        runtime_secrets = st.secrets
         return {
-            name: st.secrets.get(name)
+            name: runtime_secrets[name]
             for name in SUPABASE_MODEL_SETTING_NAMES
+            if name in runtime_secrets
         }
     except StreamlitSecretNotFoundError:
         return {}

@@ -1782,6 +1782,9 @@ class ModelRegistry:
         )
         return replace(result, audit_persisted=audit_persisted)
 
+    def _load_many_should_abort(self, exc: Exception) -> bool:
+        return False
+
     def load_many(
         self,
         keys,
@@ -1828,33 +1831,41 @@ class ModelRegistry:
             )
 
         loaded = {}
+        abort_error = None
         for key in normalized_keys:
-            try:
-                loaded[key] = self.load(
-                    key,
-                    expected_compatibility=expected_compatibility[key],
-                    expected_training_contract_hash=(
-                        expected_training_contract_hash[key]
-                    ),
-                    expected_backend_id=expected_backend_id[key],
-                )
-            except Exception as exc:
-                result = self._fallback(
-                    f"load_failed:{type(exc).__name__}"
-                )
-                audit_persisted = self._audit_load_result(
-                    key,
-                    result,
-                    expected_compatibility=expected_compatibility[key],
-                    expected_training_contract_hash=(
-                        expected_training_contract_hash[key]
-                    ),
-                    expected_backend_id=expected_backend_id[key],
-                )
-                loaded[key] = replace(
-                    result,
-                    audit_persisted=audit_persisted,
-                )
+            error = abort_error
+            if error is None:
+                try:
+                    loaded[key] = self.load(
+                        key,
+                        expected_compatibility=expected_compatibility[key],
+                        expected_training_contract_hash=(
+                            expected_training_contract_hash[key]
+                        ),
+                        expected_backend_id=expected_backend_id[key],
+                    )
+                except Exception as exc:
+                    error = exc
+                    if self._load_many_should_abort(exc):
+                        abort_error = exc
+                else:
+                    continue
+            result = self._fallback(
+                f"load_failed:{type(error).__name__}"
+            )
+            audit_persisted = self._audit_load_result(
+                key,
+                result,
+                expected_compatibility=expected_compatibility[key],
+                expected_training_contract_hash=(
+                    expected_training_contract_hash[key]
+                ),
+                expected_backend_id=expected_backend_id[key],
+            )
+            loaded[key] = replace(
+                result,
+                audit_persisted=audit_persisted,
+            )
         return loaded
 
     def _publish_locked(

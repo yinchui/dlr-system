@@ -13,6 +13,16 @@ git diff --check
 
 不要在最终验收时只运行新增测试；测试总数以当前 `pytest` 输出为准，不在文档中维护易失效的固定计数。
 
+真实 Supabase SDK 合同测试必须在安装 `requirements.txt` 后运行；它直接导入
+`supabase-py`、`storage3` 和 `postgrest` 的类型，通过真实客户端离线构造生产
+request builder，并仅在真实响应对象穿透处使用最小 I/O 边界替身：
+
+```bash
+python3 -m pytest tests/contracts/test_supabase_sdk_contract.py -q -rs
+```
+
+缺少这些依赖时该文件会明确显示为 skipped，不能将其视为 SDK 合同已验证。
+
 ## IEEE 738 回归
 
 稳态 Drake 金标准、低风速自然对流、风向归一、太阳热增益、电阻插值和输入不变性：

@@ -59,13 +59,25 @@ IEEE 738 稳态和暂态热核始终保留未折减的标准计算值。`DlrPipe
 - 缺失、损坏、不兼容、质量不达标或预测异常只影响对应杆塔和目标，其余模型继续使用；失败目标回退到物理气象。
 - 跨运行持久化要求线路具有完整且无歧义的杆塔坐标。坐标不完整时，模型只在当前运行使用，避免不同线路误共享。
 
-默认模型目录：
+本地开发默认模型目录：
 
 ```text
 models/<project_id>/<line_id>/<tower_id>/<target>/
 ```
 
-可通过 `DLR_MODEL_DIR` 覆盖。生产持久化仅接受经过运行时合同校验的 sealed `xgboost.XGBRegressor`；模型、元数据和 manifest 原子写入，依赖、导线、DEM、坐标或修正配置不兼容时拒绝加载。
+可通过 `DLR_MODEL_DIR` 覆盖。当 `DLR_SUPABASE_URL` 和 `DLR_SUPABASE_SECRET_KEY` 都未配置时，系统使用本地 `ModelRegistry`，该模式仅用于本地开发；只配置其中一项会明确报配置错误。
+
+生产部署使用 Streamlit 服务端 Secrets 连接 Supabase：
+
+```toml
+DLR_SUPABASE_URL = "https://<project-ref>.supabase.co"
+DLR_SUPABASE_SECRET_KEY = "<server-side-secret-key>"
+DLR_SUPABASE_MODEL_BUCKET = "dlr-models"
+```
+
+`DLR_SUPABASE_MODEL_BUCKET` 可省略，默认为私有 bucket `dlr-models`。其中以不可变 generation 对象保存 `model.joblib`；PostgreSQL 的 `dlr_model_generations`、`dlr_model_heads` 和 `dlr_model_rejections` 分别保存 generation 元数据、当前激活 head 和拒绝指纹。凭据只供服务端使用，页面不提供配置控件。
+
+生产持久化仅接受经过运行时合同校验的 sealed `xgboost.XGBRegressor`。远端现有模型下载、完整性校验或兼容性校验失败时，受影响的杆塔/目标回退到物理修正气象并继续计算 DLR。新候选模型上传或 CAS 激活失败时，未激活候选不会进入推理；如果已加载旧 champion 则继续使用旧 champion，否则回退到物理修正气象。依赖、导线、DEM、坐标或修正配置不兼容时同样拒绝加载。
 
 ## 弧垂后验证
 

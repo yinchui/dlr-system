@@ -347,6 +347,30 @@ def test_corrupt_remote_generation_is_isolated_to_its_key(tmp_path):
     assert store.events.count("current") == 2
 
 
+def test_corrupt_remote_head_can_be_replaced_by_a_new_candidate(tmp_path):
+    store = _MemoryStore()
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    publisher = SupabaseModelRegistry(store, cache_dir=tmp_path / "publisher")
+    assert publisher.promote(
+        _candidate(key, model_version="broken", model_value=0.9)
+    ).promoted is True
+    broken_generation = store.heads[key]
+    store.artifacts[broken_generation.storage_path] = b"corrupt model"
+
+    registry = SupabaseModelRegistry(store, cache_dir=tmp_path / "repair")
+    decision = registry.promote(
+        _candidate(key, model_version="repair", model_value=0.7)
+    )
+
+    assert decision.promoted is True
+    assert decision.reason == "promoted_provisional"
+    assert store.heads[key].generation_id != broken_generation.generation_id
+    loaded = _load(registry, key)
+    assert loaded.fallback_reason == ""
+    assert loaded.metadata.model_version == "repair"
+    assert loaded.bundle.model.predict(np.zeros((1, 2))).tolist() == [0.7]
+
+
 def test_transport_failure_aborts_only_the_current_load_many_call(tmp_path):
     store = _FirstTransportFailureStore()
     registry = SupabaseModelRegistry(store, cache_dir=tmp_path)
@@ -763,3 +787,36 @@ def test_real_xgboost_generation_is_reused_by_a_fresh_registry():
     assert "download" in store.events
     assert "upload" not in store.events
     assert "activate" not in store.events
+
+
+def test_real_xgboost_training_replaces_a_corrupt_remote_head():
+    store = _MemoryStore()
+    DlrPipeline(registry=SupabaseModelRegistry(store)).run(
+        physical=_weather_history("physical"),
+        truth=_weather_history("truth", truth_offset=True),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+    wind_key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    broken_generation = store.heads[wind_key]
+    store.artifacts[broken_generation.storage_path] = b"corrupt model"
+
+    repaired = DlrPipeline(registry=SupabaseModelRegistry(store)).run(
+        physical=_weather_history("physical"),
+        truth=_weather_history("truth", truth_offset=True),
+        project_id="project-a",
+        line_id="line-a",
+        terrain_lookup={},
+        ai_enabled=True,
+        conductor=_conductor(),
+    )
+
+    assert wind_key in repaired.model_report.trained_targets
+    assert wind_key in repaired.model_report.used_targets
+    assert store.heads[wind_key].generation_id != broken_generation.generation_id
+    assert all(
+        fallback.key != wind_key for fallback in repaired.model_report.fallbacks
+    )

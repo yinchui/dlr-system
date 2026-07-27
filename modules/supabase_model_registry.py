@@ -533,6 +533,7 @@ class SupabaseModelRegistry(ModelRegistry):
     def _hydrate_current_locked(
         self, key: ModelKey
     ) -> Optional[RemoteGeneration]:
+        self._remote_generation_ids.pop(key, None)
         remote = self._remote_call(lambda: self.store.current(key))
         if remote is not None and not isinstance(remote, RemoteGeneration):
             raise OSError("invalid Supabase model current generation")
@@ -602,6 +603,17 @@ class SupabaseModelRegistry(ModelRegistry):
             expected_training_contract_hash,
             expected_backend_id,
         )
+
+    def _load_current_locked(self, key):
+        try:
+            return super()._load_current_locked(key)
+        except (SupabaseTransportError, UnsafeModelPathError):
+            raise
+        except OSError:
+            if key not in self._remote_generation_ids:
+                raise
+            # The head is trusted enough for CAS, but its artifact is unusable.
+            return self._fallback("corrupt_model")
 
     def _current_generation_header_locked(self, key):
         if self._hydrate_current_locked(key) is None:

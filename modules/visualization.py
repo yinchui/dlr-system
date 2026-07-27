@@ -2,16 +2,14 @@
 import plotly.graph_objects as go
 
 
-def build_line_rating_figure(timestamps, dynamic_current, static_current):
+def build_line_rating_figure(timestamps, dynamic_current):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=timestamps, y=dynamic_current, mode="lines+markers", name="动态载流量"))
     fig.add_trace(
         go.Scatter(
             x=timestamps,
-            y=[static_current] * len(dynamic_current),
-            mode="lines",
-            line={"dash": "dash"},
-            name="静态额定值",
+            y=dynamic_current,
+            mode="lines+markers",
+            name="动态额定值",
         )
     )
     fig.update_layout(xaxis_title="日期时间", yaxis_title="允许电流 (A)", hovermode="x unified")

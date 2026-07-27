@@ -775,25 +775,16 @@ with tab_line:
 
             line_rating = np.min(data['max_currents'], axis=0)
 
-            static_p = st.session_state.conductor_params.copy()
-            static_p.update({'T_a': 40, 'wind_speed': 0.6, 'wind_angle': 90, 'elevation': 100,
-                             'day_of_year': 201, 'time': 12,
-                             'T_s': static_p['max_allow_temp'], 'T_avg': static_p['max_allow_temp']})
-            static_val = st.session_state.calculator.calculate_steady_state_current(static_p)
-
             st.markdown("##### 全线载流量统计摘要")
-            k1, k2, k3, k4 = st.columns(4)
+            k1, k2, k3 = st.columns(3)
 
             max_val = np.max(line_rating)
             min_val = np.min(line_rating)
             avg_val = np.mean(line_rating)
-            min_gain = (min_val - static_val) / static_val * 100
-            avg_gain = (avg_val - static_val) / static_val * 100
 
-            k1.metric("最低载流量（系统瓶颈）", f"{min_val:.0f} A", f"{min_gain:+.1f}% 对比静态")
+            k1.metric("最低载流量（系统瓶颈）", f"{min_val:.0f} A")
             k2.metric("最高载流量", f"{max_val:.0f} A")
-            k3.metric("平均载流量", f"{avg_val:.0f} A", f"{avg_gain:+.1f}%")
-            k4.metric("静态额定值（基准）", f"{static_val:.0f} A")
+            k3.metric("平均载流量", f"{avg_val:.0f} A")
 
             # --- 图表 1: 全线瓶颈载流量 ---
             fig = go.Figure()
@@ -803,18 +794,6 @@ with tab_line:
                 name='动态增容（SRTM地形修正）',
                 line=dict(color='blue', width=2),
                 marker=dict(size=4)
-            ))
-            fig.add_trace(go.Scatter(
-                x=plot_times,
-                y=[static_val] * len(plot_times),
-                mode='lines',
-                name=f'静态额定值 ({static_val:.0f}A)',
-                line=dict(color='red', dash='dash')
-            ))
-            fig.add_trace(go.Scatter(
-                x=plot_times, y=line_rating,
-                fill='tonexty', fillcolor='rgba(0, 255, 0, 0.1)',
-                name='增容空间', showlegend=False
             ))
             fig.update_layout(
                 title="全线瓶颈载流量分析 (SRTM地形修正)",

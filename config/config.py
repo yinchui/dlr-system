@@ -14,6 +14,7 @@ def resolve_runtime_path(env_name, default):
 APP_TITLE = "DLR动态增容评估系统"
 DEFAULT_INTERVAL_MINUTES = 30
 DEFAULT_MAX_ALLOW_TEMP = 80.0
+DLR_SAFETY_FACTOR = 0.8
 PROJECT_TIMEZONE = "Asia/Shanghai"
 
 MODEL_DIR = resolve_runtime_path("DLR_MODEL_DIR", PROJECT_ROOT / "models")

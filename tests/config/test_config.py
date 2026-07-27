@@ -15,6 +15,11 @@ def test_runtime_and_physical_defaults_are_available():
     assert config.MODEL_DIR.name == "models"
 
 
+def test_dlr_safety_factor_is_explicit_and_valid():
+    assert config.DLR_SAFETY_FACTOR == 0.8
+    assert 0.0 < config.DLR_SAFETY_FACTOR <= 1.0
+
+
 def test_conductor_catalog_includes_sag_mechanical_defaults():
     required_keys = {
         "area_m2",

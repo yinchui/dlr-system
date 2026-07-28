@@ -460,6 +460,7 @@ def test_structurally_corrupt_bundle_can_be_replaced(tmp_path):
     [
         supabase_registry_module.SupabaseTransportError("transport failed"),
         UnsafeModelPathError("unsafe cache path"),
+        MemoryError("memory exhausted"),
         KeyboardInterrupt(),
         SystemExit(),
     ],
@@ -489,6 +490,46 @@ def test_artifact_deserialization_preserves_control_and_safety_failures(
         registry._hydrate_current_locked(key)
 
     assert raised.value is failure
+
+
+def test_deserialization_memory_error_cannot_replace_remote_champion(
+    tmp_path,
+    monkeypatch,
+):
+    store = _MemoryStore()
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    publisher = SupabaseModelRegistry(store, cache_dir=tmp_path / "publisher")
+    assert publisher.promote(
+        _candidate(key, model_version="champion", model_value=0.9)
+    ).promoted is True
+    champion = store.heads[key]
+    registry = SupabaseModelRegistry(store, cache_dir=tmp_path / "challenger")
+    failure = MemoryError("memory exhausted")
+
+    def fail_deserialization(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(
+        supabase_registry_module.joblib,
+        "load",
+        fail_deserialization,
+    )
+    store.events.clear()
+
+    with pytest.raises(MemoryError) as raised:
+        registry.promote(
+            _candidate(
+                key,
+                model_version="challenger",
+                model_value=0.1,
+                corrected_mae=0.1,
+            )
+        )
+
+    assert raised.value is failure
+    assert store.heads[key] == champion
+    assert "upload" not in store.events
+    assert "activate" not in store.events
 
 
 def test_transport_failure_aborts_only_the_current_load_many_call(tmp_path):

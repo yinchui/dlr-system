@@ -561,7 +561,7 @@ class SupabaseModelRegistry(ModelRegistry):
             ) from None
         try:
             bundle = joblib.load(io.BytesIO(artifact))
-        except (SupabaseTransportError, UnsafeModelPathError):
+        except (SupabaseTransportError, UnsafeModelPathError, MemoryError):
             raise
         except Exception:
             raise _RemoteArtifactError(

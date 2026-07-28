@@ -41,6 +41,10 @@ class SupabaseTransportError(OSError):
     """Sanitized SDK request or storage transfer failure."""
 
 
+class _RemoteArtifactError(OSError):
+    """Remote model artifact is missing, corrupt, or structurally invalid."""
+
+
 def _normalized_status_code(value: Any) -> Optional[int]:
     if isinstance(value, bool):
         return None
@@ -547,13 +551,26 @@ class SupabaseModelRegistry(ModelRegistry):
         if self._cached_generation_is_current(key, remote):
             return remote
 
-        artifact = self._remote_call(lambda: self.store.download(remote))
+        try:
+            artifact = self._remote_call(lambda: self.store.download(remote))
+        except (SupabaseTransportError, UnsafeModelPathError):
+            raise
+        except OSError:
+            raise _RemoteArtifactError(
+                "Supabase model artifact download validation failed"
+            ) from None
         try:
             bundle = joblib.load(io.BytesIO(artifact))
+        except (SupabaseTransportError, UnsafeModelPathError):
+            raise
         except Exception:
-            raise OSError("Supabase model artifact deserialization failed") from None
+            raise _RemoteArtifactError(
+                "Supabase model artifact deserialization failed"
+            ) from None
         if not isinstance(bundle, ModelBundle):
-            raise OSError("Supabase model artifact has an invalid bundle")
+            raise _RemoteArtifactError(
+                "Supabase model artifact has an invalid bundle"
+            )
         try:
             candidate = ModelCandidate(
                 key=key,
@@ -561,15 +578,19 @@ class SupabaseModelRegistry(ModelRegistry):
                 metadata=remote.metadata,
             )
             self._validate_promotion_contract(candidate, None)
-        except (TypeError, ValueError, OverflowError):
-            raise OSError("Supabase model artifact validation failed") from None
+        except (SupabaseTransportError, UnsafeModelPathError):
+            raise
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+            raise _RemoteArtifactError(
+                "Supabase model artifact validation failed"
+            ) from None
         try:
             active_metadata, _ = super()._publish_locked(
                 candidate,
                 status=remote.status,
                 serialized_model=artifact,
             )
-        except UnsafeModelPathError:
+        except (SupabaseTransportError, UnsafeModelPathError):
             raise
         except Exception:
             raise OSError("Supabase model cache publication failed") from None
@@ -595,7 +616,11 @@ class SupabaseModelRegistry(ModelRegistry):
         expected_training_contract_hash,
         expected_backend_id,
     ):
-        if self._hydrate_current_locked(key) is None:
+        try:
+            remote = self._hydrate_current_locked(key)
+        except _RemoteArtifactError as exc:
+            raise OSError(str(exc)) from None
+        if remote is None:
             return self._fallback("model_not_found")
         return super()._load_locked(
             key,
@@ -609,7 +634,7 @@ class SupabaseModelRegistry(ModelRegistry):
             return super()._load_current_locked(key)
         except (SupabaseTransportError, UnsafeModelPathError):
             raise
-        except OSError:
+        except _RemoteArtifactError:
             if key not in self._remote_generation_ids:
                 raise
             # The head is trusted enough for CAS, but its artifact is unusable.

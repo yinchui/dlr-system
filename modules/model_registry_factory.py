@@ -34,12 +34,13 @@ def _runtime_streamlit_secrets() -> Mapping[str, object]:
 def create_model_registry(
     model_dir: Path | str = MODEL_DIR,
     *,
+    ai_enabled: bool = True,
     secrets: Optional[Mapping[str, object]] = None,
     environ: Optional[Mapping[str, str]] = None,
     audit_logger: Optional[Any] = None,
     audit_run_id: Optional[str] = None,
     audit_result_id: Optional[str] = None,
-) -> ModelRegistry:
+) -> Optional[ModelRegistry]:
     secret_values = (
         _runtime_streamlit_secrets() if secrets is None else secrets
     )
@@ -47,16 +48,21 @@ def create_model_registry(
         secrets=secret_values,
         environ=os.environ if environ is None else environ,
     )
+    if not ai_enabled:
+        return None
     audit_options = {
         "audit_logger": audit_logger,
         "audit_run_id": audit_run_id,
         "audit_result_id": audit_result_id,
     }
-    if config is None:
-        return ModelRegistry(model_dir, **audit_options)
-    store = SupabaseModelStore.from_credentials(
-        config.url,
-        config.secret_key,
-        bucket=config.bucket,
-    )
-    return SupabaseModelRegistry(store, **audit_options)
+    try:
+        if config is None:
+            return ModelRegistry(model_dir, **audit_options)
+        store = SupabaseModelStore.from_credentials(
+            config.url,
+            config.secret_key,
+            bucket=config.bucket,
+        )
+        return SupabaseModelRegistry(store, **audit_options)
+    except OSError:
+        return None

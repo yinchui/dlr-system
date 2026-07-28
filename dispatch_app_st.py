@@ -707,13 +707,19 @@ with tab_line:
             progress_bar.progress(60)
             status_text.text("正在修正气象并进行热平衡计算...")
             dlr_run_id = uuid.uuid4().hex
+            requested_ai_enabled = bool(corr_cfg.get('ai_enabled', False))
+            model_registry = create_model_registry(
+                model_dir=MODEL_DIR,
+                ai_enabled=requested_ai_enabled,
+                audit_logger=JsonAuditLogger(AUDIT_LOG_DIR),
+                audit_run_id=dlr_run_id,
+                audit_result_id=dlr_run_id,
+            )
+            effective_ai_enabled = (
+                requested_ai_enabled and model_registry is not None
+            )
             pipeline = DlrPipeline(
-                registry=create_model_registry(
-                    model_dir=MODEL_DIR,
-                    audit_logger=JsonAuditLogger(AUDIT_LOG_DIR),
-                    audit_run_id=dlr_run_id,
-                    audit_result_id=dlr_run_id,
-                )
+                registry=model_registry
             )
             line_identity = derive_line_identity(
                 physical_snapshot,
@@ -730,7 +736,7 @@ with tab_line:
                 dem_context=st.session_state.dem_data,
                 coordinate_context=st.session_state.tower_coords,
                 correction_options=options,
-                ai_enabled=bool(corr_cfg.get('ai_enabled', False)),
+                ai_enabled=effective_ai_enabled,
                 conductor=st.session_state.conductor_params,
                 truth_tolerance=pd.Timedelta(minutes=float(time_res)),
             )

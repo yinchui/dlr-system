@@ -1,5 +1,8 @@
 import hashlib
+import io
+from dataclasses import replace
 
+import joblib
 import numpy as np
 import pandas as pd
 import pytest
@@ -15,6 +18,7 @@ from modules.model_registry import (
     ModelKey,
     ModelMetadata,
     ModelRegistry,
+    UnsafeModelPathError,
 )
 from modules.supabase_model_registry import (
     RemoteGeneration,
@@ -369,6 +373,122 @@ def test_corrupt_remote_head_can_be_replaced_by_a_new_candidate(tmp_path):
     assert loaded.fallback_reason == ""
     assert loaded.metadata.model_version == "repair"
     assert loaded.bundle.model.predict(np.zeros((1, 2))).tolist() == [0.7]
+
+
+def test_local_cache_failure_cannot_replace_remote_champion(
+    tmp_path,
+    monkeypatch,
+):
+    store = _MemoryStore()
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    publisher = SupabaseModelRegistry(store, cache_dir=tmp_path / "publisher")
+    assert publisher.promote(
+        _candidate(key, model_version="champion", model_value=0.9)
+    ).promoted is True
+    champion = store.heads[key]
+    registry = SupabaseModelRegistry(store, cache_dir=tmp_path / "readonly")
+    real_publish = ModelRegistry._publish_locked
+
+    def fail_cache_publish(self, *args, **kwargs):
+        if self is registry:
+            raise PermissionError("local cache is read-only")
+        return real_publish(self, *args, **kwargs)
+
+    monkeypatch.setattr(ModelRegistry, "_publish_locked", fail_cache_publish)
+    store.events.clear()
+
+    with pytest.raises(OSError, match="cache publication"):
+        registry.promote(
+            _candidate(
+                key,
+                model_version="challenger",
+                model_value=0.1,
+                corrected_mae=0.1,
+                evaluation_set_hash="f" * 64,
+            )
+        )
+
+    assert store.heads[key] == champion
+    assert "upload" not in store.events
+    assert "activate" not in store.events
+
+
+def test_structurally_corrupt_bundle_can_be_replaced(tmp_path):
+    store = _MemoryStore()
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    damaged = _candidate(key, model_version="damaged", model_value=0.9)
+    del damaged.bundle.metadata
+    artifact_buffer = io.BytesIO()
+    joblib.dump(damaged.bundle, artifact_buffer, compress=3)
+    artifact = artifact_buffer.getvalue()
+    checksum = hashlib.sha256(artifact).hexdigest()
+    metadata = replace(
+        damaged.metadata,
+        checksum=checksum,
+        status="active_provisional",
+    )
+    generation_id = "11111111-1111-4111-8111-111111111111"
+    storage_path = (
+        f"{key.project_id}/{key.line_id}/{key.tower_id}/{key.target}/"
+        f"{generation_id}/model.joblib"
+    )
+    broken_generation = RemoteGeneration(
+        generation_id=generation_id,
+        key=key,
+        model_version=metadata.model_version,
+        storage_path=storage_path,
+        model_checksum=checksum,
+        metadata=metadata,
+        status=metadata.status,
+        revision=1,
+    )
+    store.heads[key] = broken_generation
+    store.artifacts[storage_path] = artifact
+
+    registry = SupabaseModelRegistry(store, cache_dir=tmp_path / "repair")
+    decision = registry.promote(
+        _candidate(key, model_version="repair", model_value=0.7)
+    )
+
+    assert decision.promoted is True
+    assert decision.reason == "promoted_provisional"
+    assert store.heads[key].generation_id != broken_generation.generation_id
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        supabase_registry_module.SupabaseTransportError("transport failed"),
+        UnsafeModelPathError("unsafe cache path"),
+        KeyboardInterrupt(),
+        SystemExit(),
+    ],
+)
+def test_artifact_deserialization_preserves_control_and_safety_failures(
+    tmp_path,
+    monkeypatch,
+    failure,
+):
+    store = _MemoryStore()
+    key = ModelKey("project-a", "line-a", "001", "wind_speed")
+    SupabaseModelRegistry(store, cache_dir=tmp_path / "publisher").promote(
+        _candidate(key)
+    )
+    registry = SupabaseModelRegistry(store, cache_dir=tmp_path / "fresh")
+
+    def fail_deserialization(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(
+        supabase_registry_module.joblib,
+        "load",
+        fail_deserialization,
+    )
+
+    with pytest.raises(type(failure)) as raised:
+        registry._hydrate_current_locked(key)
+
+    assert raised.value is failure
 
 
 def test_transport_failure_aborts_only_the_current_load_many_call(tmp_path):

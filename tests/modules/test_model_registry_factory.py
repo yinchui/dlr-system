@@ -23,6 +23,70 @@ def test_factory_uses_local_registry_when_supabase_is_not_configured(tmp_path):
     assert registry.model_dir == (tmp_path / "models").resolve()
 
 
+def test_factory_skips_registry_construction_when_ai_is_disabled(
+    tmp_path, monkeypatch
+):
+    def unexpected_remote_initialization(*args, **kwargs):
+        raise AssertionError("disabled AI must not initialize Supabase")
+
+    monkeypatch.setattr(
+        registry_factory.SupabaseModelStore,
+        "from_credentials",
+        unexpected_remote_initialization,
+    )
+
+    registry = registry_factory.create_model_registry(
+        model_dir=tmp_path / "models",
+        ai_enabled=False,
+        secrets={
+            "DLR_SUPABASE_URL": SUPABASE_URL,
+            "DLR_SUPABASE_SECRET_KEY": "server-secret-value",
+        },
+        environ={},
+    )
+
+    assert registry is None
+    assert not (tmp_path / "models").exists()
+
+
+def test_factory_disables_ai_on_operational_initialization_failure(
+    tmp_path, monkeypatch
+):
+    def fail_remote_initialization(*args, **kwargs):
+        raise OSError("Supabase client unavailable")
+
+    monkeypatch.setattr(
+        registry_factory.SupabaseModelStore,
+        "from_credentials",
+        fail_remote_initialization,
+    )
+
+    registry = registry_factory.create_model_registry(
+        model_dir=tmp_path / "models",
+        ai_enabled=True,
+        secrets={
+            "DLR_SUPABASE_URL": SUPABASE_URL,
+            "DLR_SUPABASE_SECRET_KEY": "server-secret-value",
+        },
+        environ={},
+    )
+
+    assert registry is None
+    assert not (tmp_path / "models").exists()
+
+
+def test_factory_validates_configuration_even_when_ai_is_disabled(tmp_path):
+    with pytest.raises(ValueError, match="must be configured together"):
+        registry_factory.create_model_registry(
+            model_dir=tmp_path / "models",
+            ai_enabled=False,
+            secrets={"DLR_SUPABASE_SECRET_KEY": "server-secret-value"},
+            environ={},
+        )
+
+    assert not (tmp_path / "models").exists()
+
+
 def test_factory_uses_supabase_registry_with_default_private_bucket(
     tmp_path, monkeypatch
 ):
@@ -192,3 +256,18 @@ def test_streamlit_page_uses_registry_factory_without_exposing_secrets():
     assert "DLR_SUPABASE_SECRET_KEY" not in app_source
     assert "st.write(st.secrets" not in app_source
     assert "st.json(st.secrets" not in app_source
+
+
+def test_streamlit_page_disables_ai_when_registry_initialization_falls_back():
+    app_source = (
+        Path(__file__).resolve().parents[2] / "dispatch_app_st.py"
+    ).read_text(encoding="utf-8")
+    button_start = app_source.index("if btn_generate and weather_files:")
+    button_end = app_source.index("# 结果展示", button_start)
+    button_block = app_source[button_start:button_end]
+
+    assert "requested_ai_enabled = bool(" in button_block
+    assert "ai_enabled=requested_ai_enabled" in button_block
+    assert "registry=model_registry" in button_block
+    assert "ai_enabled=effective_ai_enabled" in button_block
+    assert "model_registry is not None" in button_block
